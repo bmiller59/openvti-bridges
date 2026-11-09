@@ -2206,6 +2206,10 @@ async fn a_signed_leave_room_line_lets_the_healer_remove_the_leaver() {
     settle_posted(&w).await.unwrap();
     assert!(!w.client.members().contains(&l.did));
     assert!(w.our_keys_match(&w.b));
+    assert!(
+        w.client.signed_leaves().is_empty(),
+        "a removed signer's leave has done its job and is pruned"
+    );
 }
 
 #[tokio::test]
@@ -2314,7 +2318,7 @@ async fn a_forged_or_misdirected_leave_is_dropped() {
 async fn a_dyad_leave_frame_is_taken_and_the_newest_wins() {
     let mut w = World::build(Arc::new(NoLocalKnowledge), "");
     w.seat().await;
-    let l = Sim::new(60);
+    let l = Sim::new(2); // B, a seated member
     w.bus.put(
         &w.a.did,
         &w.our_did,
@@ -2362,7 +2366,7 @@ async fn held_signed_leaves_survive_a_restart() {
         welcome_frame(ROOM, &w.a.did, &w.policy, &welcome),
     );
     assert_eq!(room1.join().await.unwrap(), JoinState::Seated);
-    let l = Sim::new(60);
+    let l = Sim::new(2); // B, a seated member
     assert!(
         c1.take_signed_leave(&l.did, 5, &good_leave(ROOM, &l, 5))
             .unwrap()
@@ -2437,4 +2441,49 @@ async fn a_commit_with_unclassified_content_is_refused_and_the_walk_goes_on() {
     w.seat().await;
     let pol = policy(&w.a.did, "");
     refused_then_next_wins(&mut w, &|s| s.stage_policy_with_extra_extension(&pol)).await;
+}
+
+// ---- P0-2: the signed-leave book ---------------------------------------------
+
+fn throwaway(i: u32) -> (String, SigningKey) {
+    let mut seed = [7u8; 32];
+    seed[..4].copy_from_slice(&i.to_be_bytes());
+    let dev = SigningKey::from_bytes(&seed);
+    let did = did_peer::encode(&dev.verifying_key().to_bytes(), &seed, None).unwrap();
+    (did, dev)
+}
+
+/// A dyad peer can sign a valid leave for any DID it mints. Only a signer who
+/// is seated in our group is kept, so the book cannot be filled and a real
+/// leaver's leave is still taken.
+#[tokio::test]
+async fn a_leave_by_a_non_member_is_dropped_and_cannot_fill_the_book() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    for i in 0..1100u32 {
+        let (did, dev) = throwaway(i);
+        let sig = crate::geb::crypto::sign::sign_json(
+            &dev,
+            &crate::geb::leave::leave_payload(ROOM, &did, 5),
+        )
+        .unwrap();
+        assert!(!w.client.take_signed_leave(&did, 5, &sig).unwrap());
+        if i < 50 {
+            // Also through the dyad frame path.
+            w.bus.put(&w.a.did, &w.our_did, leave_frame(&did, 5, &sig));
+        }
+    }
+    w.at(w.now() + 31_000);
+    w.poll().await.unwrap();
+    assert!(w.client.signed_leaves().is_empty(), "nothing was kept");
+    // A real leaver's leave is still accepted, by frame and by call.
+    let real = Sim::new(2); // B, seated
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        leave_frame(&real.did, 20, &good_leave(ROOM, &real, 20)),
+    );
+    w.at(w.now() + 31_000);
+    w.poll().await.unwrap();
+    assert_eq!(w.client.signed_leaves(), vec![real.did.clone()]);
 }

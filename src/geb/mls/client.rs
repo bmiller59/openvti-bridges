@@ -951,6 +951,25 @@ impl MlsGroupClient {
     /// it.
     pub fn take_signed_leave(&self, by: &str, at: u64, sig: &str) -> Result<bool> {
         let mut g = self.lock()?;
+        // A signature proves only that someone holds the key inside `by`'s DID,
+        // and anyone can mint a DID: a leave counts only for a device that is
+        // seated in our group now. Otherwise a dyad peer could fill the book
+        // with throwaway signers and a real leaver's leave would be the one
+        // dropped (so the healer's Remove of it would be refused, a fork).
+        // UNVERIFIED against Geb (the answers do not say whether it checks
+        // membership); a leave that races ahead of the commit that adds its
+        // signer is dropped here and not re-asked.
+        let seated = match &g.state {
+            State::Seated(grp) => grp
+                .members()
+                .filter_map(|m| credential_did(&m.credential))
+                .any(|d| d == by),
+            _ => false,
+        };
+        if !seated {
+            tracing::warn!("dropping a signed leave by a device that is not seated in the room");
+            return Ok(false);
+        }
         if !g.leaves.take(&self.cfg.room_id, by, at, sig) {
             return Ok(false);
         }
@@ -1324,11 +1343,18 @@ impl GebGroup for MlsGroupClient {
                 let made = grp.epoch().as_u64();
                 let auth = heal::auth_hex(grp);
                 heal.note_settled(epoch, made, winner, &auth, merged_bytes);
-                added = grp
+                let seated_now: Vec<String> = grp
                     .members()
                     .filter_map(|m| credential_did(&m.credential))
-                    .filter(|d| !members_before.contains(d))
                     .collect();
+                added = seated_now
+                    .iter()
+                    .filter(|d| !members_before.contains(d))
+                    .cloned()
+                    .collect();
+                // A removed signer's leave has done its job; keeping it would
+                // let a stale one cover them again if they are re-added.
+                leaves.retain_seated(&seated_now);
                 sent_to_all = true;
             }
             let cursor_barrier_secs = queue.barrier_secs(grp.epoch().as_u64());

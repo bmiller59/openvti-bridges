@@ -20,8 +20,10 @@
 //! UNVERIFIED: the `sg` of an `lv` line is read as the same wrapper every
 //! room plaintext uses, `{v:1, room, author, body}` with `body` the plaintext
 //! without `sg` ( for lines; round 2 says only "like every
-//! room plaintext"). A held leave is kept after the leaver is removed (the
-//! answers say "newest per signer" and nothing about expiry).
+//! room plaintext"). The client keeps a leave only for a signer
+//! seated in the group and drops it once a merged commit removes the signer
+//! (the answers say "newest per signer" and nothing about membership or
+//! expiry: both are bridge-side choices, UNVERIFIED against Geb).
 
 use super::crypto::{did_peer, sign};
 use crate::{Error, Result};
@@ -29,10 +31,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-/// Most signers kept per room. Only room members (an `lv` line) and configured
-/// dyad peers can reach the book, so this only bounds a hostile member's
-/// churn; a new signer past the bound is dropped (an update of a held one is
-/// not).
+/// Most signers kept per room: a backstop only. The client keeps a leave only
+/// for a signer seated in the group and prunes it when the signer is removed,
+/// so the book is bounded by the room's size; a new signer past this bound is
+/// dropped (an update of a held one is not).
 pub const MAX_LEAVES: usize = 1024;
 
 /// `leavePayload(room, by, at)` (`leave code:33-35`).
@@ -123,6 +125,12 @@ impl LeaveBook {
         }
         self.leaves.insert(by.to_string(), new);
         true
+    }
+
+    /// Forget the leaves of signers who are not in `seated` (a signer removed
+    /// by a merged commit: the leave has done its job).
+    pub fn retain_seated(&mut self, seated: &[String]) {
+        self.leaves.retain(|by, _| seated.iter().any(|d| d == by));
     }
 
     /// Whether a verified signed leave by exactly `did` is held (without a
