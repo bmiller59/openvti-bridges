@@ -502,6 +502,8 @@ async fn a_reseat_welcome_replaces_the_group_and_our_dead_branch_lines_are_repos
     let mut w = World::build(Arc::new(AllKnown), "");
     let (at, _commit, welcome) = reseat_setup(&mut w).await;
     let old_epoch = w.client.epoch().unwrap();
+    // We are behind and have asked to be re-seated: the Welcome is expected.
+    ask_to_be_reseated(&mut w).await;
     w.a.merge_pending();
     w.bus.put(&w.a.did, &w.our_did, welcome);
     w.at(w.now() + 6_000);
@@ -840,16 +842,27 @@ async fn accepting_a_reseat_welcome_marks_the_split_reseated() {
     w.b.merge_pending();
     a_commits_and_we_settle(&mut w).await;
     sent(&w);
+    // Every other member is ahead of us, and so is B: we lose the fork (rule 1)
+    // and wait to be re-seated, which is what makes the Welcome expected.
+    let e = w.client.epoch().unwrap();
+    w.client
+        .on_rs(
+            &w.a.did,
+            Some(room_ref()),
+            Some(st(e + 5, "1111111111111111", vec![])),
+        )
+        .await;
     let b_status = st(
-        w.b.epoch(),
-        &w.b.auth16(),
-        vec![entry(w.b.epoch(), "bbbbbbbbbbbbbbbb", &w.b.auth16())],
+        e + 3,
+        "2222222222222222",
+        vec![entry(e, "bbbbbbbbbbbbbbbb", "ffffffffffffffff")],
     );
     w.client
         .on_rs(&w.b.did, Some(room_ref()), Some(b_status))
         .await;
     let before = forkmark::read(&*w.marks).await.unwrap().expect("marker");
     assert_ne!(before.state, ForkState::Reseated);
+    assert!(!w.client.split().unwrap().we_won);
     // The healer re-seats us; the Welcome is accepted.
     let (_commit, welcome) = w.a.stage_reseat_full(&w.our_did.clone(), parse_kp(&kps[1]));
     let frame = welcome_frame(ROOM, &w.a.did, &w.policy, &welcome);
@@ -876,4 +889,94 @@ async fn accepting_a_reseat_welcome_marks_the_split_reseated() {
         ),
         "the detection facts are kept"
     );
+}
+
+// ---- P0-3: a replacing Welcome needs a re-seat we expect -----------------------
+
+/// A seat-ask of ours is outstanding: we are behind, asked twice a settle
+/// window apart, and the second sighting sent the `seat-ask`.
+async fn ask_to_be_reseated(w: &mut World) {
+    let e = w.client.epoch().unwrap();
+    let ahead = Frame::Group(GroupOp::Rs {
+        room: Some(room_ref()),
+        s: Some(st(e + 2, "3333333333333333", vec![])),
+        via: None,
+    });
+    let t0 = w.now() + 6_000;
+    w.at(t0);
+    w.bus.put(&w.a.did, &w.our_did, ahead.clone());
+    w.poll().await.unwrap();
+    w.at(t0 + 6_000);
+    w.bus.put(&w.a.did, &w.our_did, ahead);
+    w.poll().await.unwrap();
+    assert_eq!(seat_asks(&sent(w)), vec![None], "our seat-ask is out");
+}
+
+#[tokio::test]
+async fn a_replacing_welcome_with_no_re_seat_expected_is_ignored() {
+    let mut w = World::build(Arc::new(AllKnown), "");
+    // Any member can build a group with the room's id from a package of ours
+    // and send the Welcome: here a re-seat of us by A, delivered unprompted.
+    let (_at, _commit, welcome) = reseat_setup(&mut w).await;
+    let (e, keys) = (
+        w.client.epoch(),
+        w.client.relay_keys().unwrap().pubkey_hex().unwrap(),
+    );
+    w.a.merge_pending();
+    w.bus.put(&w.a.did, &w.our_did, welcome);
+    w.at(w.now() + 6_000);
+    w.poll().await.unwrap();
+    assert_eq!(w.client.reseats(), 0, "no re-seat was expected");
+    assert_eq!(w.client.epoch(), e, "the group was not replaced");
+    assert_eq!(w.client.relay_keys().unwrap().pubkey_hex().unwrap(), keys);
+}
+
+#[tokio::test]
+async fn a_replacing_welcome_is_accepted_when_we_asked_to_be_reseated() {
+    let mut w = World::build(Arc::new(AllKnown), "");
+    let kps = w.seat_raw().await;
+    sent(&w);
+    ask_to_be_reseated(&mut w).await;
+    let (_c, welcome) = w.a.stage_reseat_full(&w.our_did.clone(), parse_kp(&kps[1]));
+    w.a.merge_pending();
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        welcome_frame(ROOM, &w.a.did, &w.policy, &welcome),
+    );
+    w.at(w.now() + 6_000);
+    w.poll().await.unwrap();
+    assert_eq!(w.client.reseats(), 1);
+    assert_eq!(w.client.epoch(), Some(w.a.epoch()));
+}
+
+#[tokio::test]
+async fn a_replacing_welcome_from_a_lower_epoch_is_refused_unless_we_lost_a_split() {
+    let mut w = World::build(Arc::new(AllKnown), "");
+    let kps = w.seat_raw().await;
+    sent(&w);
+    // B builds a re-seat of us at the current epoch, then falls behind the
+    // room while A commits twice.
+    let (_c, welcome) = w.b.stage_reseat_full(&w.our_did.clone(), parse_kp(&kps[1]));
+    w.b.merge_pending();
+    a_commits_and_we_settle(&mut w).await;
+    a_commits_and_we_settle(&mut w).await;
+    sent(&w);
+    ask_to_be_reseated(&mut w).await;
+    let epoch = w.client.epoch();
+    assert!(w.b.epoch() < epoch.unwrap());
+    // Delivered by A, the one configured dyad peer (it relays what B built).
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        welcome_frame(ROOM, &w.a.did, &w.policy, &welcome),
+    );
+    w.at(w.now() + 6_000);
+    w.poll().await.unwrap();
+    assert_eq!(
+        w.client.reseats(),
+        0,
+        "an older group does not replace ours"
+    );
+    assert_eq!(w.client.epoch(), epoch);
 }

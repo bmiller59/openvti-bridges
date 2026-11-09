@@ -60,6 +60,9 @@ const OWN_LINES_BYTES: usize = 256 * 1024;
 /// How long a re-seat Welcome is awaited before asking with a fresh package.
 /// UNVERIFIED: Geb's seat wait is 120 s ; we reuse it.
 pub const SEAT_WAIT_MS: u64 = 120_000;
+/// How long after a `seat-ask` of ours a replacing Welcome is still expected.
+/// UNVERIFIED (not in the answers): a bridge-side window, two ask backoffs.
+pub const SEAT_ASK_EXPECT_MS: u64 = 2 * ASK_BACKOFF_MS;
 /// Largest `rc` Commit we take (an event is at most 120,000 bytes).
 const MAX_RC_BYTES: usize = 100_000;
 
@@ -589,15 +592,64 @@ impl MlsGroupClient {
         }
     }
 
+    /// Why a replacing Welcome would be expected now, and whether it may come
+    /// from an epoch below ours. `None`: no re-seat is expected, so a Welcome
+    /// would replace our whole group on a member's say-so (any member can mint
+    /// a group with the room's id from one of our published KeyPackages).
+    ///
+    /// Expected when: we merged a commit that re-seats us (`Reseating`); a
+    /// recorded split is unresolved and we lost it (the winner's branch may sit
+    /// at a lower epoch); we lost our local copy; or a `seat-ask` of ours is
+    /// outstanding (sent within [`SEAT_ASK_EXPECT_MS`]).
+    ///
+    /// UNVERIFIED: Geb's answers say only that a `join` replaces the group
+    /// (round 2 section 8); whether a Geb device accepts a replacing Welcome
+    /// it did not expect is not stated. This gate, the window and the epoch
+    /// rule are bridge-side hardening. The welcomer is NOT restricted to the
+    /// elected healer: any member can commit a re-seat (round 2 section 8,
+    /// round 4 Q6), and nothing shows Geb requires the healer.
+    pub(super) fn reseat_expected(g: &Inner, now: u64) -> Option<(&'static str, bool)> {
+        if matches!(g.state, State::Reseating(_)) {
+            return Some(("a merged commit re-seats us", false));
+        }
+        if g.heal
+            .p
+            .split
+            .as_ref()
+            .is_some_and(|s| !s.we_won && !s.resolved)
+        {
+            return Some(("we lost a recorded split", true));
+        }
+        if g.heal.lost_copy {
+            return Some(("we lost our local copy", true));
+        }
+        let asked = [g.heal.last_ask_ms, g.heal.last_kp_ask_ms]
+            .into_iter()
+            .flatten()
+            .any(|t| now.saturating_sub(t) < SEAT_ASK_EXPECT_MS);
+        asked.then_some(("a seat-ask of ours is outstanding", false))
+    }
+
     /// A Welcome while we hold the room: accepted only as a re-seat of OUR
-    /// DID (round 2 section 8). Anything else is ignored and logged.
+    /// DID (round 2 section 8) that we expect ([`Self::reseat_expected`]).
+    /// Anything else is ignored and logged.
     pub(crate) async fn on_reseat_welcome(&self, peer: &str, room: &RoomInfo, w: &str) {
+        let now = (self.clock)();
         let joined = {
             let Ok(mut g) = self.lock() else { return };
             if !matches!(g.state, State::Seated(_) | State::Reseating(_)) {
                 return;
             }
-            match self.join_from_welcome(&mut g, room, w, Some(peer)) {
+            let Some((why, lower_ok)) = Self::reseat_expected(&g, now) else {
+                tracing::warn!(
+                    security_alert = true,
+                    "ignoring a replacing Welcome: no re-seat is expected (not split, \
+                     not re-seated, no seat-ask outstanding)"
+                );
+                return;
+            };
+            tracing::info!(why, "a replacing Welcome is expected; checking it");
+            match self.join_from_welcome(&mut g, room, w, Some(peer), lower_ok) {
                 Ok(()) => match self.persist_state(&g) {
                     Ok(()) => true,
                     Err(e) => {

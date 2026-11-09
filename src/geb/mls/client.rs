@@ -782,9 +782,10 @@ impl MlsGroupClient {
         room: &RoomInfo,
         w: &str,
         replace: Option<&str>,
+        lower_ok: bool,
     ) -> Result<()> {
         let Some(welcomer) = replace else {
-            return self.join_inner(g, room, w, None);
+            return self.join_inner(g, room, w, None, true);
         };
         let known = match &g.state {
             State::Seated(old) | State::Reseating(old) => old
@@ -816,7 +817,7 @@ impl MlsGroupClient {
         {
             tracing::error!(error = ?e, "could not delete the old group before a re-seat");
         }
-        let r = self.join_inner(g, room, w, replace);
+        let r = self.join_inner(g, room, w, replace, lower_ok);
         if r.is_err()
             && let Ok(mut v) = g.provider.storage().values.write()
         {
@@ -831,6 +832,7 @@ impl MlsGroupClient {
         room: &RoomInfo,
         w: &str,
         replace: Option<&str>,
+        lower_ok: bool,
     ) -> Result<()> {
         room.validate()?;
         if room.id != self.cfg.room_id {
@@ -903,6 +905,19 @@ impl MlsGroupClient {
             && let Err(why) = self.reseat_consistent(g, &group)
         {
             return Err(Error::Wire(format!("not a re-seat of us: {why}")));
+        }
+        // A replacing group from an epoch below ours is the older branch;
+        // accepted only when we are known to be on the losing side of a split
+        // or have lost our copy (UNVERIFIED against Geb, see
+        // `reseat_expected`).
+        if replace.is_some()
+            && !lower_ok
+            && let State::Seated(o) | State::Reseating(o) = &g.state
+            && group.epoch().as_u64() < o.epoch().as_u64()
+        {
+            return Err(Error::Wire(
+                "a replacing Welcome from an epoch below ours, and no split lost".into(),
+            ));
         }
         let now = (self.clock)();
         let old_epoch = match &g.state {
@@ -1045,7 +1060,7 @@ impl GebGroup for MlsGroupClient {
                         let outcome = {
                             let mut g = self.lock()?;
                             let replace = matches!(g.state, State::Reseating(_)).then_some(&**peer);
-                            let r = self.join_from_welcome(&mut g, &room, &w, replace);
+                            let r = self.join_from_welcome(&mut g, &room, &w, replace, false);
                             if r.is_ok() {
                                 self.persist_state(&g)?;
                             }
