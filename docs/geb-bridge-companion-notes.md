@@ -115,7 +115,7 @@ For Geb (Geb's announcement channel; bring file:line):
 - The VTI repository's root CLAUDE.md sections that bind this work: foreign-protocol identity exception, key custody, Trust Task rules,
   retry ownership, R1.1, R2.1, R6.2.
 
-## F. Geb's answers (2026-11-08, code at release 0.5.14 = path B 0.1)
+## F. Geb's answers (2026-11-08, code at release 0.5.14 = path B 0.1; since round 2 the pin is release 0.5.15, `fdf804d`)
 
 Settled: test vectors exist (`geb-path-b-vectors.json`, not yet received here; sealed box, mailbox envelope and ratchet
 nonces are "open this" checks); inbox IKM is the raw 32-byte X25519 key; no AAD except on the mailbox envelope; ratchet

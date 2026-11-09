@@ -2,8 +2,8 @@
 
 An experimental bridge between a Verifiable Trust Infrastructure (VTI) community data
 room and a foreign room. The first (and only real) foreign adapter is Geb, over its
-"path B" wire (Nostr relay plus MLS), pinned to Geb substrate commit release 0.5.14
-(path B version 0.1). A second, trivial `loopback` adapter keeps the core adapter-neutral.
+"path B" wire (Nostr relay plus MLS), pinned to Geb substrate commit `fdf804d`
+(release 0.5.15; path B version 0.1). A second, trivial `loopback` adapter keeps the core adapter-neutral.
 
 The bridge carries content both ways between the two rooms. It signs as itself, and
 content that crosses the bridge is never presented as verified by either side.

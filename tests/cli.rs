@@ -164,7 +164,7 @@ fn the_binary_lists_and_reports_status_offline_and_refuses_a_bad_config() {
     );
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        text.contains("geb path B 0.1 (pinned to commit release 0.5.14)"),
+        text.contains("geb path B 0.1 (pinned to commit fdf804d)"),
         "{text}"
     );
     assert!(

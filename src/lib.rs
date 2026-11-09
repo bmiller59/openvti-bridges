@@ -10,7 +10,7 @@
 //! The Geb side is a foreign-protocol interface (workspace `CLAUDE.md`,
 //! exceptions to "every remote operation is a Trust Task"). Geb path B has no
 //! versioned specification: the adapter pins to Geb's answers
-//! (`Geb's path B answers, round 1`, commit release 0.5.14, see
+//! (`Geb's path B answers, round 1` and round 2, release 0.5.15, commit `fdf804d`, see
 //! [`geb::status_line`]) and fails closed on anything it does not recognise.
 //!
 //! Status: experimental. M0, M1 (the VTC room side and the durable store, behind

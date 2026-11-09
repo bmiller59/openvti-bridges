@@ -1,4 +1,4 @@
-> Update 2026-11-08: Geb answered the open questions from its code at commit release 0.5.14, now versioned as "path B 0.1"
+> Update 2026-11-08: Geb answered the open questions from its code at commit release 0.5.14, now versioned as "path B 0.1" (the pin moved to release 0.5.15, commit `fdf804d`, with round 2 on 2026-11-09)
 > (breaking changes are announced in the Geb's announcement channel first). Geb details below are pinned to it. Effects: a retraction
 > is an ordinary signed reply line, never a new kind; bridges are welcome by default with no marking; each room will later choose not
 > welcome / welcome automatically / ask, and whether to show a mark (same for AI agents), shapes not yet shared; the M3 blocker is now Geb's commit check, which needs persona cards and

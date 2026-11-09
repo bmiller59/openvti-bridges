@@ -20,8 +20,10 @@
 /// Version of this crate's reading of the Geb path B wire. Geb has no
 /// versioned spec; this counts our pinned reading, not a Geb version.
 pub const PATH_B_VERSION: &str = "0.1";
-/// The Geb substrate commit the answers were read from.
-pub const PATH_B_PINNED_COMMIT: &str = "release 0.5.14";
+/// The Geb substrate commit this reading is pinned to: release 0.5.15. Round 1
+/// of the answers was read at release 0.5.14 (0.5.14); round 2, which carries the
+/// 0.5.15 rules this crate builds to, at `fdf804d`.
+pub const PATH_B_PINNED_COMMIT: &str = "fdf804d";
 
 /// One line for status output and logs.
 pub fn status_line() -> String {
@@ -34,7 +36,7 @@ mod tests {
     fn status_names_the_version_and_commit() {
         assert_eq!(
             super::status_line(),
-            "geb path B 0.1 (pinned to commit release 0.5.14)"
+            "geb path B 0.1 (pinned to commit fdf804d)"
         );
     }
 }

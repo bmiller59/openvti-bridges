@@ -1,5 +1,5 @@
 //! The settle rule, as a pure component (Geb path B answer 9, code at commit
-//! release 0.5.14; guide "Commits").
+//! release 0.5.14; release 0.5.15 is `fdf804d`; guide "Commits").
 //!
 //! Commits are never applied at once. Every `mc` is **held** for
 //! `settleWindowMs` (policy, default 3000, clamped 0-60000). When the window

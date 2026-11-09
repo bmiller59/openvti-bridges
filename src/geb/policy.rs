@@ -1,5 +1,6 @@
 //! The room policy (GroupContext extension `0xF001`) and what a commit check
-//! needs. Geb path B answers 7 and 9, code at commit release 0.5.14.
+//! needs. Geb path B answers 7 and 9 (code at commit release 0.5.14) and round 2 section 7
+//! (release 0.5.15, `fdf804d`).
 //!
 //! # Policy (answer 7)
 //!

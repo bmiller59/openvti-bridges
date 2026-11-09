@@ -5,7 +5,9 @@ foreign room (first adapter: Geb). This crate was extracted from the VTI
 repository (see README); "the workspace `CLAUDE.md`" below means that
 repository's root `CLAUDE.md`, whose rules still bind this code.
 Status: **experimental** (`publish = false`). Geb path B
-reading: version `0.1`, pinned to Geb substrate commit release 0.5.14
+reading: version `0.1`, pinned to Geb substrate commit `fdf804d` (release 0.5.15;
+round 1 of the answers was read at release 0.5.14, the fixture vectors were
+generated at release 0.5.14 (round 1) and the round 2 reading (round 2), none at `fdf804d`)
 (`geb::PATH_B_VERSION`, `geb::PATH_B_PINNED_COMMIT`, `geb::status_line()`).
 
 ## Purpose
@@ -27,7 +29,8 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
 - **Geb is a foreign-protocol interface** (workspace `CLAUDE.md`, exceptions
   to "every remote operation is a Trust Task"). Its wire has no versioned spec:
   pin to Geb's authoritative answers `Geb's path B answers, round 1` (code at
-  release 0.5.14; they supersede `Geb's implementer's guide (2026-11-07)` where they differ), keep
+  release 0.5.14) and round 2 (release 0.5.15, `fdf804d`; the 0.5.15 paragraphs are
+  the current rules; they supersede `Geb's implementer's guide (2026-11-07)` where they differ), keep
   changes behind `GebCodec` and the other `geb::traits`, and mark anything the
   answers do not settle `// UNVERIFIED:`. Remaining markers: the `did:peer`
   purpose-element order, a few `parsePolicy` details (see `geb/policy.rs`), the
@@ -162,7 +165,7 @@ Run the harness: `cargo test --features harness` (needs the `room-host` git depe
   exercised by any test.
 
 - **`geb-mls`**: `geb::mls::MlsGroupClient`, the `GebGroup` over OpenMLS 0.9
-  (own provider, no `vti-rooms`): KeyPackages with `[0xF001, 0xF002]` and the
+  (own provider, no `vti-rooms`; OpenMLS 0.9.x, Geb pins 0.8.2: see "OpenMLS version"): KeyPackages with `[0xF001, 0xF002]` and the
   leaf binding signed through `GebSigner`, seating over the dyad (`kp-stock`,
   `kp-req`/`kp`, `welcome`), per-epoch relay keys from the exporter, sealed
   lines, and the settle rule. The pure settle queue (`geb::settle`) and
@@ -272,6 +275,47 @@ The supervisor ends `End::Halted` for both kinds and never retries.
 - Not covered: too many held commits (`Error::Unsupported` from
   `hold_commit`) and a build without `geb-mls` (the default `UnsupportedGroup`
   refuses every commit each tick) still fail per tick with backoff.
+
+## OpenMLS version (UNVERIFIED, needs a live run)
+
+We build on OpenMLS **0.9.x** (`Cargo.lock` resolves 0.9.2); Geb pins
+**0.8.2** (`Cargo.lock:3292-3293` there). The 0.8.2 source is not on the
+development machine, so no source diff was possible. Every behaviour Geb quotes
+for 0.8.2 (default PURE_CIPHERTEXT wire-format policy, `add_members` returning
+`(MlsMessageOut, MlsMessageOut, Option<GroupInfo>)`, the RFC 9420 section 8.5
+exporter, suite 0x0001 first in the default capability list, the ratchet-tree
+extension) was checked against the **0.9.2 source only**; they agree. The wire
+encodings we depend on are RFC 9420 ones that did not change between the two
+(0.9 changed the storage format, past-epoch timestamping and draft features). So
+wire compatibility is **inferred, not shown**: only the live compatibility run
+against a Geb 0.5.15 CLI (0.8.2) can show it. A Welcome that 0.9.2 rejects
+surfaces as `welcome: ...` / `treeRefusal: ...` in the warn log
+(`ignoring a welcome`). Also unknown: whether Geb's OpenMLS carries a
+`[patch]`. We use 0.9-only API (`StagedCommit::update_path_leaf_node`,
+`QueuedProposal::proposal_or_ref_type`); the cost of moving to 0.8.2 is a
+second MLS stack plus a storage-snapshot rework, and is not recommended before
+the live run says it is needed.
+
+## Open questions for Geb (round 2 follow-ups)
+
+1. Is Geb's build stock OpenMLS 0.8.2, with no `[patch]`?
+2. In `validCommit` (Geb's source), is the root / admin test an exact DID
+   compare, or can persona cards (`same`) widen it to a sibling device? (Decides
+   whether our card-free verdicts can fork.)
+3. In the settle walk, is a standalone-Proposal, by-reference or
+   `leafAuth`-violating commit "refused" (next hash, cursor moves) exactly like a
+   `validCommit` failure, or "failed" (cursor stays, `rs`)? We implement
+   refused.
+4. `rs` / `rc` / `seat-ask` details (P1): `forkMineWins`, when a client is
+   behind long enough to `askReseat`, and whether `rc`'s `e` is the epoch it was
+   made from.
+5. Does an unacked dyad frame block or only repeat on Geb's ratchet, and is a
+   reply required to `rs` / `rc` / `leave`? (We ack and ignore unknown ops.)
+6. Does the heal need the same signature key, and does "bound sender" read the
+   leaf before or after the commit's own update path? (We: before; key not
+   required.)
+7. Is a re-seat's added unbound leaf (naming a DID the same commit removes)
+   refused as an `unboundClaim`? (We refuse it.)
 
 ## Not built (blocked or later)
 

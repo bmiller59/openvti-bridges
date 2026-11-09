@@ -1,4 +1,7 @@
-//! Geb's path B test vectors (`tests/fixtures/geb-path-b-vectors.json`).
+//! Geb's path B test vectors (`tests/fixtures/geb-path-b-vectors.json`),
+//! generated at Geb substrate commit release 0.5.14 (round 1, release 0.5.14).
+//! The crate is now pinned to `fdf804d` (0.5.15); these vectors were not
+//! regenerated and nothing in them is a 0.5.15 output.
 //!
 //! Every value in the fixture was produced by calling Geb's own code with
 //! fixed, labelled test keys (alice: Ed25519 seed 01x32, X25519 secret 02x32;

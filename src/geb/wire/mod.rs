@@ -3,7 +3,7 @@
 //! fails closed) and tolerant about *extra fields* (Geb may add fields; we do
 //! not own this format, so `deny_unknown_fields` would only break on upgrade).
 //! Field types follow Geb's answers (path B answers 8 and 10, commit
-//! release 0.5.14). A value Geb reads leniently (a flag honoured only when exactly
+//! release 0.5.14; re-pinned to 0.5.15, `fdf804d`). A value Geb reads leniently (a flag honoured only when exactly
 //! `true`, a reaction's `on` coerced with `!!`) is kept as a raw `Value` with a
 //! helper that applies Geb's rule.
 

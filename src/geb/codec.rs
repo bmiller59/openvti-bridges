@@ -1,4 +1,4 @@
-//! The codec pinned to the guide and Geb's answers (commit release 0.5.14).
+//! The codec pinned to the guide and Geb's answers (commit release 0.5.14; re-pinned to release 0.5.15, `fdf804d`).
 
 use super::traits::GebCodec;
 use super::wire::{Envelope, LineBody, RoomPlaintext};
