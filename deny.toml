@@ -1,0 +1,90 @@
+# cargo-deny configuration, adapted from the VTI repository's deny.toml.
+#
+# Run with:
+#   cargo install cargo-deny
+#   cargo deny check
+#
+# Only the advisory ignores that apply to this crate's graph are kept; the rest of
+# the VTI list (AWS SDK, UniFFI, PGP, zip) never reaches it. Re-check the list
+# with `cargo deny check` when the lock file changes: an entry reported as
+# `advisory-not-detected` is stale.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+ignore = [
+
+  { id = "RUSTSEC-2026-0381", reason = """
+  webpki-roots 0.26.x: bundled roots trust distrusted emSign intermediates.
+  Patched only in >= 1.0.10; there is no fixed 0.26 release.
+
+  0.26.11 is a compatibility shim with no roots of its own: it re-exports
+  webpki-roots 1.x, which Cargo.lock pins at 1.0.10, the patched release. So
+  the roots any 0.26 user (tokio-tungstenite 0.30, under the messaging SDK,
+  the test mediator and vta-mobile-core) actually gets are the fixed ones; the
+  advisory matches on the shim's version number alone.
+
+  Drop when tokio-tungstenite depends on webpki-roots 1.x directly.
+  """ },
+
+
+  { id = "RUSTSEC-2026-0173", reason = """
+  proc-macro-error2 2.0.1 is unmaintained — the author has said so and
+  recommends migrating away. Build-time only, and twice removed from
+  anything we ship: it is a proc-macro, so it runs in the compiler and
+  links into no artifact, and its path into this crate is
+  the `geb-mls` feature (and vtc-client's `mls` under `harness`) —
+  openmls_rust_crypto -> hpke-rs -> libcrux-sha3 -> hax-lib ->
+  hax-lib-macros. A default build of every crate here does not resolve
+  it at all.
+
+  There is no version of this we can pick differently. OpenMLS 0.9 has
+  one production crypto provider and this is what it depends on; the
+  alternative is not a cleaner MLS but a hand-rolled group-key scheme,
+  which the data-rooms design note explicitly declines.
+
+  Drop when hax-lib moves off proc-macro-error2, or when OpenMLS's
+  provider stack stops reaching libcrux.
+  """ },
+
+
+]
+
+# License policy: permissive and weak-copyleft licenses compatible with Apache-2.0.
+# Entries come from the VTI repository; prune any that no crate here uses.
+#
+# cargo-deny resolves OR-licensed crates against this allow list, so
+# crates licensed under e.g. `Apache-2.0 OR GPL-2.0-only` or
+# `MIT OR Apache-2.0 OR LGPL-2.1-or-later` automatically resolve to a
+# permissive branch we accept — no need to allow the copyleft alternatives.
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "MIT",
+  # MIT No Attribution — MIT minus the copyright-notice preservation
+  # clause. OSI-approved, more permissive than MIT itself. Pulled in
+  # transitively via regorus → jsonschema → referencing → fluent-uri
+  # → borrow-or-share. Consistent with the "0BSD" entry below, which
+  # is the functionally-equivalent BSD variant we already accept.
+  "MIT-0",
+  "Apache-2.0",
+  # Apache-2.0 plus the LLVM exception, which only waives obligations for
+  # code compiled into a binary — strictly more permissive than Apache-2.0.
+  # Pulled in as a build dependency (target-lexicon) of tss-esapi-sys, behind
+  # vti-secrets' optional `tpm` feature (#1820).
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "ISC",
+  "Unicode-3.0",
+  "0BSD",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "Zlib",
+  "MPL-2.0",
+]
+
