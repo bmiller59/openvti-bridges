@@ -1,0 +1,56 @@
+# The room-host harness: tests that run the bridge against a real `room-host`.
+#
+# This is a SEPARATE package, deliberately not a member of the root crate and with its own
+# empty `[workspace]`, because `room-host` is not published (a service binary) and has to be
+# taken by git. A git dependency is resolved even when optional, so keeping it in the root
+# manifest broke `cargo generate-lockfile` for every build of the root crate, including the
+# default one. Here it only affects this package, which CI does not build.
+#
+# PLACEHOLDER URL below: replace with the real location of the VTI repository before use.
+# Until then, resolve it with an uncommitted `.cargo/config.toml` (git-ignored) holding a
+# `[patch."https://example.invalid/verifiable-trust-infrastructure.git"]` entry (see
+# README, "The room-host harness").
+[package]
+name = "vti-geb-bridge-harness"
+description = "Tests of vti-geb-bridge against a real room-host (not published, not built by CI)"
+version = "0.1.0"
+edition = "2024"
+publish = false
+rust-version = "1.95.0"
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+vti-geb-bridge = { path = "..", features = ["harness", "geb-live", "geb-mls"] }
+
+[dev-dependencies]
+# Pinned by rev; the VTI commit the crate was extracted at.
+room-host = { git = "https://example.invalid/verifiable-trust-infrastructure.git", rev = "3fb9cbc46f0769f4449938365dffb389c8ec4eb7", features = ["test-support"] }
+vti-rooms = { version = "0.32", features = ["test-support"] }
+vti-rooms-dtg = { version = "0.34", features = ["test-support"] }
+vtc-client = "0.40"
+dtg-credentials = "0.13"
+axum = "0.8"
+vta-sdk = { version = "0.85", features = ["client", "test-loopback"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+tempfile = "3"
+serde_json = "1"
+async-trait = "0.1"
+base64 = "0.23"
+ed25519-dalek = "3"
+openmls = "0.9"
+openmls_traits = "0.6"
+tls_codec = "0.5"
+openmls_rust_crypto = "0.6"
+vti-specs = "0.10"
+trust-tasks-rs = { version = "0.37.2", default-features = false, features = ["validate"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+multibase = "0.9"
+zeroize = "1"
+toml = "1"
+rand = "0.10"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"

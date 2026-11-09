@@ -75,18 +75,12 @@ cli = [
   "vta-sdk/crypto-provider",
 ]
 
-# The M1 harness: a real `room-host`, a real room fixture and a fake VTA sink,
-# in `tests/harness.rs`. Optional rather than dev-dependencies so a default
-# `cargo test` does not compile the room host.
+# Test support for the tests that need no room host: `HostDelivery::for_loopback_tests`, the
+# in-process MLS `sim`, and `vta-sdk`'s loopback sink for `tests/custody.rs` and
+# `tests/cli.rs`. The tests that need a real `room-host` are the separate `harness/` package
+# (not a member of this crate, because `room-host` is not published; see its Cargo.toml).
 harness = [
   "vtc",
-  "dep:room-host",
-  "dep:vti-rooms",
-  "dep:vti-rooms-dtg",
-  "dep:vtc-client",
-  "dep:dtg-credentials",
-  "dep:axum",
-  "dep:chrono",
   "vta-sdk/test-loopback",
 ]
 
@@ -98,17 +92,6 @@ required-features = ["cli"]
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
-# `room-host` is not published (a service binary), so the `harness` feature takes it by
-# git. PLACEHOLDER URL: replace with the real location of the VTI repository before use.
-# Pinned by rev; this is the VTI commit the crate was extracted at. For offline work,
-# point it at a local checkout with an uncommitted `.cargo/config.toml` `[patch]`
-# (see README, "The harness feature").
-room-host = { git = "https://example.invalid/verifiable-trust-infrastructure.git", rev = "3fb9cbc46f0769f4449938365dffb389c8ec4eb7", features = ["test-support"], optional = true }
-vti-rooms = { version = "0.32", features = ["test-support"], optional = true }
-vti-rooms-dtg = { version = "0.34", features = ["test-support"], optional = true }
-vtc-client = { version = "0.40", optional = true }
-dtg-credentials = { version = "0.13", optional = true }
-axum = { version = "0.8", optional = true }
 vta-sdk = { version = "0.85", features = ["client"], optional = true }
 vti-common = { version = "0.61", optional = true }
 vti-specs = { version = "0.10", optional = true }

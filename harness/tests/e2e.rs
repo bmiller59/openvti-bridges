@@ -15,12 +15,11 @@
 //! guide and answers, and the MLS framing choices listed at the top of
 //! `geb/mls/mod.rs` are unverified against Geb's code. It does not exercise
 //! the wss/TLS path, a real VTA (the persona's room operations are the harness
-//! fake), a sealed-tier room, a mid-step crash (the existing `harness` tests
+//! fake), a sealed-tier room, a mid-step crash (the `harness.rs` tests
 //! kill the pump between every pair of store operations; here a "kill" is a
 //! drop-and-reboot between steps), or Geb's persona cards and signed leaves.
 //! A VTC-side edit and retraction are carried for real (a tombstone on the
 //! host becomes a reply line).
-#![cfg(all(feature = "harness", feature = "geb-live", feature = "geb-mls"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;

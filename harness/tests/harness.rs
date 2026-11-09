@@ -11,7 +11,6 @@
 //! fixture's keys. A real `vta-service` with a real MLS room group is not
 //! stood up: the sealed tier is therefore covered only by the scripted
 //! `sealed_*` tests below, not end to end.
-#![cfg(feature = "harness")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use async_trait::async_trait;

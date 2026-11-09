@@ -2,9 +2,12 @@ target/
 # Local, uncommitted: points the git `room-host` dependency at a local VTI checkout for
 # offline runs of the `harness` feature (see README).
 .cargo/
-# The `room-host` git dependency is a placeholder URL, so a lock file cannot resolve
-# for everyone; keep it local until the real URL is set, then commit it.
-Cargo.lock
+# Not committed yet: a lock produced here has path-patched VTI crates in it, which is wrong for
+# everyone else. Once one is generated with network and no `.cargo/config.toml` override
+# (`cargo generate-lockfile`), delete this line and commit it (README, "Cargo.lock").
+/Cargo.lock
+# The room-host harness package has a placeholder git dependency, so its lock stays local.
+/harness/Cargo.lock
 # Link state, secrets and sealed files from local runs
 data/
 *.sealed
