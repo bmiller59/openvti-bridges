@@ -108,13 +108,20 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   `sg` must verify for its MLS sender, then `ls` is verified for `by` = that
   sender); (b) the dyad frame above (`by` is a field; any peer may relay a
   leave, the signature is what counts). Kept: the NEWEST leave per signer per
-  room, persisted in the sealed MLS snapshot (`Snapshot.leaves`), at most 1024
-  signers; a leave whose signature does not verify, or that names another room,
-  is dropped. A held leave covers its signer's EXACT DID in `valid_commit` rule
+  room, persisted in the sealed MLS snapshot (`Snapshot.leaves`), and ONLY for a
+  signer whose device DID is seated in our group now (a signature proves only
+  key possession and anyone can mint a DID: otherwise a dyad peer fills the book
+  with throwaway signers and the real leaver's leave is the one dropped); a
+  signer removed by a merged commit is pruned; 1024 signers is a backstop. A
+  leave whose signature does not verify, that names another room, or whose
+  signer is not seated is dropped. A held leave covers its signer's EXACT DID in `valid_commit` rule
   (2). We do not send a leave, elect a healer or commit a Remove (follower
   only). UNVERIFIED: the `lv` line's `sg` is read as the usual
   `{v:1, room, author, body}` wrapper over the plaintext without `sg`; a held
-  leave is never expired.
+  leave is never expired (only pruned when its signer is removed); that Geb
+  checks membership at all (the answers are silent: a bridge-side choice), and a
+  leave that races ahead of the commit that adds its signer is dropped and not
+  re-asked.
 - **0.5.15 commit and tree rules** (answers round 2 sections 2, 7, 8, round 4
   Q1-Q6; `geb/mls/commit.rs`, `geb::policy::valid_commit`). Refused (staged by
   MLS, then failed `leafAuth` / `validCommit`): an update-path leaf naming
@@ -243,12 +250,25 @@ a git source still has to fetch it on a fresh resolve (no lock), so offline eith
 
 `geb::dyad::StatefulDyad` is the `GebDyad`: connect-when-apart (`invite`,
 `invitations`, `accept`, then `sync` completes the handshake) and ratcheted
-messaging (`send`, `recv`, `retransmit`). State goes through
+messaging (`send`, `recv`, `retransmit`, `retransmit_due`). State goes through
 `BridgeStore::state_get/state_put` (`links/dyad/<peer>` and `ratchets/<peer>`);
 a received frame is queued durably before its ack is posted, and a sent
 frame's counter is persisted before the post. It sends `cap` with `dm:0` and
 `fc:0` and refuses to send `dm>=1`, `fc` or `rv` of 1. The state is leased, not locked: a
 second concurrent call fails with "dyad busy".
+
+Unacked frames (`pending`) are keyed by counter (`{counter:010}:{frame id}`) and
+bounded: at 256 unacked, or when the next counter is 256 past the oldest unacked
+one (a lost frame while later ones are acked), `send` fails with `PEER_BEHIND`
+and nothing is dropped; sends resume as acks arrive. That keeps every frame well
+inside the receiver's 512 skipped keys (and Geb's cooldown on a jump of more than
+512, round 3 section 6). `retransmit_due` reposts in counter order, at most 64
+per call, from the MLS client's service pass (every 5 s): a never-posted frame
+once 3 s old (Geb's live-link relay fallback), a posted but unacked one every
+60 s until 15 min after it was sent (round 4 Q7); they stay pending after that.
+UNVERIFIED: the 60 s repost interval and that a 256-frame count (not Geb's 2 MB
+or age limit) is the right bridge-side bound; there is no `rx` handling, so the
+peer's receive counter is inferred from acks only.
 
 ## VTC room side rules
 
@@ -342,9 +362,24 @@ The supervisor ends `End::Halted` for both kinds and never retries.
   They fail with "the store at ... is in use by another process" rather than
   the engine's lock error (`fjall_store::open_err`; `config`-only commands such
   as `link list` do not open it).
-- Not covered: too many held commits (`Error::Unsupported` from
-  `hold_commit`) and a build without `geb-mls` (the default `UnsupportedGroup`
-  refuses every commit each tick) still fail per tick with backoff.
+- Not covered: a build without `geb-mls` (the default `UnsupportedGroup`
+  refuses every commit each tick) still fails per tick with backoff.
+- **Held commits are bounded and never fail a poll** (`geb/settle.rs`): an `mc`'s
+  `e` and bytes are unauthenticated until judged, so a limit must not be a hard
+  stop any member can trigger. `e` more than 8 epochs ahead of ours is dropped at
+  the door; at most 64 ahead-of-us commits are held (a further one is dropped,
+  newest first); at 256 held in all a commit already recorded failed is evicted
+  (oldest first), else the newcomer is dropped. Drops are logged
+  (`security_alert`). Only commits made from our own epoch hold the read cursor
+  back. UNVERIFIED (bridge-side; the answers state no such cap): that dropping
+  is right where Geb holds, and that a dropped or cursor-passed future commit is
+  recovered by `rs`/`rc` and the re-read.
+- **A commit with content Geb's check is not described for** (Update,
+  PreSharedKey, ReInit, SelfRemove, custom proposals, a group-context change
+  beyond the policy, a non-UTF-8 identity) is refused and the walk goes on (as
+  for any commit failing `validCommit`, round 4 Q1), no longer a halt: a member
+  must not be able to halt the link by commit content alone. UNVERIFIED: what
+  Geb does with them (OpenMLS may refuse them first, also a skip).
 
 ## OpenMLS version (UNVERIFIED, needs a live run)
 
@@ -511,8 +546,17 @@ alignment change.
   local copy that is missing/evicted (snapshot says we were seated, group gone); a
   `seat-check` while we hold nothing; a re-seat Welcome that has not come 120 s
   after the re-seat Commit merged.
-- **Re-seat**: a Welcome while seated (or while `Reseating`) replaces the group:
-  only from a current member's device, after `treeRefusal`, the direct-policy
+- **Re-seat**: a Welcome while seated (or while `Reseating`) replaces the group,
+  but only when a re-seat is EXPECTED: state `Reseating`, a recorded split we lost,
+  a lost local copy, or a `seat-ask` of ours sent within 20 minutes; otherwise it
+  is ignored and logged (`security_alert`), because any member can build a group
+  with the room's id from one of our published KeyPackages. It must also not come
+  from an epoch below ours unless we lost a split or our copy. The welcomer is
+  NOT restricted to the elected healer (any member can commit a re-seat). A
+  Welcome that races ahead of its commit is ignored and recovered by the 120 s
+  seat-ask. UNVERIFIED: whether Geb accepts an unexpected replacing Welcome (the
+  answers say only that a `join` replaces); the gate, the 20-minute window and the
+  epoch rule are bridge-side. Accepted only from a current member's device, after `treeRefusal`, the direct-policy
   refusal and the other Welcome checks, and only if our own leaf names our DID,
   is bound and carries the key we hold. The old group is deleted from storage
   first (OpenMLS refuses `GroupAlreadyExists` otherwise); any refusal restores a
@@ -545,11 +589,51 @@ alignment change.
 - An oversize outbox entry (cannot come out of the mapping layer, which cuts at
   the room's unit limit) is a permanent journalled failure (xref `failed:<key>`,
   `status` shows `oversize_failed`), never retried.
+- Other permanent failures are dead-lettered the same way (xref `failed:<key>`,
+  `failed:in:<origin id>`, `failed:browse:<key>@<version>`; `status` shows
+  `dead_lettered`): a non-retryable room error (key collision, size refusal), a
+  line that cannot be encoded, a record the persona can never read. The cursor
+  passes them. Retryable and transport errors are never dead-lettered: they stop
+  the tick, resume with backoff, and never block the other direction. A sealed put
+  that ran out of its 3 re-seal attempts is continued from the version the host
+  reports (an update over what landed), not wedged. UNVERIFIED: that a
+  non-retryable room error is always content-specific rather than a
+  configuration fault an operator could fix (it is dead-lettered, visible in
+  `status` and the log, not retried).
 - Sending a leave, healer duty, persona-card intake, fork choice.
+
+### Review backlog (2026-11-09 reviews; P0 fixed, these are not)
+
+From `the 2026-11-09 review notes`. One line each.
+
+- `rs` flood: a member varying `a`/`e` defeats the once-a-minute guard and draws up to 64 `rc` frames per 5 s (`geb/mls/client/heal.rs` `on_rs`, `COMMIT_KEEP`). Rate-limit per peer.
+- A false fork status from any member overwrites `heal.p.split`; `same_auth` compares a 1-hex-char prefix (`geb/mls/client/heal.rs`, `geb/status.rs` `clean_hex`). Require 16 hex, ignore epochs we hold no chain entry for.
+- `judged` is unbounded between merges (`geb/mls/client.rs`); state is not persisted after `open`, so a crash loses lines opened earlier in the poll (pump atomicity).
+- `StatefulDyad::recv` clears opened frames durably before the consumer has acted, so a crash loses an acked Welcome/`rc`/leave (`geb/dyad.rs` `recv`; needs a two-phase hand-off).
+- Nostr client leaves REQ subscriptions open after a timeout and truncates silently at 5,000 events (`geb/nostr.rs` `expire`, `MAX_FETCH_EVENTS`).
+- `newest` is not clamped to the local clock, so a future-dated event stalls the read window (`geb/dyad.rs` `newest`, `inbox_newest`).
+- `did_peer::document` panics on a multi-byte purpose character (`geb/crypto/did_peer.rs:146`, latent).
+- Line `sg` is verified over a lossy re-serialisation, so a newer Geb field makes lines show Unverified (`geb/room.rs`, `geb/wire/mod.rs` `signing_doc`).
+- Secret hygiene: chain keys as plain `String`/`Vec<u8>`, no `Zeroizing` on `state_get` or `ecdh`/`hkdf32` outputs (`geb/crypto/ratchet.rs`, `atrest.rs`).
+- A frame that opens but fails `parse_frame` is dropped unacked, so the sender reposts for ever (`geb/dyad.rs`; Geb acks before reading the op); the jump limit is 65,536 with no cooldown (more lenient than Geb); at-rest records have no rollback counter in the AAD.
+- `geb connect` and `geb stock-kps` ignore the pause flag and a persisted halt (`service.rs` `offline_parts`, `ops.rs`, `main.rs`).
+- Unbounded state growth: journal, outbox and xref are never pruned and `outbox_unposted` scans all history each tick (`fjall_store.rs`, `pump.rs`, `ops.rs`).
+- `link pause` can be reverted by a concurrent `link add` (read-modify-write over a network call); `Config::save` does not fsync or create 0600 (`cli.rs` `link_add`, `config.rs`).
+- `directions` defaults to `both` (absence is the most permissive reading) (`config.rs`, `main.rs`).
+- A VTC-side refusal halts as "the foreign room refused" with the wrong remediation; add `HaltReason::VtcRefused` (`vtc/host.rs`, `pump.rs`, `halt.rs`).
+- Forged attribution: only the first line of a bridged body is the real header; quote every body line and strip bidi format characters (`mapping.rs` `prepare_outbound`, `strip_controls`, `sanitize_label`).
+- CI: the `harness` job is manual-only and cannot resolve `room-host` until the placeholder URL is replaced; Cargo.lock is not committed; patched VTI crate versions/features are unchecked against crates.io (`.github/workflows/ci.yml`, `harness/Cargo.toml`).
 
 ### UNVERIFIED points that still stand
 
 Round 4 settled most of the round 2 and 3 follow-ups (see "Round 4 answers").
+Bridge-side choices made in the P0 pass, none stated by Geb: the held-commit
+bounds and the drop (never halt) policy; a commit with content outside the
+described check is refused and skipped; signed leaves are kept only for seated
+signers and pruned on removal; a replacing Welcome needs an expected re-seat
+(the 20-minute seat-ask window and the lower-epoch rule are ours); the 256
+unacked-frame cap and the 3 s / 60 s / 15 min repost schedule; that dead-lettering
+every non-retryable room error is right.
 Still open: OpenMLS 0.8.2's own acceptance of …
 … path; which of failed and refused fires for a by-reference
 commit; the live relay limits (see below); whether the `lv` line's `sg` uses the

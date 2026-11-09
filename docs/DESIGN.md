@@ -506,8 +506,12 @@ re-seats, root policy changes, every 0.5.15 bound-leaf refusal) are handled norm
 refused one is skipped as Geb skips it. A "pending" seating (an "ask" room) is a state,
 not an error: the link idles and re-checks each tick.
 
-Not covered by a halt: too many held commits (`Error::Unsupported` from `hold_commit`), and a build
-without `geb-mls` (`UnsupportedGroup` refuses each tick), which fail per tick with backoff.
+Not covered by a halt: a build without `geb-mls` (`UnsupportedGroup` refuses each tick), which fails
+per tick with backoff. Held commits no longer fail a poll: an `mc`'s `e` and bytes are unauthenticated,
+so a commit more than 8 epochs ahead is dropped, at most 64 ahead of us are held, at 256 held a failed
+one is evicted else the newcomer is dropped (logged, never an error), and only commits from our own
+epoch hold the read cursor. A commit with content the check is not described for is refused and
+skipped, not a halt (UNVERIFIED against Geb).
 
 **What `status` shows.** The pinned Geb reading, then per link: `enabled` or `PAUSED`, the browse
 version, the foreign cursor (seconds), the outbox depth (journalled, not yet posted), the time of
@@ -563,8 +567,20 @@ unless something changed. Both commands open the link's store, so `run` must be 
 
 **Recovery notes.**
 
-- A sealed record left at a wrong version by a crash mid-race is not repaired; it is reported as a
-  typed read error.
+- A sealed record left at a wrong version (a put that ran out of its 3 re-seal attempts, or a crash
+  mid-race) is continued from the version the host reports: the next create-only put conflicts, the
+  record does not open, and it is rewritten as an update over `currentVersion`.
+- A failure that cannot pass (a non-retryable room error such as a key collision, a line that cannot
+  be encoded, a record the persona can never read) is dead-lettered: xref `failed:...` with the
+  reason, counted (`status` shows `dead_lettered`), and the cursor passes it. Retryable errors stop
+  the tick and resume; the two directions run independently, so a stuck one does not starve the other.
+- Unacked dyad frames are capped (256 unacked, or a 256-counter span from the oldest): beyond it
+  sending to that peer stops with `PEER_BEHIND` and nothing is dropped. Unposted or unacked frames
+  are reposted in counter order from the service loop (3 s, then every 60 s until 15 min).
+- A replacing Welcome while seated is accepted only when a re-seat is expected (re-seating, a split
+  we lost, a lost copy, or a recent `seat-ask` of ours), and not from a lower epoch unless we lost a
+  split or our copy; otherwise it is ignored and logged. Signed leaves are kept only for seated signers
+  and pruned on removal (UNVERIFIED against Geb).
 - A restart loses the settle queue (re-read from the relay; the cursor barrier holds the position)
   and the dedup window (the journal covers it).
 - After a real fork the bridge asks and waits: a Geb member must commit the re-seat (healer duty is not built). A re-seat Welcome is accepted; if it never comes the bridge asks again with a fresh bound package every 600 s.
