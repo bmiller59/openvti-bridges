@@ -194,17 +194,30 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   VTI build graph, and so nothing Geb-shaped is pulled into it. Only the
   features that need it enable it: `cli`, `keyring` and `harness`
   (`geb-live` and `geb-mls` do not).
-- **`harness`** (implies `vtc`): optional dependencies on `room-host`,
-  `vti-rooms-dtg` test support and `vtc-client`, for `tests/harness.rs`. They
-  are optional rather than dev-dependencies so a default `cargo test` does not
-  compile the room host.
+- **`harness`** (implies `vtc`): test support only, no room host:
+  `HostDelivery::for_loopback_tests`, the in-process MLS `sim`, and
+  `vta-sdk/test-loopback` for `tests/custody.rs` and `tests/cli.rs`.
+  The tests that need a real `room-host` are the **separate `harness/` package**
+  (`harness/tests/harness.rs`, `harness/tests/e2e.rs`; not a workspace member,
+  its own git-ignored lock). `room-host` is not published, so `harness/Cargo.toml`
+  takes it by git under a placeholder URL; that dependency must never go back into
+  the root manifest, because cargo resolves optional dependencies too and the
+  root crate would stop resolving for everyone.
 
-Run the harness: it needs the local-only `.cargo/config.toml` override (git-ignored, README:
-a `[patch]` entry pointing `room-host` at a local VTI checkout, plus `[patch.crates-io]` for VTI
-crates not in the cargo cache), because `room-host` is a placeholder git dependency. Then
-`cargo test --offline --features "cli harness geb-live geb-mls" --no-fail-fast`; `tests/harness.rs` and
-`tests/e2e.rs` need `harness`, and `e2e` also `geb-live` and `geb-mls`. Full counts at the last
-run: 273 lib, `cli` 5, `custody` 5, `e2e` 3, `geb_live` 9, `harness` 8, `vectors` 11, `vectors2` 9.
+**What CI can run** (`.github/workflows/ci.yml`; none of it has run yet, there is no
+remote): fmt; clippy and tests for default, `cli geb-live geb-mls` and
+`cli harness geb-live geb-mls`; `cargo deny check`; a Signed-off-by check on PRs. CI
+generates `Cargo.lock` first because none is committed (a lock produced here has
+path-patched sources). The `harness/` package stays manual until the URL is real. Do not
+write "verified in CI" for anything.
+
+Run everything locally: the root crate needs the local-only `.cargo/config.toml` override
+(git-ignored; `[patch.crates-io]` for VTI crates not in the cargo cache, plus a `[patch]` for
+`room-host`). `cargo test --offline --features "cli harness geb-live geb-mls" --no-fail-fast`
+in the root gives 273 lib, `cli` 5, `custody` 5, `geb_live` 9, `vectors` 11, `vectors2` 9. For
+the room-host tests, `cd harness && cargo test --offline`: `e2e` 3, `harness` 8. A `[patch]` on
+a git source still has to fetch it on a fresh resolve (no lock), so offline either point
+`room-host` at a path in `harness/Cargo.toml` temporarily (do not commit that) or keep a lock.
 
 - **`geb-live`**: `geb::nostr::NostrRelay` (a `GebRelay` over one websocket per
   identity: wss only, `ws://` only for 127.0.0.1, capped jittered reconnect,
@@ -287,8 +300,7 @@ second concurrent call fails with "dyad busy".
   mirrors a recorded split (`heal::Split`, sealed snapshot) so `status` can show it without
   keys: `waiting-for-reseat` / `branch-won` -> `reseated` when a re-seat Welcome is accepted
   (`MlsGroupClient::with_fork_marker`, `sync_fork_marker`). Never add a secret to it.
-- `wiring::assemble` builds a link; the end-to-end test (`tests/e2e.rs`,
-  features `harness geb-live geb-mls`) uses the same assembly. Its header says
+- `wiring::assemble` builds a link; the end-to-end test (`harness/tests/e2e.rs`) uses the same assembly. Its header says
   what it does not prove (byte-compatibility with real Geb).
 - **Edit and retraction are decided by the record KEY, never by `version`**
   (the host's version is room-wide arrival order). `xref` holds

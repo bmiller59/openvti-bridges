@@ -133,10 +133,10 @@ VTC side, operations (feature-gated):
 | `geb-mls` | `openmls` 0.9, `openmls_rust_crypto`, `openmls_basic_credential`, `openmls_traits`, `tls_codec` | `MlsGroupClient`, own provider; no `vti-rooms` |
 | `keyring` | `vtc`, `vti-secrets/keyring`, `vta-sdk/keyring` | OS keyring as the secret store |
 | `cli` | `vtc`, `geb-live`, `geb-mls`, `clap`, `tracing-subscriber`, `vta-sdk/provision-client`, `vta-sdk/crypto-provider` | The `vti-geb-bridge` binary (`required-features = ["cli"]`) |
-| `harness` | `vtc`, `room-host`, `vti-rooms`, `vti-rooms-dtg`, `vtc-client`, `dtg-credentials`, `axum`, `chrono`, `vta-sdk/test-loopback` | For `tests/harness.rs` and `tests/e2e.rs`. Optional, not dev-dependencies, so a default `cargo test` does not compile the room host |
+| `harness` | `vtc`, `vta-sdk/test-loopback` | Test support: loopback host delivery, the in-process MLS `sim`, the loopback sink for `tests/custody.rs` and `tests/cli.rs`. No room host: the real-`room-host` tests are the separate `harness/` package |
 
-`vti-geb-bridge` depends on published VTI crates by version, except `room-host`, which is not
-published (section 10).
+`vti-geb-bridge` depends on published VTI crates by version. `room-host` is not published; only the
+separate `harness/` package takes it, by git (section 10).
 
 ## 3. The ForeignRoom seam, and adding another adapter
 
@@ -650,24 +650,29 @@ Run (offline once dependencies are cached; run under `nice -n 10` on a shared ma
 
 ```sh
 cargo test                                          # default features
-cargo test --features "cli geb-live geb-mls"        # what CI runs
-cargo test --features "cli harness geb-live geb-mls"  # also needs room-host, see below
+cargo test --features "cli geb-live geb-mls"
+cargo test --features "cli harness geb-live geb-mls"  # adds tests/custody.rs and tests/cli.rs
+(cd harness && cargo test)                          # real room-host: manual, see below
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features "cli geb-live geb-mls" -- -D warnings
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, both clippy lines and the first two test lines, on Rust
-1.95.0. The `harness` job is manual (`workflow_dispatch`) because `room-host` cannot resolve.
+CI (`.github/workflows/ci.yml`), on Rust 1.95.0, is configured to run: fmt; clippy and tests for the
+default features, `cli geb-live geb-mls` and `cli harness geb-live geb-mls`; `cargo deny check`; and,
+on pull requests, a check that every commit has a `Signed-off-by` trailer. It generates `Cargo.lock`
+first because none is committed. **None of this has run**: the repository has no remote yet. The
+`harness/` package (real `room-host`) is a manual job (`workflow_dispatch`) that cannot pass until
+its placeholder git URL is real.
 
 | Test target | What it shows | What it does not |
 |---|---|---|
 | Unit tests in `src/` | Pure mapping, config rules, settle queue, `validCommit`, pump behaviour against `Loopback`, `MemoryRoom` and `MemoryStore`, dyad and room behaviour against `FakeRelay`, MLS against `sim.rs` | Anything about real Geb |
 | `tests/vectors.rs` (round 1) and `tests/vectors2.rs` (round 2) | Our primitives reproduce, or open, bytes that Geb's own code produced from fixed test keys: inbox and rendezvous derivation, sealed box, ratchet, frame id, leaf binding, `sign_json`, `did:peer`, plus commit hash and settle winner, exporter, signed leaf, persona card, VRC v2. The exporter is re-derived by a test-only RFC 9420 implementation and the persona card by a test-only verifier | Round 1 vectors are from release 0.5.14 and round 2 from the round 2 reading; none is a `fdf804d` output. Randomised values (sealed box, ratchet nonces) are "open this" checks. The MLS room cannot be fixed by Geb's API, so that vector is one real run plus its inputs |
 | `tests/geb_live.rs` (`geb-live`) | The dyad runs over a real websocket to the in-process `TestRelay` on 127.0.0.1 | Not a real relay; not `wss://` or TLS |
-| `tests/custody.rs`, `tests/cli.rs` | Key minting, export and the CLI against a fake VTA that serves only key create and export (our own reading of those tasks), and the offline binary commands | A real VTA |
-| `tests/harness.rs` (`harness`) | A real `room-host` on a TCP port (open tier), real room credentials, `VtcRoom` over a real `VtaClient`, HTTPS delivery, `FjallStore`, the pump, against a loopback foreign room and a fake VTA sink; a kill between every pair of store operations | The VTA is a fake; the sealed tier is only covered by scripted `sealed_*` tests |
-| `tests/e2e.rs` (`harness`, `geb-live`, `geb-mls`) | The production assembly (`wiring::assemble`) with fjall, sealed state, the real dyad and `MlsGroupClient`, the real `room-host`, the test relay, and a Geb member played by `sim.rs` | Byte compatibility with real Geb; wss/TLS; a real VTA; a sealed-tier room; a mid-step crash (a "kill" is a drop and reboot between steps); persona cards and signed leaves |
+| `tests/custody.rs`, `tests/cli.rs` (`harness`) | Key minting, export and the CLI against a fake VTA that serves only key create and export (our own reading of those tasks), and the offline binary commands | A real VTA |
+| `harness/tests/harness.rs` (separate package) | A real `room-host` on a TCP port (open tier), real room credentials, `VtcRoom` over a real `VtaClient`, HTTPS delivery, `FjallStore`, the pump, against a loopback foreign room and a fake VTA sink; a kill between every pair of store operations | The VTA is a fake; the sealed tier is only covered by scripted `sealed_*` tests |
+| `harness/tests/e2e.rs` (separate package) | The production assembly (`wiring::assemble`) with fjall, sealed state, the real dyad and `MlsGroupClient`, the real `room-host`, the test relay, and a Geb member played by `sim.rs` | Byte compatibility with real Geb; wss/TLS; a real VTA; a sealed-tier room; a mid-step crash (a "kill" is a drop and reboot between steps); persona cards and signed leaves |
 
 Self-consistency is not interoperability. The second OpenMLS client was written by us from the
 guide and the answers, so a shared misreading would pass every test. Only a live compatibility run
@@ -676,14 +681,21 @@ invitation "follows separately" (round 3, section 14).
 
 **Known gaps in testing.**
 
-- `room-host` is not published. `Cargo.toml` takes it as an optional git dependency under the
+- `room-host` is not published. `harness/Cargo.toml` takes it as a git dependency under the
   placeholder URL `https://example.invalid/verifiable-trust-infrastructure.git`, pinned by `rev`.
-  Because even optional dependencies must resolve, no lock file can be created for everyone, and
-  `Cargo.lock` is git-ignored. For a local or offline run, put an uncommitted `.cargo/config.toml`
-  (git-ignored) next to `Cargo.toml` with a `[patch."https://example.invalid/..."]` entry pointing
-  `room-host` at a local VTI checkout, and a `[patch.crates-io]` entry for each VTI crate that is
-  not in the cargo cache. The real URL has to replace the placeholder before the harness can run
-  in CI.
+  It lives in a package of its own because cargo resolves even optional dependencies, so in the
+  root manifest it broke resolution of this crate (and every CI job but fmt) on a clean checkout.
+  For a local or offline run, put an uncommitted `.cargo/config.toml` (git-ignored) in the
+  repository root with a `[patch."https://example.invalid/..."]` entry pointing `room-host` at a
+  local VTI checkout, and a `[patch.crates-io]` entry for each VTI crate not in the cargo cache.
+  The real URL has to replace the placeholder before the harness can run in CI.
+- `Cargo.lock` is not committed. A lock made here contains path-patched VTI crates, which is
+  wrong for everyone else. Someone with network and no override should run
+  `cargo generate-lockfile`, remove `/Cargo.lock` from `.gitignore` and commit it. The VTI crates
+  `vta-sdk` 0.85, `vti-common` 0.61, `vti-secrets` 0.34 and `vti-specs` 0.10 resolve from the
+  local registry index but their sources are not in the local cache, so they have not been
+  built from crates.io, and whether the published `vta-sdk` 0.85 has the `test-loopback`,
+  `provision-client` and `crypto-provider` features is unchecked.
 - The dependencies on published VTI crates (`vta-sdk`, `vti-common`, `vti-secrets`, `vti-specs`,
   `vtc-client`, `vti-rooms`, `vti-rooms-dtg`, and others) have only been built here against local
   path overrides; building against the crates published on crates.io has not been exercised.

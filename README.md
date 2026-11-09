@@ -27,20 +27,42 @@ itself would refuse it and continue, the halt is a deliberate bridge-side choice
 Needs Rust 1.95.0 (edition 2024). Run builds and tests under `nice -n 10` on a shared machine.
 
 ```sh
-cargo test                                            # default features, no network
-cargo test --features "cli geb-live geb-mls"          # what CI runs
+cargo generate-lockfile                               # once, if there is no Cargo.lock (needs network)
+cargo test                                            # default features
+cargo test --features "cli geb-live geb-mls"          # the full CI configuration
+cargo test --features "cli harness geb-live geb-mls"  # also tests/custody.rs and tests/cli.rs
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo build --features cli                            # the vti-geb-bridge binary
 ```
 
-**The `harness` feature does not build by default.** `room-host` is a service binary that is not
-published, so `Cargo.toml` takes it as an optional git dependency under a placeholder URL
-(`https://example.invalid/...`). For local runs, add an uncommitted `.cargo/config.toml`
-(git-ignored) with a `[patch."https://example.invalid/verifiable-trust-infrastructure.git"]` entry
-pointing `room-host` at a local VTI checkout, plus `[patch.crates-io]` entries for VTI crates not in
-your cargo cache. Then `cargo test --features "cli harness geb-live geb-mls"`. `Cargo.lock` is
-git-ignored until the real URL replaces the placeholder. See `docs/DESIGN.md`, section 10.
+**What CI runs today** (`.github/workflows/ci.yml`): `cargo fmt --check`; clippy and tests for the
+default features, for `cli geb-live geb-mls`, and for `cli harness geb-live geb-mls` (which adds
+`tests/custody.rs` and `tests/cli.rs`); `cargo deny check`; a sign-off (DCO) check on pull
+requests. Those jobs need network (crates.io and the advisory database). **None of it has run in
+CI yet**: the repository has no remote, and the published VTI crates it needs (`vta-sdk` 0.85,
+`vti-common` 0.61, `vti-secrets` 0.34, `vti-specs` 0.10) have only been built here against local
+path overrides. Whether `vta-sdk` 0.85 on crates.io has the `test-loopback`, `provision-client` and
+`crypto-provider` features used here is unchecked, so the first CI run is also the first test of
+that.
+
+**What CI does not run, and why.** `harness/tests/harness.rs` and `harness/tests/e2e.rs` need a
+real `room-host`, which is not published and is taken by git under a placeholder URL
+(`https://example.invalid/...`). They live in the separate `harness/` package so that the
+placeholder does not break resolution of this crate. They stay manual until the URL is real.
+
+**The room-host harness.** `harness/` is its own package (not a workspace member, its own
+`Cargo.lock`, git-ignored). To run it, add an uncommitted `.cargo/config.toml` (git-ignored) in
+the repository root with a `[patch."https://example.invalid/verifiable-trust-infrastructure.git"]`
+entry pointing `room-host` at a local VTI checkout, plus `[patch.crates-io]` entries for VTI crates
+not in your cargo cache, then `cd harness && cargo test` (the features are fixed by
+`harness/Cargo.toml`).
+
+**Cargo.lock.** The root `Cargo.lock` is committed once someone with network has generated it
+(`cargo generate-lockfile`, then commit it). It has not been committed yet because it could not be
+produced here without local path overrides, and a lock containing path or placeholder sources
+would be wrong for everyone else. Until it is committed, CI generates one before building. See
+`docs/DESIGN.md`, section 10.
 
 ## Features
 
@@ -52,7 +74,7 @@ git-ignored until the real URL replaces the placeholder. See `docs/DESIGN.md`, s
 | `geb-mls` | The Geb MLS group over OpenMLS 0.9, tested only against an in-process second client |
 | `keyring` | The OS keyring as the secret store (implies `vtc`) |
 | `cli` | The `vti-geb-bridge` binary; implies `vtc geb-live geb-mls` |
-| `harness` | Tests against a real `room-host` and a fake VTA (implies `vtc`; see above) |
+| `harness` | Test support: loopback host delivery, the in-process MLS `sim`, `vta-sdk`'s loopback sink (implies `vtc`). The real-`room-host` tests are the separate `harness/` package |
 
 ## CLI
 
@@ -79,7 +101,8 @@ src/               core: foreign.rs (the seam), model, mapping, pump, store, roo
 src/geb/           the Geb adapter: wire, crypto, dyad, room, settle, policy, vrc, nostr, mls/
 src/vtc/           the VTC room side and HTTPS delivery to the room host
 src/{custody,run,wiring,ops,cli,service,main}.rs   key custody, supervision, operator shell
-tests/             vectors (Geb's), harness, e2e, geb_live, custody, cli; fixtures/ holds the vectors
+tests/             vectors (Geb's), geb_live, custody, cli; fixtures/ holds the vectors
+harness/           separate package: harness and e2e tests against a real room-host (manual)
 docs/              DESIGN.md, geb-bridge-plan.md, geb-bridge-companion-notes.md
 ```
 
@@ -97,7 +120,7 @@ docs/              DESIGN.md, geb-bridge-plan.md, geb-bridge-companion-notes.md
 
 Extracted from the VTI repository (crate `vti-geb-bridge`, branch `feat/geb-bridge`) as a fresh
 import without history; the first commit message names the source commit. It depends on published
-VTI crates by version, except `room-host`.
+VTI crates by version; only the separate `harness/` package needs `room-host`.
 
 ## Contributing
 

@@ -35,7 +35,7 @@ ignore = [
   recommends migrating away. Build-time only, and twice removed from
   anything we ship: it is a proc-macro, so it runs in the compiler and
   links into no artifact, and its path into this crate is
-  the `geb-mls` feature (and vtc-client's `mls` under `harness`) —
+  the `geb-mls` feature (and vtc-client's `mls` in the `harness/` package) —
   openmls_rust_crypto -> hpke-rs -> libcrux-sha3 -> hax-lib ->
   hax-lib-macros. A default build of every crate here does not resolve
   it at all.
