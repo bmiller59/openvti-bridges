@@ -173,17 +173,82 @@ impl Config {
         Self::from_toml(&raw).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
     }
 
-    /// Write the config (validated first) by replacing the file. Comments in a
-    /// hand-edited file are not kept.
+    /// Write the config (validated first) by replacing the file, durably:
+    /// the temp file is created mode `0600` (the config names the secrets
+    /// backend and every link's identifiers), written, fsynced, renamed over
+    /// the original, and the directory fsynced, so a crash leaves the old file
+    /// or the new one, never an empty or partial one. Comments in a
+    /// hand-edited file are not kept. For a read-modify-write use
+    /// [`Config::modify`], which also serialises writers.
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
         self.validate()?;
         let raw = toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = std::path::PathBuf::from(tmp);
-        std::fs::write(&tmp, raw)
-            .and_then(|()| std::fs::rename(&tmp, path))
-            .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))
+        let io = |what: &str, e: std::io::Error| {
+            Error::Config(format!("{what} {}: {e}", path.display()))
+        };
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp).map_err(|e| io("write", e))?;
+        // A leftover temp file from a crash keeps its old mode: set it again.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| io("chmod", e))?;
+        }
+        f.write_all(raw.as_bytes()).map_err(|e| io("write", e))?;
+        f.sync_all().map_err(|e| io("sync", e))?;
+        drop(f);
+        std::fs::rename(&tmp, path).map_err(|e| io("replace", e))?;
+        // Make the rename itself durable.
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| io("sync directory of", e))?;
+        }
+        Ok(())
+    }
+
+    /// Read the current file, apply `f`, and save: under an exclusive lock on
+    /// `<config>.lock`, so two commands (`link pause`, `link add`, ...) cannot
+    /// each overwrite the other's change with a stale copy. Only what `f`
+    /// changes changes. The lock is held for the read, `f` and the write, never
+    /// across a network call: do the remote work first, then `modify` to
+    /// record it. Readers (the running pump's pause check) take no lock; they
+    /// see the old file or the new one, as [`Config::save`] replaces it
+    /// atomically.
+    pub fn modify<R>(
+        path: &std::path::Path,
+        f: impl FnOnce(&mut Config) -> Result<R>,
+    ) -> Result<R> {
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let lock = opts
+            .open(&lock_path)
+            .map_err(|e| Error::Config(format!("open the config lock: {e}")))?;
+        lock.lock()
+            .map_err(|e| Error::Config(format!("lock the config: {e}")))?;
+        let mut cfg = Self::load(path)?;
+        let out = f(&mut cfg)?;
+        cfg.save(path)?;
+        Ok(out)
+        // The lock is released when `lock` is dropped.
     }
 
     /// `data_dir` resolved against the config file's directory.

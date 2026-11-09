@@ -317,7 +317,32 @@ pub struct NewLink {
 /// `link add`: mint this link's keys with a fresh setup key, then record it.
 /// The new link starts paused (`enabled = false`).
 pub async fn link_add(config_path: &Path, setup_key_file: &Path, n: NewLink) -> Result<()> {
-    let (mut cfg, _, store) = open(config_path).await?;
+    let (_, _, store) = open(config_path).await?;
+    link_add_with(config_path, n, |cfg, link| async move {
+        let url = cfg
+            .vta
+            .url
+            .clone()
+            .ok_or_else(|| Error::Config("[vta] url is not set".into()))?;
+        let secrets = store.load().await?.ok_or_else(|| {
+            Error::Config("the secret store holds no bridge keys; run setup".into())
+        })?;
+        let client = setup_client(&cfg.vta.did, &url, setup_key_file).await?;
+        let secrets = provision(&client, &cfg.vta.context, &[link], secrets).await?;
+        store.save(&secrets).await
+    })
+    .await
+}
+
+/// The part of `link add` that is not the VTA call. `mint` runs the remote
+/// effect (key minting and storing the secrets) and may take seconds; the
+/// config is not held across it. See [`Config::modify`].
+pub async fn link_add_with<F, Fut>(config_path: &Path, n: NewLink, mint: F) -> Result<()>
+where
+    F: FnOnce(Config, LinkConfig) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut cfg = Config::load(config_path)?;
     let link = LinkConfig {
         id: n.id,
         vtc_room: n.vtc_room,
@@ -337,20 +362,21 @@ pub async fn link_add(config_path: &Path, setup_key_file: &Path, n: NewLink) -> 
     };
     cfg.links.push(link.clone());
     cfg.validate()?;
-    let url = cfg
-        .vta
-        .url
-        .clone()
-        .ok_or_else(|| Error::Config("[vta] url is not set".into()))?;
-    let secrets = store
-        .load()
-        .await?
-        .ok_or_else(|| Error::Config("the secret store holds no bridge keys; run setup".into()))?;
-    let client = setup_client(&cfg.vta.did, &url, setup_key_file).await?;
-    let secrets = provision(&client, &cfg.vta.context, &[link], secrets).await?;
-    store.save(&secrets).await?;
-    cfg.save(config_path)?;
-    Ok(())
+    mint(cfg, link.clone()).await?;
+    // Re-read and merge: the config may have changed while `mint` ran (a
+    // `link pause` is the kill switch), so only this link is added to what is
+    // on disk now, and nothing else is rewritten from the copy loaded above.
+    Config::modify(config_path, |cfg| {
+        if cfg.links.iter().any(|l| l.id == link.id) {
+            return Err(Error::Config(format!(
+                "link {} was added while this command ran; its keys were minted: `link remove {}` \
+                 and add it again",
+                link.id, link.id
+            )));
+        }
+        cfg.links.push(link);
+        Ok(())
+    })
 }
 
 /// `link list`: one line per link.
@@ -396,25 +422,23 @@ pub fn pause_notice(id: &str, poll_secs: u64, enabled: bool) -> String {
 /// `link pause` / `link resume`. Resuming does not clear a halt. Returns the
 /// message to print: what a running process will do about it, and how soon.
 pub fn link_set_enabled(config_path: &Path, id: &str, enabled: bool) -> Result<String> {
-    let mut cfg = Config::load(config_path)?;
-    let l = cfg
-        .links
-        .iter_mut()
-        .find(|l| l.id == id)
-        .ok_or_else(|| Error::Config(format!("no link {id}")))?;
-    l.enabled = enabled;
-    let poll = l.poll_secs;
-    cfg.save(config_path)?;
+    let poll = Config::modify(config_path, |cfg| {
+        let l = cfg
+            .links
+            .iter_mut()
+            .find(|l| l.id == id)
+            .ok_or_else(|| Error::Config(format!("no link {id}")))?;
+        l.enabled = enabled;
+        Ok(l.poll_secs)
+    })?;
     Ok(pause_notice(id, poll, enabled))
 }
 
 /// `link remove`: drop the link and its secrets. The VTA key records are not
 /// revoked and the link's data directory is left in place.
 pub async fn link_remove(config_path: &Path, id: &str) -> Result<()> {
-    let (mut cfg, _, store) = open(config_path).await?;
-    let before = cfg.links.len();
-    cfg.links.retain(|l| l.id != id);
-    if cfg.links.len() == before {
+    let (cfg, _, store) = open(config_path).await?;
+    if !cfg.links.iter().any(|l| l.id == id) {
         return Err(Error::Config(format!("no link {id}")));
     }
     if let Some(mut s) = store.load().await?
@@ -422,19 +446,23 @@ pub async fn link_remove(config_path: &Path, id: &str) -> Result<()> {
     {
         store.save(&s).await?;
     }
-    cfg.save(config_path)
+    Config::modify(config_path, |cfg| {
+        cfg.links.retain(|l| l.id != id);
+        Ok(())
+    })
 }
 
 /// Add a connected peer to a link's `geb_peers`.
 pub fn add_peer(config_path: &Path, id: &str, peer: &str) -> Result<()> {
-    let mut cfg = Config::load(config_path)?;
-    let l = cfg
-        .links
-        .iter_mut()
-        .find(|l| l.id == id)
-        .ok_or_else(|| Error::Config(format!("no link {id}")))?;
-    if !l.geb_peers.iter().any(|p| p == peer) {
-        l.geb_peers.push(peer.into());
-    }
-    cfg.save(config_path)
+    Config::modify(config_path, |cfg| {
+        let l = cfg
+            .links
+            .iter_mut()
+            .find(|l| l.id == id)
+            .ok_or_else(|| Error::Config(format!("no link {id}")))?;
+        if !l.geb_peers.iter().any(|p| p == peer) {
+            l.geb_peers.push(peer.into());
+        }
+        Ok(())
+    })
 }

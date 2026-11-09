@@ -440,3 +440,92 @@ fn directions_is_required_on_link_add_and_in_the_config() {
         "{err}"
     );
 }
+
+/// P1-5: a `link pause` issued while `link add` is talking to the VTA is not
+/// reverted when `link add` saves, and the new link is recorded.
+#[tokio::test]
+async fn a_pause_during_link_add_survives_the_save() {
+    use vti_geb_bridge::cli::NewLink;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let cfg = SetupInputs::from_toml_str(SETUP).unwrap().config().unwrap();
+    cfg.save(&path).unwrap();
+    cli::link_set_enabled(&path, "l1", true).unwrap();
+    let new = NewLink {
+        id: "l3".into(),
+        vtc_room: "room-3".into(),
+        host_did: "did:webvh:host.example".into(),
+        host_url: "https://host.example".into(),
+        persona: "did:key:z6Mkp3".into(),
+        geb_room_id: "geb-room-0003".into(),
+        directions: "to_foreign".into(),
+        tier: "open".into(),
+        tier_optin: true,
+        poll_secs: 10,
+        display_name: None,
+    };
+    let p2 = path.clone();
+    cli::link_add_with(&path, new, move |_, _| async move {
+        // The operator pauses l1 while the VTA call is in flight.
+        cli::link_set_enabled(&p2, "l1", false).map(|_| ())
+    })
+    .await
+    .unwrap();
+    let after = Config::load(&path).unwrap();
+    assert_eq!(after.links.len(), 3, "the new link is recorded");
+    assert!(
+        !after.links.iter().find(|l| l.id == "l1").unwrap().enabled,
+        "the pause survived link add's save"
+    );
+    assert!(!after.links.iter().find(|l| l.id == "l3").unwrap().enabled);
+}
+
+/// P1-5: the config names secret backends, so it is private, and the write is
+/// durable.
+#[cfg(unix)]
+#[test]
+fn the_config_is_written_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let cfg = SetupInputs::from_toml_str(SETUP).unwrap().config().unwrap();
+    cfg.save(&path).unwrap();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    // A later save (pause) keeps it private, whatever the file was before.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    cli::link_set_enabled(&path, "l1", true).unwrap();
+    assert_eq!(mode(&path), 0o600);
+    assert!(
+        !dir.path().join("config.toml.tmp").exists(),
+        "no temp file is left behind"
+    );
+}
+
+/// P1-5: config writers are serialised; concurrent edits do not lose each
+/// other's changes.
+#[test]
+fn concurrent_config_edits_are_not_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    SetupInputs::from_toml_str(SETUP)
+        .unwrap()
+        .config()
+        .unwrap()
+        .save(&path)
+        .unwrap();
+    let handles: Vec<_> = (0..12)
+        .map(|i| {
+            let p = path.clone();
+            std::thread::spawn(move || {
+                cli::add_peer(&p, "l1", &format!("did:peer:2.peer{i}")).unwrap();
+                cli::link_set_enabled(&p, "l2", i % 2 == 0).unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.links[0].geb_peers.len(), 12, "no peer was lost");
+}
