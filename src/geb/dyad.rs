@@ -183,14 +183,86 @@ pub struct RatchetRecord {
     pub send: SendState,
     /// Receiving chain.
     pub recv: RecvState,
-    /// Sent, not yet acked: frame id to frame base64.
+    /// Sent, not yet acked: `"{counter:010}:{frame id}"` to frame base64, so
+    /// the map iterates in send (counter) order. A record written before this
+    /// keyed by the bare frame id still loads; its entries are reposted
+    /// first, once, and acked and removed as usual.
     pub pending: BTreeMap<String, String>,
+    /// When each pending frame was first sent and last posted, by the same
+    /// key (seconds).
+    #[serde(default)]
+    pub meta: BTreeMap<String, PendingMeta>,
     /// Opened frames not yet handed to the caller, with their ratchet counter
     /// (handed over in counter order: equal `created_at` seconds sort by
     /// event id, which is not send order).
     pub inbound: Vec<(u32, Frame)>,
     /// Frame ids already opened (re-acked, never re-opened).
     pub done: VecDeque<String>,
+}
+
+/// Send and post times of one pending frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingMeta {
+    /// When the frame was first sent (its counter was spent), seconds.
+    pub sent: u64,
+    /// When the relay last accepted a post of it; `None` while no post of it
+    /// has succeeded (the first one failed, or we restarted before knowing).
+    pub posted: Option<u64>,
+}
+
+/// Most frames sent and not yet acked. Beyond it we stop sending to that peer
+/// (see [`PEER_BEHIND`]) and never drop an unacked frame.
+///
+/// Why: a receiver keeps 512 skipped message keys ([`MAX_SKIPPED`](super::crypto::crate::geb::crypto::ratchet::MAX_SKIPPED))
+/// and Geb applies a cooldown to a jump of more than 512 counters (answers
+/// round 3 section 6, "do not run hundreds of frames ahead of an offline
+/// peer"). Capping the unacked frames, and the counter span from the oldest
+/// unacked one to the next (`MAX_UNACKED` too), keeps every frame well inside
+/// that window. Geb's own limit is 15 minutes, 256 frames and 2 MB for frames
+/// it will seal again (round 4 Q7); the count matches, the age and bytes are
+/// not applied to what we send.
+pub const MAX_UNACKED: usize = 256;
+/// The error text when sending is stopped because the peer has not acked.
+pub const PEER_BEHIND: &str = "the peer is behind: too many frames are unacked; not sending more \
+     until it acks (nothing was dropped)";
+/// An unposted frame is reposted once it is this old (seconds): Geb itself
+/// falls back from a live link to the relay after 3 s (round 4 Q7).
+pub const REPOST_AFTER_SECS: u64 = 3;
+/// A posted but unacked frame is reposted at most this often (seconds). The
+/// relay already holds the original for 7 days; this is only for a relay that
+/// lost it.
+pub const REPOST_EVERY_SECS: u64 = 60;
+/// A posted frame is no longer reposted after this long (seconds), Geb's own
+/// retention for an unacked frame (round 4 Q7). It stays pending (and counts
+/// against [`MAX_UNACKED`]); only the reposting stops.
+pub const REPOST_UNTIL_SECS: u64 = 15 * 60;
+/// Most frames reposted by one call.
+pub const REPOST_BATCH: usize = 64;
+
+fn pending_key(counter: u32, id: &str) -> String {
+    format!("{counter:010}:{id}")
+}
+
+/// The counter a pending key records (`None` for a legacy key).
+fn counter_of(key: &str) -> Option<u32> {
+    let (c, _) = key.split_once(':')?;
+    c.parse().ok()
+}
+
+/// Remove the pending frame with this id, however it is keyed.
+fn remove_pending(r: &mut RatchetRecord, id: &str) -> bool {
+    let suffix = format!(":{id}");
+    let keys: Vec<String> = r
+        .pending
+        .keys()
+        .filter(|k| *k == id || k.ends_with(&suffix))
+        .cloned()
+        .collect();
+    for k in &keys {
+        r.pending.remove(k);
+        r.meta.remove(k);
+    }
+    !keys.is_empty()
 }
 
 /// An invitation read from our inbox, not yet answered.
@@ -663,6 +735,7 @@ impl StatefulDyad {
             send: SendChain::new(&ck, mine)?.snapshot(),
             recv: RecvChain::new(&ck, mine.other())?.snapshot(),
             pending: BTreeMap::new(),
+            meta: BTreeMap::new(),
             inbound: Vec::new(),
             done: VecDeque::new(),
         })
@@ -889,7 +962,7 @@ impl StatefulDyad {
                     }
                     Envelope::Ack { a } => {
                         for id in a {
-                            if r.pending.remove(&id).is_some() {
+                            if remove_pending(r, &id) {
                                 report.acked += 1;
                             }
                         }
@@ -981,16 +1054,43 @@ impl StatefulDyad {
                 "frame too large for one event (fragments are not supported)".into(),
             ));
         }
+        // Stop, never drop: too many frames unacked, or the oldest unacked one
+        // is too far behind the counter we would spend (a lost frame while
+        // later ones are acked grows the span without growing the count).
+        let oldest = r.pending.keys().find_map(|k| counter_of(k));
+        let span = oldest.map_or(0, |o| r.send.counter.saturating_sub(o));
+        if r.pending.len() >= MAX_UNACKED || span as usize >= MAX_UNACKED {
+            tracing::warn!(
+                unacked = r.pending.len(),
+                span,
+                "the peer has not acked {MAX_UNACKED} frames; not sending to it until it does"
+            );
+            return Err(Error::Foreign(PEER_BEHIND.into()));
+        }
+        let counter = r.send.counter;
         let mut sc = SendChain::restore(&r.send)?;
         let f = sc.seal_b64(&plain)?;
         let id = frame_id::frame_id(&f);
         r.send = sc.snapshot();
-        r.pending.insert(id, f.clone());
+        let key = pending_key(counter, &id);
+        r.pending.insert(key.clone(), f.clone());
+        let now = self.now();
+        r.meta.insert(
+            key.clone(),
+            PendingMeta {
+                sent: now,
+                posted: None,
+            },
+        );
         // The counter and the pending frame are durable before the post.
         self.save_ratchet(peer, r).await?;
         let mine = my_side(&self.id.did, peer)?;
         self.post_envelope(peer, &Envelope::Frame { f, d: mine })
-            .await
+            .await?;
+        if let Some(m) = r.meta.get_mut(&key) {
+            m.posted = Some(now);
+        }
+        Ok(())
     }
 
     /// Test only: send raw frame JSON, as a peer speaking a newer protocol would.
@@ -1006,36 +1106,89 @@ impl StatefulDyad {
     }
 
     /// Repost every sent-but-unacked frame, unchanged (same ratchet frame, a
-    /// new event). The receiver opens it once and re-acks duplicates. One
-    /// attempt each; the caller decides when to call again.
+    /// new event), lowest counter first. The receiver opens it once and
+    /// re-acks duplicates. One attempt each, [`REPOST_BATCH`] at most per call;
+    /// the first failed post ends the call so the order is kept.
     pub async fn retransmit(&self, peer: &str) -> Result<usize> {
+        self.repost(peer, false).await
+    }
+
+    /// Repost what is due, in counter order: a frame no post of which has
+    /// succeeded, once it is [`REPOST_AFTER_SECS`] old; a posted but unacked
+    /// one every [`REPOST_EVERY_SECS`] until [`REPOST_UNTIL_SECS`] after it
+    /// was first sent. Called on a bounded schedule by the service loop.
+    pub async fn retransmit_due(&self, peer: &str) -> Result<usize> {
+        self.repost(peer, true).await
+    }
+
+    async fn repost(&self, peer: &str, only_due: bool) -> Result<usize> {
         let mut lease = self.lease()?;
         let core = lease.core.get_or_insert_with(HashMap::new);
         self.load(core, peer).await?;
         let p = core
-            .get(peer)
+            .get_mut(peer)
             .ok_or_else(|| Error::Foreign("no connection with this peer".into()))?;
-        let Some(r) = p.ratchet.as_ref() else {
+        let Some(r) = p.ratchet.as_mut() else {
             return Ok(0);
         };
         let mine = my_side(&self.id.did, peer)?;
-        let frames: Vec<String> = r.pending.values().cloned().collect();
-        for f in &frames {
-            self.post_envelope(
-                peer,
-                &Envelope::Frame {
-                    f: f.clone(),
-                    d: mine,
-                },
-            )
-            .await?;
+        let now = self.now();
+        let due: Vec<(String, String)> = r
+            .pending
+            .iter()
+            .filter(|(k, _)| {
+                if !only_due {
+                    return true;
+                }
+                let m = r.meta.get(*k).copied().unwrap_or_default();
+                match m.posted {
+                    None => now.saturating_sub(m.sent) >= REPOST_AFTER_SECS,
+                    Some(t) => {
+                        now.saturating_sub(t) >= REPOST_EVERY_SECS
+                            && now.saturating_sub(m.sent) < REPOST_UNTIL_SECS
+                    }
+                }
+            })
+            .take(REPOST_BATCH)
+            .map(|(k, f)| (k.clone(), f.clone()))
+            .collect();
+        let mut n = 0;
+        for (k, f) in due {
+            self.post_envelope(peer, &Envelope::Frame { f, d: mine })
+                .await?;
+            r.meta.entry(k).or_default().posted = Some(now);
+            n += 1;
         }
-        Ok(frames.len())
+        Ok(n)
+    }
+
+    /// The ids of the pending frames, in the order they are reposted.
+    #[cfg(test)]
+    async fn pending_ids(&self, peer: &str) -> Vec<String> {
+        let mut lease = self.lease().unwrap();
+        let core = lease.core.get_or_insert_with(HashMap::new);
+        self.load(core, peer).await.unwrap();
+        core.get(peer)
+            .and_then(|p| p.ratchet.as_ref())
+            .map(|r| {
+                r.pending
+                    .keys()
+                    .map(|k| {
+                        k.split_once(':')
+                            .map_or(k.clone(), |(_, id)| id.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
 #[async_trait]
 impl GebDyad for StatefulDyad {
+    async fn retransmit_due(&self, peer_did: &str) -> Result<usize> {
+        StatefulDyad::retransmit_due(self, peer_did).await
+    }
+
     async fn send(&self, peer_did: &str, frame: &Frame) -> Result<()> {
         let mut lease = self.lease()?;
         let core = lease.core.get_or_insert_with(HashMap::new);
@@ -1682,5 +1835,154 @@ mod tests {
             ["durable?"]
         );
         assert!(acks(&w) > before);
+    }
+
+    // ---- P0-5: unacked frames are bounded and reposted in order -------------------
+
+    fn flaky_world() -> (World, Arc<Flaky>) {
+        let relay = Arc::new(Flaky {
+            inner: Arc::new(FakeRelay::new()),
+            fail: AtomicBool::new(false),
+        });
+        let now = Arc::new(AtomicU64::new(T0));
+        let (a_store, b_store) = (Arc::new(MemoryStore::new()), Arc::new(MemoryStore::new()));
+        let w = World {
+            a: dyad(ident(1), relay.clone(), a_store.clone(), &now),
+            b: dyad(ident(2), relay.clone(), b_store.clone(), &now),
+            relay: relay.inner.clone(),
+            now,
+            a_store,
+            b_store,
+        };
+        (w, relay)
+    }
+
+    /// Ack everything sent so far: B reads, A syncs.
+    async fn settle_acks(w: &World) {
+        w.now.fetch_add(1, Ordering::SeqCst);
+        w.b.recv(w.a.did()).await.unwrap();
+        w.now.fetch_add(1, Ordering::SeqCst);
+        w.a.sync(w.b.did()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_post_is_reposted_in_counter_order_not_hash_order() {
+        let (w, relay) = flaky_world();
+        connect(&w).await;
+        settle_acks(&w).await;
+        // Three sends whose posts all fail after their counters were spent.
+        for t in ["m0", "m1", "m2", "m3", "m4"] {
+            relay.fail.store(true, Ordering::SeqCst);
+            assert!(w.a.send(w.b.did(), &msg(t)).await.is_err());
+        }
+        assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), 5);
+        let order = w.a.pending_ids(w.b.did()).await;
+        let before = envelopes(&w).len();
+        // Not yet due: a frame is reposted once it is 3 s old.
+        assert_eq!(w.a.retransmit_due(w.b.did()).await.unwrap(), 0);
+        w.now.fetch_add(REPOST_AFTER_SECS, Ordering::SeqCst);
+        assert_eq!(w.a.retransmit_due(w.b.did()).await.unwrap(), 5);
+        let posted: Vec<String> = envelopes(&w)
+            .into_iter()
+            .skip(before)
+            .filter_map(|e| match e {
+                Envelope::Frame { f, .. } => Some(frame_id::frame_id(&f)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(posted, order, "counter order, whatever the hashes are");
+        let mut hashes = order.clone();
+        hashes.sort();
+        assert_ne!(hashes, order, "the ids are not already in sorted order");
+        // The peer gets all five, in order, and the sender's pending drains.
+        w.now.fetch_add(1, Ordering::SeqCst);
+        let got: Vec<_> =
+            w.b.recv(w.a.did())
+                .await
+                .unwrap()
+                .iter()
+                .map(text)
+                .collect();
+        assert_eq!(got, ["m0", "m1", "m2", "m3", "m4"]);
+        w.now.fetch_add(1, Ordering::SeqCst);
+        w.a.sync(w.b.did()).await.unwrap();
+        assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), 0);
+        // And nothing is reposted once acked.
+        w.now.fetch_add(REPOST_EVERY_SECS, Ordering::SeqCst);
+        assert_eq!(w.a.retransmit_due(w.b.did()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn at_the_cap_sending_stops_with_a_clear_error_and_nothing_is_dropped() {
+        let w = world();
+        connect(&w).await;
+        settle_acks(&w).await;
+        // The peer is offline: it reads nothing, so nothing is acked.
+        let mut sent = 0;
+        let mut refused = 0;
+        for i in 0..(MAX_UNACKED + 44) {
+            match w.a.send(w.b.did(), &msg(&format!("m{i}"))).await {
+                Ok(()) => sent += 1,
+                Err(Error::Foreign(m)) if m == PEER_BEHIND => refused += 1,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!((sent, refused), (MAX_UNACKED, 44));
+        assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), MAX_UNACKED);
+        // The peer comes back: every frame opens, in order, none lost.
+        w.now.fetch_add(1, Ordering::SeqCst);
+        let got = w.b.recv(w.a.did()).await.unwrap();
+        assert_eq!(got.len(), MAX_UNACKED);
+        assert_eq!(text(&got[0]), "m0");
+        assert_eq!(text(&got[MAX_UNACKED - 1]), format!("m{}", MAX_UNACKED - 1));
+        w.now.fetch_add(1, Ordering::SeqCst);
+        w.a.sync(w.b.did()).await.unwrap();
+        assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), 0);
+        // Sending resumes.
+        w.a.send(w.b.did(), &msg("again")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_frame_is_sent_more_than_the_window_ahead_of_a_lost_one() {
+        let (w, relay) = flaky_world();
+        connect(&w).await;
+        settle_acks(&w).await;
+        // Frame 0 never reaches the relay; every later one does and is acked,
+        // so the unacked COUNT stays at one while the counter runs on.
+        relay.fail.store(true, Ordering::SeqCst);
+        assert!(w.a.send(w.b.did(), &msg("lost")).await.is_err());
+        let mut sent = 0;
+        let mut stopped = false;
+        for i in 0..600 {
+            match w.a.send(w.b.did(), &msg(&format!("m{i}"))).await {
+                Ok(()) => sent += 1,
+                Err(Error::Foreign(m)) if m == PEER_BEHIND => {
+                    stopped = true;
+                    break;
+                }
+                Err(e) => panic!("{e}"),
+            }
+            if i % 10 == 9 {
+                settle_acks(&w).await;
+            }
+        }
+        assert!(stopped, "the span from the lost frame stops the sender");
+        assert!(
+            sent < crate::geb::crypto::ratchet::MAX_SKIPPED,
+            "{sent} frames sent past a lost one; the receiver keeps {} skipped keys",
+            crate::geb::crypto::ratchet::MAX_SKIPPED
+        );
+        // The lost frame is reposted and the peer still opens it.
+        w.now.fetch_add(REPOST_AFTER_SECS, Ordering::SeqCst);
+        assert_eq!(w.a.retransmit_due(w.b.did()).await.unwrap(), 1);
+        w.now.fetch_add(1, Ordering::SeqCst);
+        let got: Vec<_> =
+            w.b.recv(w.a.did())
+                .await
+                .unwrap()
+                .iter()
+                .map(text)
+                .collect();
+        assert!(got.contains(&"lost".to_string()), "{got:?}");
     }
 }

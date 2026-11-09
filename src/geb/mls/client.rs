@@ -722,6 +722,13 @@ impl MlsGroupClient {
                     continue;
                 }
             };
+            // Repost what is due (a post that failed after its counter was
+            // spent, a frame the relay lost), in counter order, at most once
+            // per service pass (every SERVICE_EVERY_MS); a failure is logged
+            // and tried again next pass.
+            if let Err(e) = self.dyad.retransmit_due(peer).await {
+                tracing::debug!(error = %e, "could not repost unacked dyad frames");
+            }
             // The dyad answered: a link that comes up is told our status.
             let first = self
                 .lock()
@@ -1042,6 +1049,9 @@ impl GebGroup for MlsGroupClient {
                     continue;
                 }
             };
+            if let Err(e) = self.dyad.retransmit_due(peer).await {
+                tracing::debug!(error = %e, "could not repost unacked dyad frames");
+            }
             for frame in frames {
                 match frame {
                     Frame::Group(GroupOp::KpReq { room }) if room.id == self.cfg.room_id => {

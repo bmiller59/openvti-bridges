@@ -46,6 +46,12 @@ pub trait GebDyad: Send + Sync {
     async fn send(&self, peer_did: &str, frame: &super::wire::Frame) -> Result<()>;
     /// Frames received from a peer.
     async fn recv(&self, peer_did: &str) -> Result<Vec<super::wire::Frame>>;
+    /// Repost the frames to `peer_did` that are due for it, in send order, and
+    /// return how many. Called on a bounded schedule by the service loop.
+    /// Default: nothing to repost.
+    async fn retransmit_due(&self, _peer_did: &str) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// A message opened from the room.
