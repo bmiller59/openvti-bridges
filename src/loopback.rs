@@ -18,6 +18,9 @@ struct Inner {
     pending: bool,
     /// Every call fails with `Refused` (seating refused or leaf removed).
     refused: Option<String>,
+    /// Every post fails: `Some(true)` with a permanent (`Wire`) error,
+    /// `Some(false)` with a transient (`Foreign`) one.
+    fail_posts: Option<bool>,
     inbox: Vec<BridgeEvent>,
     posted: Vec<BridgeEvent>,
 }
@@ -73,6 +76,14 @@ impl Loopback {
     /// Refuse the bridge from now on.
     pub fn refuse(&self, why: &str) -> Result<()> {
         self.lock()?.refused = Some(why.into());
+        Ok(())
+    }
+
+    /// Make every post fail from now on (`None` stops): permanently
+    /// (`Some(true)`, a `Wire` error that cannot succeed) or transiently
+    /// (`Some(false)`, a `Foreign` error a later try may pass).
+    pub fn fail_posts(&self, permanent: Option<bool>) -> Result<()> {
+        self.lock()?.fail_posts = permanent;
         Ok(())
     }
 
@@ -138,6 +149,11 @@ impl ForeignRoom for Loopback {
         }
         if !g.joined {
             return Err(Error::Foreign("not joined".into()));
+        }
+        match g.fail_posts {
+            Some(true) => return Err(Error::Wire("a line that cannot be encoded".into())),
+            Some(false) => return Err(Error::Foreign("relay unreachable".into())),
+            None => {}
         }
         let foreign_ref = format!("lbline{}", g.posted.len());
         g.posted.push(event.clone());

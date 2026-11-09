@@ -147,7 +147,7 @@ pub async fn status(config_path: &Path, only: Option<&str>) -> Result<()> {
         let store = FjallStore::open(&link_dir(&data_dir, &l.id).join("store"))?;
         let s = crate::ops::status(&store as &dyn BridgeStore).await?;
         println!(
-            "{}: {} browse_version={} foreign_cursor={} outbox_depth={} oversize_failed={} last_relayed={} {}",
+            "{}: {} browse_version={} foreign_cursor={} outbox_depth={} oversize_failed={} dead_lettered={} last_relayed={} {}",
             l.id,
             if l.enabled {
                 "enabled"
@@ -158,6 +158,7 @@ pub async fn status(config_path: &Path, only: Option<&str>) -> Result<()> {
             s.foreign_cursor_secs.map_or("-".into(), |v| v.to_string()),
             s.outbox_depth,
             s.oversize_failed,
+            s.dead_lettered,
             s.last_relayed_secs
                 .map_or("never".into(), |v| v.to_string()),
             match &s.halted {

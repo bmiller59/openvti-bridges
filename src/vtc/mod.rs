@@ -24,7 +24,7 @@
 
 pub mod host;
 
-use crate::room::{PutOutcome, RecordWrite, RoomRecord, RoomSide};
+use crate::room::{PutOutcome, RecordWrite, RoomRecord, RoomSide, SkippedRecord};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -68,6 +68,9 @@ pub struct VtcRoom {
     host: HostDelivery,
     cfg: VtcRoomConfig,
     tier: OnceCell<Tier>,
+    /// Records the last browse could not read for good (see
+    /// [`RoomSide::take_skipped`]).
+    skipped: std::sync::Mutex<Vec<SkippedRecord>>,
 }
 
 fn type_put() -> &'static str {
@@ -118,6 +121,7 @@ impl VtcRoom {
             host,
             cfg,
             tier: OnceCell::new(),
+            skipped: std::sync::Mutex::default(),
         }
     }
 
@@ -358,7 +362,17 @@ impl VtcRoom {
 
 #[async_trait]
 impl RoomSide for VtcRoom {
+    fn take_skipped(&self) -> Vec<SkippedRecord> {
+        self.skipped
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
+    }
+
     async fn browse(&self, since_version: u64) -> Result<Vec<RoomRecord>> {
+        if let Ok(mut sk) = self.skipped.lock() {
+            sk.clear();
+        }
         let opts = RoomBrowse {
             since_version: Some(since_version),
             ..Default::default()
@@ -422,11 +436,36 @@ impl RoomSide for VtcRoom {
             let results = read["results"]
                 .as_array()
                 .ok_or_else(|| Error::Wire("batch read answered no results".into()))?;
-            for entry in results {
-                // A key not come to (`notAttempted`) or refused ends this
-                // browse with its typed error: the cursor does not pass it.
-                if let Some(rec) = self.entry_to_record(entry)? {
-                    out.push(rec);
+            for (i, entry) in results.iter().enumerate() {
+                match self.entry_to_record(entry) {
+                    Ok(Some(rec)) => out.push(rec),
+                    Ok(None) => {}
+                    // A key the persona can never read (a non-retryable typed
+                    // error, or a body that is not a record): reported to the
+                    // pump to journal and pass, so it cannot stop the listing
+                    // and hold the cursor behind it for ever.
+                    Err(
+                        e @ (Error::Room {
+                            retryable: false, ..
+                        }
+                        | Error::Wire(_)),
+                    ) => {
+                        let Some((version, key)) = chunk.get(i) else {
+                            return Err(e);
+                        };
+                        tracing::error!(key = %key, error = %e, "a room record cannot be read; skipped");
+                        if let Ok(mut sk) = self.skipped.lock() {
+                            sk.push(SkippedRecord {
+                                key: key.clone(),
+                                version: *version,
+                                reason: e.to_string(),
+                            });
+                        }
+                    }
+                    // A key not come to (`notAttempted`), a transient error or
+                    // a refusal that ends the link ends this browse with its
+                    // typed error: the cursor does not pass it.
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -435,7 +474,8 @@ impl RoomSide for VtcRoom {
     }
 
     async fn put(&self, write: &RecordWrite) -> Result<PutOutcome> {
-        let attempt = match self.tier().await? {
+        let tier = self.tier().await?;
+        let attempt = match tier {
             Tier::Open => self.put_open(write).await,
             Tier::Sealed => self.put_sealed(write).await,
         };
@@ -482,6 +522,31 @@ impl RoomSide for VtcRoom {
                     // The key is there but cannot be read (for instance a
                     // sealed record left at the wrong version by an earlier
                     // crash): the typed read error is the more useful one.
+                    //
+                    // On a sealed tier that is exactly what an earlier
+                    // `put_sealed` leaves when it ran out of attempts: the
+                    // record is stored at the version the host reported
+                    // (`currentVersion`, the same number as the
+                    // `landedVersion` of that failure) but sealed for another.
+                    // Continue from there: rewrite it as an UPDATE over what
+                    // landed, the same request `put_sealed` makes in-call (a
+                    // different request, not a retry of the failed one). The
+                    // key is the link's own HMAC, so it is ours: nobody else
+                    // can name it.
+                    Err(read_err @ Error::Room { .. })
+                        if tier == Tier::Sealed
+                            && let Some(landed) =
+                                details.as_ref().and_then(|d| d["currentVersion"].as_u64()) =>
+                    {
+                        tracing::warn!(key = %write.key, landed, error = %read_err,
+                            "a sealed record was left at the wrong version; rewriting it \
+                             over the version that landed");
+                        let rewrite = RecordWrite {
+                            expected_version: landed,
+                            ..write.clone()
+                        };
+                        self.put_sealed(&rewrite).await.map(|_| PutOutcome::Created)
+                    }
                     Err(read_err) if !matches!(read_err, Error::Refused(_)) => Err(read_err),
                     Err(e) => Err(e),
                 }

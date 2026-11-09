@@ -60,11 +60,29 @@ pub enum PutOutcome {
     AlreadyExists,
 }
 
+/// A record the last browse could not read and will never be able to (a
+/// non-retryable per-key error): not in the records returned, reported here so
+/// the pump can journal it, count it and let the cursor pass it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRecord {
+    /// Record key.
+    pub key: String,
+    /// Its version in the listing.
+    pub version: u64,
+    /// Why it was skipped.
+    pub reason: String,
+}
+
 /// The room, as the pump uses it.
 #[async_trait]
 pub trait RoomSide: Send + Sync {
     /// Records with a version above `since_version`, in version order.
     async fn browse(&self, since_version: u64) -> Result<Vec<RoomRecord>>;
+    /// The records the last [`RoomSide::browse`] skipped as unreadable for
+    /// good, drained. Default: none.
+    fn take_skipped(&self) -> Vec<SkippedRecord> {
+        Vec::new()
+    }
     /// Create-only write.
     async fn put(&self, write: &RecordWrite) -> Result<PutOutcome>;
 }

@@ -507,6 +507,15 @@ mod sealed {
                 return Ok(json!({
                     "sealed": { "ciphertext": "AAAA", "nonce": "AAAA", "epoch": 1 } }));
             }
+            if ty == vta_sdk::trust_tasks::TASK_ROOMS_KEYS_READ_0_2 {
+                // The record is there but does not open: it was sealed for
+                // another version.
+                return Err(VtaError::Rejected {
+                    code: "rooms/keys/read:cannotOpen".into(),
+                    message: "the record does not open at its version".into(),
+                    details: None,
+                });
+            }
             Err(VtaError::Other(format!("unexpected {ty}")))
         }
     }
@@ -553,5 +562,114 @@ mod sealed {
         let puts = stub.puts.lock().unwrap();
         assert_eq!(puts[0]["expectedVersion"], 0);
         assert_eq!(puts[1]["expectedVersion"], 7);
+    }
+
+    #[derive(Clone)]
+    enum Reply {
+        Land(u64),
+        Conflict(u64),
+    }
+
+    #[derive(Clone)]
+    struct Scripted {
+        puts: Arc<Mutex<Vec<Value>>>,
+        script: Arc<Mutex<Vec<Reply>>>,
+    }
+
+    async fn scripted_host(
+        State(s): State<Scripted>,
+        body: String,
+    ) -> (axum::http::StatusCode, axum::Json<Value>) {
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        let ty = doc["type"].as_str().unwrap().to_string();
+        if ty.contains("rooms/info") {
+            return (
+                axum::http::StatusCode::OK,
+                axum::Json(json!({ "type": ty, "payload": { "visibility": "attributed", "epoch": 1 } })),
+            );
+        }
+        s.puts.lock().unwrap().push(doc["payload"].clone());
+        match s.script.lock().unwrap().remove(0) {
+            Reply::Land(v) => (
+                axum::http::StatusCode::OK,
+                axum::Json(json!({ "type": ty, "payload": { "key": doc["payload"]["key"], "version": v } })),
+            ),
+            Reply::Conflict(cur) => (
+                axum::http::StatusCode::CONFLICT,
+                axum::Json(json!({ "payload": {
+                    "code": "rooms/records/put:versionConflict",
+                    "message": "the key exists",
+                    "details": { "currentVersion": cur } } })),
+            ),
+        }
+    }
+
+    /// P0-4: a sealed put that runs out of re-seal attempts leaves the record
+    /// stored at the wrong version. The next tick's create-only put conflicts
+    /// and the record does not open, which used to wedge the inbound direction
+    /// for ever; it is now rewritten over the version that landed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sealed_put_that_ran_out_of_attempts_continues_from_the_landed_version() {
+        use Reply::{Conflict, Land};
+        let stub = Scripted {
+            puts: Arc::default(),
+            // Attempt 1 intended 5 landed 7; 2 intended 8 landed 9; 3 intended
+            // 10 landed 11: out of attempts, stored at 11 sealed for 10.
+            // Then the retry: create-only conflict (currentVersion 11); the
+            // rewrite over 11 intended 5 landed 12; re-seal for 13 lands 13.
+            script: Arc::new(Mutex::new(vec![
+                Land(7),
+                Land(9),
+                Land(11),
+                Conflict(11),
+                Land(12),
+                Land(13),
+            ])),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/trust-tasks", post(scripted_host))
+            .with_state(stub.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let sink = Arc::new(Sink {
+            sealed_for: Mutex::default(),
+        });
+        let room = VtcRoom::new(
+            Arc::new(VtaClient::loopback(sink.clone())),
+            HostDelivery::for_loopback_tests(&format!("http://{addr}")),
+            VtcRoomConfig {
+                room_id: "did:key:zRoom".into(),
+                host_did: HOST_DID.into(),
+                persona: "did:key:persona".into(),
+            },
+        );
+        let write = RecordWrite {
+            key: "k".into(),
+            body: "b".into(),
+            basis: "observed",
+            expected_version: 0,
+        };
+        let first = room.put(&write).await.unwrap_err();
+        match first {
+            Error::Room {
+                code,
+                retryable,
+                details,
+                ..
+            } => {
+                assert_eq!(code, "sealedVersionRace");
+                assert!(retryable);
+                assert_eq!(details.unwrap()["landedVersion"], 11);
+            }
+            other => panic!("{other:?}"),
+        }
+        // The next tick: not stuck, the record is rewritten over version 11.
+        assert_eq!(room.put(&write).await.unwrap(), PutOutcome::Created);
+        let puts = stub.puts.lock().unwrap();
+        let expected: Vec<u64> = puts.iter().map(|p| p["expectedVersion"].as_u64().unwrap()).collect();
+        assert_eq!(expected, vec![0, 7, 9, 0, 11, 12]);
     }
 }

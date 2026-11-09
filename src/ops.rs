@@ -78,6 +78,11 @@ pub struct Status {
     /// Outbound entries given up on for good because they could not be made to
     /// fit the foreign room's size limit (journalled, never retried).
     pub oversize_failed: u64,
+    /// Entries dead-lettered because they failed for a reason that cannot pass
+    /// (a non-retryable room error, a line that cannot be encoded, a record
+    /// the persona can never read), inbound and outbound; each is journalled
+    /// in the xref as `failed:...` with its reason.
+    pub dead_lettered: u64,
     /// When a post was last read back from the relay (unix seconds).
     pub last_relayed_secs: Option<u64>,
     /// Why the link is halted, if it is.
@@ -110,6 +115,7 @@ pub async fn status(store: &dyn BridgeStore) -> Result<Status> {
         foreign_cursor_secs: be8(store.cursor(CURSOR_FOREIGN).await?),
         outbox_depth,
         oversize_failed: be8(store.cursor(crate::pump::OVERSIZE_FAILED).await?).unwrap_or(0),
+        dead_lettered: be8(store.cursor(crate::pump::DEAD_LETTERED).await?).unwrap_or(0),
         last_relayed_secs: be8(store.cursor(LAST_RELAYED).await?),
         halted: crate::halt::read(store).await?,
         fork: crate::geb::forkmark::read(store).await?,

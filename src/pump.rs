@@ -48,6 +48,11 @@ pub const OVERSIZE_FAILED: &str = "oversize_failed";
 /// the outbox key; its value is the reason. An entry with one is never posted
 /// again and no longer counts as pending.
 pub const FAILED_PREFIX: &str = "failed:";
+/// Count (big-endian u64) of entries dead-lettered because they failed for a
+/// reason that cannot pass (a non-retryable room error, a line that cannot be
+/// encoded, a record the room will never let the persona read); `status`
+/// shows it. Each is journalled in the xref (`failed:...`) with its reason.
+pub const DEAD_LETTERED: &str = "dead_lettered";
 
 /// What a link needs at run time.
 #[derive(Debug, Clone)]
@@ -130,6 +135,25 @@ pub struct Pump {
     /// tick, before every outbound post and before every write into the VTC
     /// room; a step already begun finishes.
     pause: Arc<dyn PauseSource>,
+}
+
+/// A failure that stops the link (see [`HaltReason`]) rather than one tick.
+fn is_halting(e: &Error) -> bool {
+    matches!(e, Error::Refused(_) | Error::UndecidableCommit(_))
+}
+
+/// A failure no later try can pass: the room refused the write for good (a
+/// non-retryable typed room error, such as a key collision) or the content
+/// cannot be encoded for its destination. Retryable and transport errors are
+/// not permanent, and a refusal that stops the link is handled by the guard.
+fn is_permanent(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Room {
+            retryable: false,
+            ..
+        } | Error::Wire(_)
+    )
 }
 
 async fn version_cursor(store: &dyn BridgeStore) -> Result<u64> {
@@ -245,14 +269,33 @@ impl Pump {
         Ok(report)
     }
 
+    /// Run both directions, each with its own cursor, even when one fails: a
+    /// stuck direction must not starve the other. The first error is returned
+    /// afterwards (a halting one wins, and stops the tick before the second
+    /// direction touches the foreign room again).
     async fn run_directions(&self, report: &mut TickReport) -> Result<()> {
-        if self.link.directions != Directions::FromForeign {
-            self.push_foreign(report).await?;
+        let mut first: Option<Error> = None;
+        if self.link.directions != Directions::FromForeign
+            && let Err(e) = self.push_foreign(report).await
+        {
+            if is_halting(&e) {
+                return Err(e);
+            }
+            first = Some(e);
         }
-        if self.link.directions != Directions::ToForeign && !self.is_paused() {
-            self.pull_foreign(report).await?;
+        if self.link.directions != Directions::ToForeign
+            && !self.is_paused()
+            && let Err(e) = self.pull_foreign(report).await
+        {
+            match first {
+                Some(ref prev) if !is_halting(&e) => {
+                    tracing::warn!(link = %self.link.id, error = %e, first = %prev,
+                        "the inbound direction failed as well");
+                }
+                _ => first = Some(e),
+            }
         }
-        Ok(())
+        first.map_or(Ok(()), Err)
     }
 
     /// Join; when seated, post the one-time announcement if configured.
@@ -326,6 +369,37 @@ impl Pump {
         Ok(())
     }
 
+    /// Dead-letter one thing that failed for a reason that cannot pass:
+    /// journal why in the xref under `xref_key` (once: a repeat does not count
+    /// again), count it (`status` shows [`DEAD_LETTERED`]) and log it. The
+    /// caller then lets its cursor pass.
+    async fn dead_letter(
+        &self,
+        xref_key: &str,
+        what: &str,
+        err: &Error,
+        r: &mut TickReport,
+    ) -> Result<()> {
+        if self.store.xref_has(xref_key).await? {
+            return Ok(());
+        }
+        self.store.xref_set(xref_key, &err.to_string()).await?;
+        let n = self
+            .store
+            .cursor(DEAD_LETTERED)
+            .await?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        self.store
+            .set_cursor(DEAD_LETTERED, &(n + 1).to_be_bytes())
+            .await?;
+        tracing::error!(link = %self.link.id, entry = %what, error = %err,
+            "failed for a reason that cannot pass; dead-lettered, not retried");
+        r.failed += 1;
+        Ok(())
+    }
+
     /// Post one journalled event. [`Step::Paused`] when the kill switch is on:
     /// nothing is posted and nothing is marked, so the entry stays unposted in
     /// the outbox and the next tick after a resume posts it exactly once. An
@@ -359,7 +433,17 @@ impl Pump {
             .await?;
             return Ok(Step::Failed);
         }
-        let posted = self.foreign.post(ev).await?;
+        let posted = match self.foreign.post(ev).await {
+            Ok(p) => p,
+            // A line that cannot be encoded never will be: dead-letter it so
+            // the browse cursor (already past it) and the outbox move on.
+            Err(e) if is_permanent(&e) => {
+                self.dead_letter(&format!("{FAILED_PREFIX}{key}"), key, &e, r)
+                    .await?;
+                return Ok(Step::Failed);
+            }
+            Err(e) => return Err(e),
+        };
         // Keep the foreign id of the line: a later retraction answers it.
         // Both cross-references are written before the outbox entry is marked
         // posted, so a crash between the post and the mark re-posts (the
@@ -401,7 +485,22 @@ impl Pump {
         }
         let caps = self.foreign.capabilities();
         let since = version_cursor(self.store.as_ref()).await?;
-        for rec in self.room.browse(since).await? {
+        let records = self.room.browse(since).await?;
+        // Records the room will never let the persona read: journalled and
+        // counted once each, then the cursor passes them (below).
+        let mut passed = since;
+        for sk in self.room.take_skipped() {
+            let err = Error::Wire(sk.reason.clone());
+            self.dead_letter(
+                &format!("{}browse:{}@{}", FAILED_PREFIX, sk.key, sk.version),
+                &sk.key,
+                &err,
+                report,
+            )
+            .await?;
+            passed = passed.max(sk.version);
+        }
+        for rec in records {
             // Before anything for this record is journalled or the cursor
             // moves: a record not yet reached is browsed again after a resume.
             if self.is_paused() {
@@ -468,6 +567,11 @@ impl Pump {
                 }
             }
         }
+        if passed > version_cursor(self.store.as_ref()).await? {
+            self.store
+                .set_cursor(BROWSE_CURSOR, &passed.to_be_bytes())
+                .await?;
+        }
         Ok(())
     }
 
@@ -492,14 +596,36 @@ impl Pump {
                 // even for a journalled event because a crash may have
                 // separated the two. AlreadyExists makes the replay a no-op.
                 self.store.journal_insert(&ev.origin_id, &ev).await?;
-                let write = foreign_to_record(&ev, &self.link.link_secret)?;
-                match self.room.put(&write).await? {
-                    PutOutcome::Created => report.written += 1,
-                    PutOutcome::AlreadyExists => report.skipped += 1,
+                let stored = async {
+                    let write = foreign_to_record(&ev, &self.link.link_secret)?;
+                    let outcome = self.room.put(&write).await?;
+                    Ok::<_, Error>((write, outcome))
                 }
-                self.store
-                    .xref_set(&format!("foreign:{}", ev.origin_id), &write.key)
-                    .await?;
+                .await;
+                match stored {
+                    Ok((write, outcome)) => {
+                        match outcome {
+                            PutOutcome::Created => report.written += 1,
+                            PutOutcome::AlreadyExists => report.skipped += 1,
+                        }
+                        self.store
+                            .xref_set(&format!("foreign:{}", ev.origin_id), &write.key)
+                            .await?;
+                    }
+                    // A write the room refuses for good (a collision, content
+                    // it cannot take): dead-lettered, and the cursor passes it
+                    // so it cannot hold every later message behind it.
+                    Err(e) if is_permanent(&e) => {
+                        self.dead_letter(
+                            &format!("{FAILED_PREFIX}in:{}", ev.origin_id),
+                            &ev.origin_id,
+                            &e,
+                            report,
+                        )
+                        .await?;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             self.store.set_cursor(FOREIGN_CURSOR, &p.cursor.0).await?;
         }
@@ -1286,5 +1412,227 @@ mod tests {
         assert_eq!(lb.posted().len(), 1);
         // And it is not bridged: nothing claims it was.
         assert!(!store.xref_has("vtc:big|1").await.unwrap());
+    }
+
+    // ---- P0-4: dead letters, direction independence ----------------------------
+
+    use crate::room::{RecordWrite, RoomRecord, SkippedRecord};
+    use std::collections::VecDeque;
+
+    /// A room whose writes fail on demand and which reports skipped records.
+    struct ScriptedRoom {
+        inner: MemoryRoom,
+        put_errors: Mutex<VecDeque<Error>>,
+        always: Mutex<Option<fn() -> Error>>,
+        skipped: Mutex<Vec<SkippedRecord>>,
+    }
+
+    impl ScriptedRoom {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryRoom::new(),
+                put_errors: Mutex::default(),
+                always: Mutex::default(),
+                skipped: Mutex::default(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RoomSide for ScriptedRoom {
+        async fn browse(&self, since: u64) -> Result<Vec<RoomRecord>> {
+            self.inner.browse(since).await
+        }
+        fn take_skipped(&self) -> Vec<SkippedRecord> {
+            std::mem::take(&mut *self.skipped.lock().unwrap())
+        }
+        async fn put(&self, w: &RecordWrite) -> Result<PutOutcome> {
+            if let Some(e) = self.put_errors.lock().unwrap().pop_front() {
+                return Err(e);
+            }
+            if let Some(f) = *self.always.lock().unwrap() {
+                return Err(f());
+            }
+            self.inner.put(w).await
+        }
+    }
+
+    fn collision() -> Error {
+        Error::Room {
+            code: "keyCollision".into(),
+            message: "exists with another author".into(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    fn transient() -> Error {
+        Error::Room {
+            code: "sealedVersionRace".into(),
+            message: "busy".into(),
+            retryable: true,
+            details: None,
+        }
+    }
+
+    async fn counter(store: &MemoryStore, name: &str) -> u64 {
+        store
+            .cursor(name)
+            .await
+            .unwrap()
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_stuck_inbound_direction_does_not_starve_the_outbound_one() {
+        let room = ScriptedRoom::new();
+        *room.always.lock().unwrap() = Some(transient);
+        let (lb, store) = (
+            Arc::new(Loopback::new("bridge-id")),
+            Arc::new(MemoryStore::new()),
+        );
+        let pump = Pump::new(link(), room.clone(), lb.clone(), store.clone());
+        pump.start().await.unwrap();
+        lb.inject("did:bob", "stuck", 2).unwrap();
+        room.inner.add("did:alice", None, "goes out", 1).unwrap();
+        let err = pump.tick().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Room {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(lb.posted().len(), 1, "the outbound direction still ran");
+        // The stuck one resumes when it can; nothing was lost or skipped.
+        *room.always.lock().unwrap() = None;
+        let r = pump.tick().await.unwrap();
+        assert_eq!(r.written, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stuck_outbound_direction_does_not_starve_the_inbound_one() {
+        let (room, lb, store) = parts();
+        let pump = Pump::new(link(), room.clone(), lb.clone(), store.clone());
+        pump.start().await.unwrap();
+        lb.fail_posts(Some(false)).unwrap();
+        room.add("did:alice", None, "stuck out", 1).unwrap();
+        lb.inject("did:bob", "comes in", 2).unwrap();
+        assert!(matches!(pump.tick().await, Err(Error::Foreign(_))));
+        assert_eq!(room.writes().len(), 1, "the inbound direction still ran");
+        assert_eq!(counter(&store, FOREIGN_CURSOR).await, 1);
+        lb.fail_posts(None).unwrap();
+        assert_eq!(pump.tick().await.unwrap().posted, 1);
+    }
+
+    #[tokio::test]
+    async fn a_non_retryable_write_error_is_dead_lettered_and_the_cursor_advances() {
+        let room = ScriptedRoom::new();
+        room.put_errors.lock().unwrap().push_back(collision());
+        let (lb, store) = (
+            Arc::new(Loopback::new("bridge-id")),
+            Arc::new(MemoryStore::new()),
+        );
+        let pump = Pump::new(link(), room.clone(), lb.clone(), store.clone());
+        pump.start().await.unwrap();
+        lb.inject("did:bob", "poison", 2).unwrap();
+        lb.inject("did:bob", "fine", 3).unwrap();
+        let r = pump
+            .tick()
+            .await
+            .expect("a permanent failure is not a tick error");
+        assert_eq!((r.written, r.failed), (1, 1));
+        assert_eq!(
+            counter(&store, FOREIGN_CURSOR).await,
+            2,
+            "the cursor passed it"
+        );
+        assert_eq!(counter(&store, DEAD_LETTERED).await, 1);
+        let why = store.xref_get("failed:in:loop0").await.unwrap().unwrap();
+        assert!(why.contains("keyCollision"), "{why}");
+        // A later tick does not count it again.
+        pump.tick().await.unwrap();
+        assert_eq!(counter(&store, DEAD_LETTERED).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_retryable_write_error_is_not_dead_lettered() {
+        let room = ScriptedRoom::new();
+        room.put_errors.lock().unwrap().push_back(transient());
+        let (lb, store) = (
+            Arc::new(Loopback::new("bridge-id")),
+            Arc::new(MemoryStore::new()),
+        );
+        let pump = Pump::new(link(), room.clone(), lb.clone(), store.clone());
+        pump.start().await.unwrap();
+        lb.inject("did:bob", "later", 2).unwrap();
+        assert!(pump.tick().await.is_err());
+        assert_eq!(counter(&store, FOREIGN_CURSOR).await, 0);
+        assert_eq!(counter(&store, DEAD_LETTERED).await, 0);
+        assert_eq!(pump.tick().await.unwrap().written, 1);
+    }
+
+    #[tokio::test]
+    async fn a_post_that_cannot_succeed_is_dead_lettered() {
+        let (room, lb, store) = parts();
+        let pump = Pump::new(link(), room.clone(), lb.clone(), store.clone());
+        pump.start().await.unwrap();
+        lb.fail_posts(Some(true)).unwrap();
+        room.add("did:alice", None, "unpostable", 1).unwrap();
+        let r = pump.tick().await.expect("not a tick error");
+        assert_eq!((r.posted, r.failed), (0, 1));
+        assert_eq!(counter(&store, BROWSE_CURSOR).await, 1);
+        assert_eq!(counter(&store, DEAD_LETTERED).await, 1);
+        for (k, _) in store.outbox_unposted().await.unwrap() {
+            assert!(
+                store
+                    .xref_has(&format!("{FAILED_PREFIX}{k}"))
+                    .await
+                    .unwrap()
+            );
+        }
+        // Not retried: the foreign room works again and nothing is posted.
+        lb.fail_posts(None).unwrap();
+        assert_eq!(pump.tick().await.unwrap().posted, 0);
+        assert!(lb.posted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_record_the_browse_could_not_read_is_journalled_and_passed_once() {
+        let room = ScriptedRoom::new();
+        room.inner.add("did:alice", None, "ok", 1).unwrap();
+        room.skipped.lock().unwrap().push(SkippedRecord {
+            key: "unreadable".into(),
+            version: 5,
+            reason: "rooms/keys/read:cannotOpen".into(),
+        });
+        let (lb, store) = (
+            Arc::new(Loopback::new("bridge-id")),
+            Arc::new(MemoryStore::new()),
+        );
+        let pump = Pump::new(link(), room.clone(), lb.clone(), store.clone());
+        pump.start().await.unwrap();
+        let r = pump.tick().await.unwrap();
+        assert_eq!((r.posted, r.failed), (1, 1));
+        assert_eq!(
+            counter(&store, BROWSE_CURSOR).await,
+            5,
+            "passed the skipped version"
+        );
+        assert_eq!(counter(&store, DEAD_LETTERED).await, 1);
+        assert!(store.xref_has("failed:browse:unreadable@5").await.unwrap());
+        // Reported again (as a host would list it again): counted once.
+        room.skipped.lock().unwrap().push(SkippedRecord {
+            key: "unreadable".into(),
+            version: 5,
+            reason: "again".into(),
+        });
+        pump.tick().await.unwrap();
+        assert_eq!(counter(&store, DEAD_LETTERED).await, 1);
     }
 }
