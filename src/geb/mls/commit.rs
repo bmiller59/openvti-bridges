@@ -144,10 +144,11 @@ pub fn facts_of(
 ) -> CommitFacts {
     let mut facts = CommitFacts {
         sender: credential_did(sender).unwrap_or_default(),
-        // UNVERIFIED: the sender's leaf BEFORE the commit decides; a commit
-        // whose own update path brings a bound leaf does not count as bound
-        // for the remove / re-seat / policy rule (only a heal commit, which
-        // has no proposals, uses the new leaf).
+        // Confirmed (answers round 4 Q2: `mls.rs:226-237`):
+        // the sender's leaf BEFORE the commit decides; a commit whose own
+        // update path brings a bound leaf does not count as bound for the
+        // remove / re-seat / policy rule (only a heal commit, which has no
+        // proposals, uses the new leaf).
         sender_bound: group
             .public_group()
             .leaf(sender_index)
@@ -323,10 +324,12 @@ impl GroupJudge<'_> {
         // DID, and its binding, if present, must verify. A bound new leaf is
         // the `heal` shape (a path-only self-update that binds the sender's
         // own leaf) and is valid; an unbound one is an ordinary self-update.
-        // UNVERIFIED: Geb's description of a heal says "same signature key";
-        // we do not require it, because a binding that verifies is bound to
-        // whatever key the new leaf has, and the rest of the commit is
-        // processed by OpenMLS either way.
+        // Confirmed (answers round 4 Q3): Geb's receivers check only the same
+        // DID and, if a binding is present, that it verifies for the new leaf's
+        // key; nothing compares the new key with the old .
+        // Geb's own heal keeps the key, but that is not required of senders.
+        // UNVERIFIED: …
+        // … an update path (the crate was not read).
         if let Some(path_leaf) = staged.update_path_leaf_node() {
             let (a, b) = (
                 credential_did(&sender),

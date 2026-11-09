@@ -299,10 +299,11 @@ pub enum GroupOp {
     #[serde(rename = "kp-req")]
     KpReq { room: RoomRef },
     /// A device's room status request `{k:"g", op:"rs"}`, sent when a commit
-    /// cannot be processed; it starts Geb's fork repair (answer 9).
-    // UNVERIFIED: the answers name `{k:"g", op:"rs"}` and nothing else about
-    // it; whether it carries `room:{id}` (sent here, tolerated absent) and
-    // what the receiver replies is not stated.
+    /// cannot be processed; with a valid status body `s` it starts Geb's fork
+    /// repair (answer 9). OURS HAS NO BODY, and Geb DROPS an `rs` with no valid
+    /// `s` (confirmed, round 4 Q8: `cleanStatus`), so it
+    /// has no effect; the proper body is the next task. (`room:{id}` is sent,
+    /// tolerated absent.)
     #[serde(rename = "rs")]
     Rs {
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -647,11 +647,12 @@ impl MlsGroupClient {
     }
 
     /// Answer `seat-check {room, e}`: with `rs` when we hold the room.
-    // UNVERIFIED: the `rs` we send is the minimal `{k:"g", op:"rs", room:{id}}`.
-    // Geb's `cleanStatus` (round 2 section 5) requires a status body
-    // `s:{e, a, chain, ...}` that we do not build (P1), so Geb most likely
-    // reads it as malformed and ignores it: it does NOT satisfy a seat-check.
-    // Nothing worse follows (round 3 section 3: silence never commits). When
+    // The `rs` we send is the minimal `{k:"g", op:"rs", room:{id}}`. Geb's
+    // `cleanStatus` (round 2 section 5) requires a status body `s:{e, a,
+    // chain, ...}` that we do not build (P1), so Geb DROPS it (confirmed, round
+    // 4 Q8:): it has no effect, never counts as "seen",
+    // and does NOT satisfy a seat-check. Nothing worse follows (silence never
+    // commits). The proper `rs` is the next task. When
     // we do not hold the room Geb expects a `seat-ask` carrying a fresh
     // package, which is not built either, so we send nothing.
     async fn answer_seat_check(&self, peer: &str, room: &RoomRef) {

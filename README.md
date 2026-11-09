@@ -17,9 +17,10 @@ Geb's written answers do not settle are marked `// UNVERIFIED:` in the source. T
 self-consistency and agreement with Geb's vendored test vectors, not interoperability.
 
 Not built: `fc` fragments (joining a large Geb room fails), the `rs` status body, `seat-ask`,
-accepting a re-seat Welcome, leaving a room, persona-card intake, fork choice, and gap records.
-Direct Geb rooms are refused at join time. Two commit kinds halt the link because deciding them
-needs persona cards. The full list, with consequences, is in `docs/DESIGN.md`, section 5.
+accepting a re-seat Welcome, sending a leave (signed leaves are received), persona-card intake,
+fork choice, and gap records. Direct Geb rooms are refused at join time. One commit kind (a Remove
+of another DID by a plain member) halts the link because deciding it needs persona cards; Geb
+itself would refuse it and continue, the halt is a deliberate bridge-side choice. The full list, with consequences, is in `docs/DESIGN.md`, section 5.
 
 ## Quickstart
 

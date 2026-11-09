@@ -15,12 +15,16 @@
 //! `hashData = SHA-256(JCS(proof without proofValue)) || SHA-256(JCS(document
 //! without proof))`. The older v1 flat shape is not read: this crate never did.
 //!
-//! UNVERIFIED: whether Geb accepts a VRC issued here is what a live exchange
-//! settles; the vectors prove only that this code reproduces Geb's bytes and
-//! verifies Geb's credentials. `ieee7012Agreed` is the issuing party's own
-//! claim and the bridge makes none (`false`); `terms` is never sent. A receiver
-//! here does not require `nonce`, `issuerEndpoint` or `ieee7012Agreed` (the
-//! answers' verifier list does not).
+//! `ieee7012Agreed` (answers round 4 Q18, confirmed): a REQUIRED boolean
+//! (`ieee7012_agreed: bool` has no serde default; a credential without it, or
+//! with a non-boolean, fails to parse), whose VALUE Geb never checks (it is
+//! covered by the signature and used only for display). The bridge makes no
+//! such claim, so it sends `false`, which Geb accepts. `terms` is never sent.
+//!
+//! UNVERIFIED: whether a live Geb accepts a VRC issued here in full is what a
+//! live exchange settles; the vectors prove only that this code reproduces
+//! Geb's bytes and verifies Geb's credentials. A receiver here does not require
+//! `nonce` or `issuerEndpoint` (the answers' verifier list does not).
 
 use super::crypto::did_peer;
 use crate::{Error, Result};

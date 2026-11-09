@@ -301,8 +301,9 @@ Dyad frames are planned at 36,000 bytes of plaintext (conservative).
 **VRC v2 (built, UNVERIFIED against live Geb).** W3C VC 2.0 with the DTG context, an
 `eddsa-jcs-2022` DataIntegrityProof, `credentialSubject.issuerPublicKey`, a 32-hex `nonce`,
 `issuerEndpoint`, `subjectEndpoint` and `ieee7012Agreed` (always sent `false`: the bridge makes no
-such claim). The output reproduces Geb's round 2 vector byte for byte; whether a live Geb accepts
-one we issue is open.
+such claim; round 4 Q18 confirms the field is a required boolean whose value Geb never checks, so
+`false` is accepted). The output reproduces Geb's round 2 vector byte for byte; whether a live Geb
+accepts one we issue in full is open.
 
 **Mailbox envelopes (built).** `{t:"f"|"ack"|"ml"|"mc"|response|completion}` sealed into Nostr
 events of kind 4177 (pair and room mailboxes) and 4178 (inboxes), each with a NIP-40 `expiration`
@@ -332,25 +333,54 @@ the Welcome; external joins are never used. The KeyPackage declares extensions `
   PrivateMessage; a Welcome is an `MLSMessage` holding a Welcome; a KeyPackage is a bare TLS
   `KeyPackage` in standard base64. Other forms are refused or dropped.
 
-**Settle rule and `validCommit` (built, partially).** The bridge never commits in either group.
+**Settle rule and `validCommit` (built).** The bridge never commits in either group.
 Every `mc` is held for the room's `settleWindowMs` (read from the policy, default 3000, clamped to
 0 to 60,000). Candidates for one parent epoch are tested in ascending SHA-256 of the commit
-bytes, each against `validCommit` before it can win; the first valid one is merged. Outcomes:
-*refused* (drop it, try the next hash), *failed* (cannot be processed: stop, keep the cursor, send
-`rs` once), or *merged*. The 0.5.15 rules are applied: refuse a commit with a proposal by
-reference, a standalone Proposal, an update-path leaf naming another DID than its sender, an
-unbound added leaf naming the root, an admin or a seated DID, and a remove, re-seat or policy
-change from a sender whose leaf is not bound (a …
-excepted). A path-only self-update carrying the sender's binding (a "heal") is valid. At join a
-Welcome whose … with one unbound, is refused.
-Two cases need local knowledge (persona cards and signed leaves, section 11) that the bridge does
-not have; see the table and section 8.
+bytes, each against `validCommit` before it can win; the first valid one is merged. **The walk
+never stops on any candidate** (round 4 Q1). *Refused* (MLS staged it, then it failed `leafAuth` /
+`validCommit`: drop it) and *failed* (MLS cannot process it: replay, other branch, unparsable, a
+standalone Proposal in an `mc`, a proposal by reference) both go on to the next hash. They differ
+only after the walk: if nothing merged and one failed, the cursor stays before it and one `rs`
+goes out; if one merged, a failed candidate changes nothing. The 0.5.15 rules are applied: refuse
+an update-path leaf naming another DID than its sender, an unbound added leaf naming the root, an
+admin or a seated DID (the DID a same commit removes still counts as seated), and a remove,
+re-seat or policy change from a sender whose leaf, as it stood before the commit, is not bound
+(`selfHeal` excepted: an unbound sender may remove leaves naming only its own DID if it adds at
+least one leaf, … bound, and there is no policy change). A
+path-only self-update carrying the sender's binding (a "heal") is valid and need not keep its key.
+At join a Welcome whose … with one unbound, is
+refused.
+
+A **Remove** passes (Geb's exact rule, round 4 Q6) when any of: (1) every
+removed DID is the sender's person (no persona store here, so the sender's own DID only); (2) every
+removed leaf is covered by a held signed leave, with no adds and no policy change; (3) a re-seat:
+… change, by any member with a bound
+leaf; (4) the sender is root or an admin (exact DID compare, never widened by persona cards) or the
+room's policy is v1. Geb **refuses anything else and goes on; it never halts a room.**
+
+**The one deliberate difference.** The bridge holds no persona store (persona-card intake is not
+built). A Remove of another DID by a non-root, non-admin sender in a v2 room, with no signed leave
+we hold and not a re-seat, is the only commit whose verdict depends on a card: a Geb device holding
+a card that links the two DIDs would merge it, and we cannot know. The bridge therefore **halts**
+(persisted, `UndecidableCommit`) rather than silently fork. That halt is a bridge-side choice, the
+honest alternative to a silent fork; Geb itself refuses and continues. The same halt covers a
+direct-room Add of a DID that is not exactly one of the pair.
+
+**Signed leaves (received, never sent).** Ignoring a leave is safe only if the signed room line is
+taken (round 4 Q7), or a device with …
+leaver that every Geb device merges. The payload is `JCS {t:"leave", v:1, room, by, at}` signed by
+the leaver's device DID key. It arrives as a room line `{t:"lv", at, ls, sg}` (the line's `sg` must
+verify for its MLS sender, then `ls` for that sender) and as …
+… (still acked). The newest leave per signer per room is kept and persisted
+in the sealed MLS state; one that does not verify is dropped. A held leave covers its signer's exact
+DID in rule (2). The bridge does not send a leave, elect a healer or commit a Remove.
 
 **Limits (built).** A line's text is at most 20,000 UTF-16 code units: refused on post, dropped on
 read. Every event we post is at most 120,000 bytes (an error naming the size, never truncated);
 we read at most 131,072. We refuse to post an event dated more than 900 s ahead. Catch-up reads
-page with `limit: 200` and `until`, at most 8 at once (the relay allows 20 subscriptions); the
-first read starts at the 7-day retention floor, never unbounded.
+page with `limit: 200` and `until`, at most 8 at once (the repo copy of the relay config allows 20
+subscriptions, but that copy is stale: 200 per Geb's record, live config UNCONFIRMED, round 4 Q13);
+the first read starts at the 7-day retention floor, never unbounded.
 
 ### What is built and what is not
 
@@ -358,11 +388,12 @@ first read starts at the 7-day retention floor, never unbounded.
 |---|---|---|
 | Identity, dyad, VRC v2, mailbox envelopes, ratchet | Built; vectors bind the primitives; the whole flow only against our own test relay | Interop with a live Geb is unproven |
 | MLS seating, lines, settle rule, 0.5.15 commit rules | Built behind `geb-mls`; tested only against an in-process second OpenMLS client | Wire compatibility with Geb's OpenMLS 0.8.2 is inferred, not shown |
-| `rs` status body (`s:{e, a, chain, ...}`) | Not built; we send the minimal `{k:"g", op:"rs", room:{id}}` | Geb's `cleanStatus` most likely rejects it, so it does not answer a `seat-check`; nothing worse follows (silence never commits). Fork repair through `rs` does not work |
+| `rs` status body (`s:{e, a, chain, ...}`) | Not built; we send the minimal `{k:"g", op:"rs", room:{id}}` | Geb DROPS an `rs` with no valid `s` (confirmed, round 4 Q8): ours has no effect at all, never counts as "seen", does not answer a `seat-check`; nothing worse follows (silence never commits). Fork repair through `rs` does not work. The proper body is the next task |
 | `seat-ask` and `rc` | Not built; acked and ignored | A wiped or re-keyed bridge cannot ask to be re-seated; Geb's expected reply is not sent |
 | Accepting a re-seat Welcome | Not built; a Welcome received while seated is not processed | After an epoch fork or removal the bridge cannot rejoin by itself |
-| Leave (`{t:"lv", at, ls}`) | Not built; `leave` fails closed | The bridge cannot leave a room cleanly; the leaf stays until someone removes it. Also, a refused direct-room Welcome leaves the adder's leaf in that room |
-| Persona-card intake | Not built; only `NoLocalKnowledge` exists | Two commit kinds halt the link (section 8) |
+| Signed leave, receiving (`{t:"lv", at, ls}`, dyad `leave`) | Built (`geb/leave.rs`) | Feeds `validCommit` rule (2) |
+| Signed leave, sending; healer duty; Remove commits | Not built; `leave` fails closed | The bridge cannot leave a room cleanly; the leaf stays until someone removes it. Also, a refused direct-room Welcome leaves the adder's leaf in that room |
+| Persona-card intake | Not built; only `NoLocalKnowledge` plus held signed leaves exists | One card-dependent Remove halts the link (section 8); Geb itself would refuse and continue |
 | Fork choice | Not built | A real fork is not detected or resolved by the bridge |
 | `fc` fragments (`{k:"fc", id, i, n, d}`) | Not built; we say `fc:0` | A frame too big for one 120,000-byte event, notably a Welcome for a large room, never reaches us: joining a large room fails. The practical room size limit is unknown |
 | `rq` / `rl` line-sharing, history | Not built; acked and ignored | No lines from before joining (Geb gives none) and no gap healing after joining |
@@ -437,7 +468,7 @@ The analysis is reasoning, not testing. The residual risk is bounded, not elimin
 | **Bridge compromise.** Attacker gets the exported Geb keys and the bridge's room role | One identity per link; the persona and seed never leave the VTA; at-rest encryption protects disks; revocation is removing the ACL entry | A live compromise reads everything. Key rotation is manual; `link remove` does not revoke the VTA key records. No tested wss/TLS path |
 | **Injection from Geb** into the room (prompt injection aimed at agents, misleading text, oversize or malformed input) | Records are `basis: "observed"` with a provenance block; text is fenced longer than any backtick run; control characters stripped; 80,000-byte cap; no action is triggered by bridged content; unknown kinds dropped | Whether the VTI room's existing content handling is sufficient for hostile text from a stranger-populated room was never checked. Anything that reads the room, especially an agent, must treat bridged records as untrusted |
 | **Spoofed attribution** | A Geb line's `sg` is verified against the author's device DID; the result is recorded in the provenance block; unsigned and forged lines are still bridged but labelled `UNVERIFIED`. In the other direction the quoted author is the bridge's assertion | Geb members cannot verify the quoted VTC author. A forged name can appear inside quoted text |
-| **Epoch fork** on the Geb side (a wrong commit decision silently drops the bridge from the group) | The settle rule and 0.5.15 `validCommit` rules; never skipping a commit silently; without `geb-mls` every commit refuses; two undecidable cases halt the link | Persona cards and signed leaves are not implemented (section 8); fork repair is not built. If Geb's root/admin test also accepts a sibling device through persona cards, we would refuse a commit Geb merges (a fork): UNVERIFIED, round 2 question 2 |
+| **Epoch fork** on the Geb side (a wrong commit decision silently drops the bridge from the group) | The settle rule and 0.5.15 `validCommit` rules, Geb's exact removes rule, signed leaves received; never skipping a commit silently; without `geb-mls` every commit refuses; the one card-dependent Remove (and a direct-room add of a non-exact DID) halts the link | Persona cards are not implemented (section 8); fork repair is not built. Root and admin are an exact DID compare (confirmed, round 4 Q4) |
 | **Echo loops and duplication** | Own-persona and provenance-marker skip on the VTC side; own-DID, own-leaf and `deny_list` skip on the Geb side; xref; create-only deterministic keys | A bridge not listed in `deny_list` and with a different device DID is bridged like any member |
 | **Relay availability and 7-day expiry** | Capped jittered reconnect, a startup catch-up read from the 7-day floor, relay manners from round 3 | One relay is the only resting place; no gap record; lines lost during a long outage are not noticed in the room |
 | **Unstable upstream** (no versioned spec) | Pinned to one release; unknown envelope, frame and plaintext kinds fail closed or are dropped; Geb-specific shapes sit behind `GebCodec` and the other `geb::traits` | Wire compatibility with Geb's OpenMLS 0.8.2 is inferred. Geb `wire: 2` in release metadata is not a compatibility signal; nothing reads it |
@@ -467,11 +498,12 @@ with `End::Halted` and never retries.
 | Halt | Cause | Meaning |
 |---|---|---|
 | `Refused` | Seating refused, our leaf removed by a merged commit, a `permissionDenied` / `actionNotHeld` / `notAMember` or VTA `Forbidden` on the room side, or a Welcome into a direct room | Permanent until the bridge is admitted again |
-| `UndecidableCommit` | With the production inputs (`NoLocalKnowledge`): a Remove of a different DID by a sender who is neither root nor admin, or a direct-room Add of a DID that is not exactly one of the pair. The record names the commit's epoch and hash | Neither merging nor skipping is safe without persona cards or signed leaves, since either may fork the epoch. A card-free refusal in the same commit wins over the undecidable part |
+| `UndecidableCommit` | A Remove of another DID by a non-root, non-admin sender in a v2 room, with no signed leave we hold and not a re-seat; or a direct-room Add of a DID that is not exactly one of the pair. The record names the commit's epoch and hash and says the bridge holds no persona store | A Geb device holding a persona card linking the DIDs would merge it and we cannot know, so neither merging nor skipping is safe. **A deliberate bridge-side choice, the honest alternative to a silent fork: Geb itself refuses such a commit and continues.** A card-free refusal in the same commit wins over the undecidable part |
 
-Commits that are decided without local knowledge (ordinary adds, exact-DID root or admin removes,
-a bound sender removing or re-seating its own DID, other re-seats, root policy changes, every
-0.5.15 bound-leaf refusal) are handled normally. A "pending" seating (an "ask" room) is a state,
+Commits that are decided without a persona store (ordinary adds, removes by exact-DID root or admin
+or in a v1 room, a Remove of the sender's own DID, a Remove covered by a held signed leave,
+re-seats, root policy changes, every 0.5.15 bound-leaf refusal) are handled normally, and a
+refused one is skipped as Geb skips it. A "pending" seating (an "ask" room) is a state,
 not an error: the link idles and re-checks each tick.
 
 Not covered by a halt: too many held commits (`Error::Unsupported` from `hold_commit`), and a build
@@ -620,68 +652,66 @@ invitation "follows separately" (round 3, section 14).
 
 ### Open questions for Geb
 
-These are the follow-ups recorded in `CLAUDE.md` after rounds 2 and 3; none is answered. Geb has
-promised answers to its "Not decided yet" list.
+Rounds 2 and 3 left a list of follow-ups; **round 4** (`Geb's path B answers, round 4`,
+2026-11-09, read at `fdf804d`) answered nearly all of them. Four of our readings would have forked
+us and are fixed (Q1 walk, Q2 `selfHeal`, Q6 removes, Q7 signed leaves).
 
-Round 2 follow-ups:
+Answered and confirmed (no longer UNVERIFIED):
 
-1. Is Geb's build stock OpenMLS 0.8.2, with no `[patch]`? (Round 3 says stock 0.8.2; whether a
-   `[patch]` exists is unanswered.)
-2. In `validCommit`, is the root / admin test an exact DID compare, or can persona cards widen it
-   to a sibling device? This decides whether our card-free verdicts can fork.
-3. In the settle walk, is a standalone Proposal, a by-reference commit, or a `leafAuth` violation
-   "refused" (next hash) like a `validCommit` failure, or "failed" (cursor stays, `rs`)? We
-   implement "refused".
-4. `rs` / `rc` / `seat-ask` details: `forkMineWins`, when a client is behind long enough to ask for
-   a re-seat, and whether `rc`'s `e` is the epoch it was made from.
-5. Does an unacked dyad frame block Geb's ratchet or only repeat, and is a reply required to `rs`,
-   `rc` or `leave`? (We ack and ignore unknown ops.)
-6. Does the heal need the same signature key, and is the "bound sender" read before or after the
-   commit's own update path? (We: before; key not required.)
-7. Is a re-seat's added unbound leaf, naming a DID the same commit removes, refused as an
-   `unboundClaim`? (We refuse it.)
+- Geb's OpenMLS 0.8.2 is stock from crates.io, no `[patch]` (Q19).
+- Root and admin are an exact DID compare; persona cards widen only …
+  … (Q4).
+- A heal needs the same DID and a valid binding if present; the new key is not compared (Q3).
+  Whether OpenMLS 0.8.2 itself accepts a new key in an update path is unconfirmed.
+- A DID removed in the same commit still counts as seated for `unboundClaim` (Q5).
+- An unacked frame never blocks the ratchet; ack-and-ignore is safe except for `leave` (Q7).
+- An `rs` with no valid status body is dropped (Q8): our minimal `rs` has no effect.
+- `rc`'s `e` is the from-epoch; `forkMineWins` and `askReseat` as in round 4 Q9 (for the `rs`
+  task, not built). After a re-seat each device re-posts its own dead-branch lines (Q10, not
+  built).
+- A KeyPackage lifetime of exactly 84 d + 1 h is not refused (Q15); `kp-low` `n:0` is valid and
+  the gen after a loss is theirs + 1 (Q16); the first 16 `kp-stock` entries that pass the filter
+  are kept (Q17); `ieee7012Agreed` is a required boolean, value never checked (Q18).
+- An over-budget frame goes whole to an `fc:0` peer and is never delivered above the relay's cap;
+  no fallback (Q11); no fragment sample yet (Q12).
 
-Round 3 follow-ups:
+Still open:
 
-1. Does Geb accept, or silently ignore, an `rs` with no status body `s`, and is a seat-check
-   answered by anything short of a full `rs`?
-2. With `fc:0`, is a Welcome over 120,000 bytes really never delivered, or is there a fallback? What
-   room size is the practical limit?
-3. Is the live relay's per-event cap 131,072 or 256 KB, and are the 900 s future limit and the
-   20-subscription limit still as in the repo copy?
-4. `kp-low {gen, n}`: can `n` be 0, and what should we answer when we have lost our per-contact
-   state (we use their `gen` plus 1)?
-5. Does Geb reject a KeyPackage whose lifetime range is exactly 84 days plus 1 h?
-
-Geb's "Not decided yet" list (round 3): stay on OpenMLS 0.8.2 or move to 0.9.x; whether 0.5.15 is
-still path B 0.1 or 0.2; a path B compatibility policy; a room member cap; bridge and agent room
-settings; … (so it could sit in their
-direct rooms); the live relay limits. No separate round 4 question file exists in
-`the shared scratch directory`; the lists above are the current open points.
+- The live relay limits (Q13, Q14): per-event cap (131,072 in the stale repo copy, 256 KB per
+  Geb's record), subscriptions (20 stale, 200 per record), future limit (900 s), NIP-40 handling.
+  Geb will read the live config. We plan to 120,000 bytes either way.
+- Which of "failed" and "refused" fires for a by-reference commit (both are skipped).
+- Geb's "Not decided yet" lists (rounds 3 and 4): OpenMLS 0.8.2 versus 0.9.x; whether 0.5.15 is
+  path B 0.1 or 0.2; a compatibility policy; a room member cap and a recommended size for clients
+  without fragment joining; bridge and agent room settings; linking a bridge as a person's own
+  device; the live relay limits; which of the seven round 4 cases the compatibility run uses and
+  whether test switches run on throwaway Geb nodes; a fragmented-frame sample; the fixed transcript
+  (Q20, following separately).
 
 Other UNVERIFIED points: the `did:peer` purpose-element order; a few `parsePolicy` details
-(`geb/policy.rs`); VRC acceptance by a live Geb; the dyad's unstated choices (list at the top of
-`geb/dyad.rs`); whether `kp-low` and `seat-check` field types match (read from prose, no vector);
-`fc:0` consequences; the live relay limits; the settle window's start (local first sight of the
-earliest commit); the OpenMLS 0.9.x versus 0.8.2 difference (every behaviour Geb quotes for 0.8.2
-was checked against 0.9.2 source only; the 0.8.2 source was not available).
+(`geb/policy.rs`); VRC acceptance by a live Geb in full; the dyad's unstated choices (list at the
+top of `geb/dyad.rs`); whether `kp-low` and `seat-check` field types match (read from prose, no
+vector); whether the `lv` line's `sg` uses the usual `{v:1, room, author, body}` wrapper; the
+settle window's start (local first sight of the earliest commit); the OpenMLS 0.9.x versus 0.8.2
+difference (every behaviour Geb quotes for 0.8.2 was checked against 0.9.2 source only; the 0.8.2
+source was not available).
 
 ### Before any live run
 
 All of these need a person or Geb. None has been done.
 
-1. Resolve open questions 1 to 3 above and the round 3 questions with Geb, especially the
-   `rs` body (needed to answer `seat-check`) and OpenMLS compatibility.
-2. Implement persona cards and signed leaves (Geb's persona code and leave code) so Remove and
-   policy commits by non-root senders can be decided. Until then the link halts, persisted, on any
-   undecidable commit; Add-only and the other decided commits merge (with `geb-mls`).
+1. Settle the remaining open points above with Geb, and build the proper `rs` status body (Geb
+   drops ours; it is needed to answer `seat-check` and for fork repair).
+2. Implement persona-card intake (Geb's persona code) so the one card-dependent Remove can be
+   decided like Geb. Signed leaves are already received. Until then the link halts, persisted, on
+   that Remove; every other commit is decided and merged or skipped as Geb does (with `geb-mls`).
 3. Run `setup` and `link add` against a real VTA (untested); confirm the printed `pnm` grant text,
    the role name and capability set, and the exportable-key flow.
 4. A real-VTA end to end on the sealed tier with an MLS group; a `wss://` and TLS soak; a
    compatibility run against the Geb CLI on a test relay (not Geb's live room).
 5. Choose a `vti-secrets` backend (plaintext is for development only).
 6. Decide what to do about the not-built list in section 5, in particular `fc` fragments (large-room
-   joins fail), `rs` body and re-seat Welcome acceptance, leave, and gap records.
+   joins fail), `rs` body and re-seat Welcome acceptance, sending a leave, and gap records.
 7. Record in the VTI specification's divergence register (Appendix F): `room-host` answers a
    refused create-only put as a bare `taskFailed`, where the specification names
    `rooms/records/put:versionConflict`.
@@ -726,7 +756,8 @@ All of these need a person or Geb. None has been done.
   signature from that DID.
 - **Persona card**: Geb's record that two devices belong to one person; local knowledge needed to
   decide some commits. Not to be confused with the bridge's VTC persona.
-- **Signed leave**: Geb's `{t:"lv", at, ls}` plaintext, by which a person leaves a room.
+- **Signed leave**: Geb's `{t:"lv", at, ls}` plaintext (and dyad `leave` frame), by which a person
+  leaves a room. The bridge receives them and never sends one.
 - **Echo suppression**: not re-bridging what the bridge itself wrote.
 - **Xref**: the store's cross-reference between origin ids and foreign line ids.
 - **Halt**: a persisted stop of a link (`Refused` or `UndecidableCommit`).

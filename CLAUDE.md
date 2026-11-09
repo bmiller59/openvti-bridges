@@ -31,11 +31,12 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   pin to Geb's authoritative answers `Geb's path B answers, round 1` (code at
   release 0.5.14), round 2 (release 0.5.15, `fdf804d`; the 0.5.15 paragraphs are
   the current rules; they supersede `Geb's implementer's guide (2026-11-07)` where they differ)
-  and round 3 (round 3, 2026-11-09, read at `fdf804d`; see "Round 3 answers"), keep
+  round 3 (round 3, 2026-11-09, read at `fdf804d`; see "Round 3 answers") and
+  round 4 (round 4, 2026-11-09, `fdf804d`; see "Round 4 answers"), keep
   changes behind `GebCodec` and the other `geb::traits`, and mark anything the
   answers do not settle `// UNVERIFIED:`. Remaining markers: the `did:peer`
   purpose-element order, a few `parsePolicy` details (see `geb/policy.rs`), the
-  VRC acceptance by a live Geb (`geb/vrc.rs`: the v2 shape matches Geb's vector byte for byte; `ieee7012Agreed` is sent `false`) and the dyad's
+  VRC acceptance by a live Geb (`geb/vrc.rs`: the v2 shape matches Geb's vector byte for byte; `ieee7012Agreed` is a required boolean whose value Geb never checks, round 4 Q18, so `false` is sent and accepted: no longer UNVERIFIED) and the dyad's
   unstated choices (list at the top of `geb/dyad.rs`). The Nostr event id and
   BIP-340 signature are resolved (`geb/event.rs`, bound to the published
   BIP-340 vectors).
@@ -43,24 +44,34 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   unreadable mailbox event is dropped and logged, never acted on. Without the
   `geb-mls` group a Geb commit (`mc`) stops the poll (the default
   `GebGroup::hold_commit` refuses): skipping a commit forks the epoch
-  silently. Geb's `validCommit` needs local knowledge in exactly two cases (persona cards
-  from persona code, signed leaves `{t:"lv", at, ls}` from leave code), which
-  we do not have; the only production inputs are `geb::policy::NoLocalKnowledge`
-  (`can_evaluate() == false`). Everything else is decided without them
-  (round 2 section 7): ordinary adds, exact-DID root or admin removes, a bound
-  sender removing or re-seating its own DID, other re-seats, root policy
-  changes, a direct-room add of an exact pair member, and every 0.5.15 bound-leaf
-  refusal. Only (1) a Remove of a DIFFERENT DID by a sender who is neither root
-  nor admin and (2) a direct-room Add of a DID that is not exactly one of the
-  pair are neither merged nor skipped: the poll errors with
-  `Error::UndecidableCommit` (epoch and commit hash in the text) and the link
-  halts, persisted, `HaltReason::UndecidableCommit` (see "Halts"). A card-free
-  refusal in the same commit wins over the undecidable part. UNVERIFIED (open
-  question 2): the root / admin test is an exact DID compare; if Geb's test also
-  accepts a root's sibling device through persona cards, a commit from one is
-  refused here and merged by Geb (a fork), and a non-root policy change is
-  refused rather than halted. To turn ALL commit merging off,
-  leave `geb-mls` off.
+  silently. Geb's `validCommit` needs local knowledge in two places: persona
+  cards (persona code, which we do NOT hold: no persona-card intake is built) and
+  signed leaves (`{t:"lv"}` lines and dyad `leave` frames, leave code, which
+  we take: `geb::leave`). The production inputs are
+  `geb::policy::NoLocalKnowledge` (`can_evaluate() == false`) plus the held
+  signed leaves. A Remove passes (Geb's exact rule, answers
+  round 4 Q6) when ANY of: (1) every removed DID is the sender's person (without
+  a persona store: the sender's own DID); (2) …
+  … we hold, no adds, no policy change; (3) a re-seat (removed and
+  added DIDs the same non-empty set, no policy change) by any member with a
+  bound leaf; (4) the sender is root or an admin (EXACT DID compare, never
+  widened, Q4) or the room's policy is v1 (`p.v !== 2`). A Remove or policy
+  change needs a sender whose leaf is bound BEFORE the commit, except
+  `selfHeal` (Q2: an unbound sender whose Remove has no policy change, removes
+  only leaves naming its own DID, adds at least one leaf and …
+  … signature). **Geb refuses
+  anything else and goes on; it never halts a room.** The ONE residue the bridge
+  cannot decide is a Remove of ANOTHER DID by a non-root non-admin sender in a v2
+  room with no signed leave we hold and not a re-seat: a Geb device holding a
+  persona card linking the two DIDs would merge it. Only that case (and a
+  direct-room Add of a DID that is not exactly one of the pair) is neither merged
+  nor skipped: the poll errors with `Error::UndecidableCommit` (epoch and commit
+  hash in the text, and the reason: no persona store, no signed leave) and the
+  link halts, persisted, `HaltReason::UndecidableCommit` (see "Halts"). **That
+  halt is a deliberate bridge-side choice, the honest alternative to silently
+  forking; Geb itself refuses and continues.** The reason it exists is that the
+  bridge holds no persona store. A card-free refusal in the same commit wins over
+  the undecidable part. To turn ALL commit merging off, leave `geb-mls` off.
 - **MLS wire strictness** (answers round 2, sections 1-2; `geb/mls/commit.rs`):
   every MLS object we read is a full RFC 9420 `MLSMessage`. `mc` / `ml` `m` must
   be an `MLSMessage` whose body is a PrivateMessage (a PublicMessage, a bare
@@ -72,41 +83,61 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   strings are dropped, in our `kp` / `kp-stock` frames (`Frame::validate`) and
   in `geb::mls::parse_key_package`.
 - **Unknown group ops are ignored, unknown kinds are not** (`wire::parse_frame`).
-  A dyad frame `{k:"g", op:<not kp-stock|kp-req|rs|kp|welcome>}` (Geb's `rc`,
-  `seat-ask`, `leave`, or anything newer) parses as `GroupOp::Ignored`, is
+  A dyad frame `{k:"g", op:<not kp-stock|kp-req|rs|kp|welcome|kp-low|seat-check|leave>}` (Geb's `rc`,
+  `seat-ask`, or anything newer) parses as `GroupOp::Ignored`, is
   logged, recorded done and ACKED, and never reaches the consumer. An unknown
   frame kind `k`, a `g` frame without a string `op`, or a known op with a bad
   body still fails and is dropped unacked (a kind may carry authority).
-  UNVERIFIED: whether an unacked frame blocks Geb's ratchet or only repeats.
-  Our own receive chain cannot stall (opening a frame commits the chain, and the
-  skipped-key window heals gaps), but without an ack the sender would repost
-  the frame for ever, so ack is the safe choice either way. Geb's expected
-  reply to `rc` / `seat-ask` / `leave` (P1/P2) is not built.
-- **0.5.15 commit and tree rules** (answers round 2 sections 2, 7, 8;
-  `geb/mls/commit.rs`, `geb::policy::valid_commit`). Refusals, never failures:
-  a commit with any proposal by reference, a standalone Proposal in an `mc`
-  (never stored), an update-path leaf naming another DID than its sender
-  (`leafAuth`) or carrying a forged binding, an unbound added leaf naming the
-  root, an admin or a seated DID (`unboundClaim`), and a remove, re-seat or
-  policy change from a sender whose leaf is not bound (exception: …
-  … leaf). A `heal` (path-only self-update
-  whose new leaf carries the sender's binding) is valid. At join a Welcome whose
-  … with one unbound, is
-  refused (`treeRefusal`: the group `into_group` stored is deleted, we stay
-  pending). Leaf verdicts: bound = binding verifies (`BindingStatus::Verified`),
-  unbound = no `0xF002` (`Missing`), forged = present and wrong (`Forged`); `k`
-  is derived from the leaf's own signature key, so a bad-`k` binding is simply a
-  signature that does not verify. Refused vs failed in the walk: refused = drop
-  and try the next hash; failed (`Unprocessable`: replay, wrong branch,
-  unparsable) = stop, keep the cursor, send `rs` once.
-  UNVERIFIED (Geb's walk label for the MLS-layer refusals is "refused", which
-  we read as the same as a `validCommit` failure, matching the forged-binding
-  precedent in round 1; the answers do not say it outright, and the reading
-  "failed" would stop the walk instead; open question 3): standalone Proposal,
-  by-reference, `leafAuth`. UNVERIFIED: the "bound sender" is the sender's leaf
-  before the commit; the unboundClaim "seated" set includes a DID the same
-  commit removes (a re-seat onto an unbound leaf is refused); a heal need not
-  keep the same signature key.
+  Confirmed (round 4 Q7): an unacked frame never blocks Geb's ratchet (Geb acks
+  a frame the moment it opens it, before reading its op; an unacked frame is
+  kept at most 15 minutes, 256 frames, 2 MB); ack-and-ignore is safe for `rc`,
+  `seat-ask` and unknown ops (Geb drops unknown ops too). **`leave` is the
+  exception: it is a real op** (`GroupOp::Leave`, `{k:"g", op:"leave", room:{id},
+  by, at, sig}`), handed to the group, verified, and still acked; a malformed one
+  is acked and ignored. See "Signed leaves". No reply to `rc` / `seat-ask` is
+  built.
+- **Signed leaves (receive only)** (answers round 2 section 8, round 4 Q7;
+  `geb/leave.rs`). Ignoring a leave is safe only if we take the signed room
+  line, or a device with …
+  … leaver that every Geb device merges. Taken two ways, one payload:
+  `leavePayload(room, by, at) = JCS {t:"leave", v:1, room, by, at}` signed by the
+  leaver's device DID Ed25519 key (verified against the key in the `did:peer`):
+  (a) a room line `{t:"lv", at, ls, sg}` (read in `GebRoom::poll`; the line's
+  `sg` must verify for its MLS sender, then `ls` is verified for `by` = that
+  sender); (b) the dyad frame above (`by` is a field; any peer may relay a
+  leave, the signature is what counts). Kept: the NEWEST leave per signer per
+  room, persisted in the sealed MLS snapshot (`Snapshot.leaves`), at most 1024
+  signers; a leave whose signature does not verify, or that names another room,
+  is dropped. A held leave covers its signer's EXACT DID in `valid_commit` rule
+  (2). We do not send a leave, elect a healer or commit a Remove (follower
+  only). UNVERIFIED: the `lv` line's `sg` is read as the usual
+  `{v:1, room, author, body}` wrapper over the plaintext without `sg`; a held
+  leave is never expired.
+- **0.5.15 commit and tree rules** (answers round 2 sections 2, 7, 8, round 4
+  Q1-Q6; `geb/mls/commit.rs`, `geb::policy::valid_commit`). Refused (staged by
+  MLS, then failed `leafAuth` / `validCommit`): an update-path leaf naming
+  another DID than its sender (`leafAuth`) or carrying a forged binding, an
+  unbound added leaf naming the root, an admin or a seated DID (`unboundClaim`;
+  `seated` is the list BEFORE the commit and nothing exempts a DID the same
+  commit removes, Q5), and a remove, re-seat or policy change from a sender whose
+  leaf (as it stood before the commit, Q2) is not bound (exception: `selfHeal`).
+  Failed (MLS cannot process it): replay, wrong branch, unparsable, a standalone
+  Proposal in an `mc` (Geb's binding never stores one; in an `ml` it is dropped
+  as non-line) and a commit with a proposal by reference (UNVERIFIED which of
+  failed and refused fires there; both are skipped). **The walk NEVER stops on
+  any candidate** (Q1): both refused and failed skip to the next hash and the
+  first that passes is merged. They differ only after the walk: if NOTHING
+  merged and one failed, the cursor stays before it (a later replay is judged
+  again) and ONE `rs` goes out; if one merged, a failed candidate changes
+  nothing. A `heal` (path-only self-update whose new leaf carries the sender's
+  binding) is valid and need not keep the same signature key (Q3; whether
+  OpenMLS 0.8.2 accepts a new key in an update path is unconfirmed). At join a
+  Welcome whose … with one
+  unbound, is refused (`treeRefusal`: the group `into_group` stored is deleted,
+  we stay pending). Leaf verdicts: bound = binding verifies
+  (`BindingStatus::Verified`), unbound = no `0xF002` (`Missing`), forged = present
+  and wrong (`Forged`); `k` is derived from the leaf's own signature key, so a
+  bad-`k` binding is simply a signature that does not verify.
 - **No new message kinds.** Geb has no edit, delete or retract on the wire. A
   retraction (or a supersede, since edit is unsupported) is an ordinary signed
   `{t:"l"}` line whose `re` is the original line's *derived* id
@@ -266,13 +297,17 @@ The supervisor ends `End::Halted` for both kinds and never retries.
 
 - `HaltReason::Refused`: seating refused or our leaf removed by a merged
   commit (`Error::Refused`). Permanent.
-- `HaltReason::UndecidableCommit`: with production inputs
-  (`NoLocalKnowledge`) a Remove of a different DID by a sender who is neither
-  root nor admin, or a direct-room Add of a non-exact DID, cannot be decided
-  without persona cards or signed leaves, and neither merging nor skipping is
-  safe. The record names the commit's epoch and hash. Clearing
-  makes the link read the commit again, so it halts again at once unless
-  something changed.
+- `HaltReason::UndecidableCommit`: a Remove of ANOTHER DID by a non-root,
+  non-admin sender in a v2 room, with no signed leave we hold and not a
+  re-seat, or a direct-room Add of a non-exact DID. A Geb device that holds a
+  persona card linking the two DIDs would merge it; the bridge holds no persona
+  store (persona-card intake is not built), cannot know, and neither merging
+  nor skipping is safe. **This halt is a deliberate bridge-side choice, the
+  honest alternative to silently forking: Geb itself refuses such a commit and
+  continues, and never halts a room.** The reason text says so. The record names
+  the commit's epoch and hash. Clearing makes the link read the commit again, so
+  it halts again at once unless something changed (a signed leave arrived, or
+  the room moved on).
 - `status` shows the halt and its reason. `link clear-halt <link>` prints what
   the halt was, then clears it only with `--yes`; a `Refused` halt also needs
   `--i-have-been-readmitted` (the bridge has been admitted to the room again).
@@ -301,12 +336,19 @@ wire compatibility is **inferred, not shown**: only the live compatibility run
 against a Geb 0.5.15 CLI (0.8.2) can show it. A Welcome that 0.9.2 rejects
 surfaces as `welcome: ...` / `treeRefusal: ...` in the warn log
 (`ignoring a welcome`). Also unknown: whether Geb's OpenMLS carries a
-`[patch]`. We use 0.9-only API (`StagedCommit::update_path_leaf_node`,
+`[patch]`. Confirmed (round 4 Q19): Geb's 0.8.2 is stock from crates.io, no `[patch]`, no
+`.cargo` folder, features `["js"]`. We use 0.9-only API (`StagedCommit::update_path_leaf_node`,
 `QueuedProposal::proposal_or_ref_type`); the cost of moving to 0.8.2 is a
 second MLS stack plus a storage-snapshot rework, and is not recommended before
 the live run says it is needed.
 
 ## Open questions for Geb (round 2 follow-ups)
+
+ANSWERED by round 4 (see "Round 4 answers"): 1 (stock 0.8.2, no patch), 2
+(exact), 3 (skip either way; which fires for by-reference is still
+unconfirmed), 4 (`forkMineWins`, `askReseat`, `e`), 5 (never blocks; `leave` is
+not safe to ignore), 6 (before the commit; key not required; OpenMLS 0.8.2's
+own acceptance unconfirmed), 7 (refused). Kept below as asked.
 
 1. Is Geb's build stock OpenMLS 0.8.2, with no `[patch]`?
 2. In `validCommit` (Geb's source), is the root / admin test an exact DID
@@ -329,6 +371,10 @@ the live run says it is needed.
 
 ## Open questions for Geb (round 3 follow-ups)
 
+ANSWERED by round 4: 1 (an `rs` with no valid `s` is DROPPED), 4 (`n:0` is
+valid, gen + 1), 5 (a lifetime of exactly 84 d + 1 h is not refused); 2 and 3
+only partly (relay figures now UNCONFIRMED, see "Round 4 answers").
+
 1. Does Geb accept (or silently ignore) an `rs` with no status body `s`, and is a
    seat-check answered by anything short of a full `rs`? (We send the minimal one.)
 2. With `fc:0`, is a Welcome over 120,000 bytes really never delivered, or is
@@ -343,16 +389,16 @@ the live run says it is needed.
 
 ## Not built (blocked or later)
 
-M3 remainder: persona cards and signed leaves (`geb::policy::CommitCheckInputs`
-has only the `NoLocalKnowledge` production implementation), so the two
-card-dependent commit kinds halt the link; leaving a room (a signed `{t:"lv"}`); a
-re-seat after a fork (`rs` is sent, a replacement Welcome is not processed);
+M3 remainder: persona-card intake (`geb::policy::CommitCheckInputs` has no
+persona implementation; the card-dependent Remove halts the link); SENDING a
+leave, the healer election and Remove commits (we only RECEIVE signed leaves);
+a re-seat after a fork (`rs` is sent, a replacement Welcome is not processed);
 a peer index (the dyad is driven per peer DID, peers are listed per link in
 `geb_peers`); `fc` fragments; the `rs` status body and its fork repair (`rs` is
-sent minimal, see "Round 3 answers"); `seat-ask` and `rc` handling; accepting a
-re-seat Welcome; persona-card intake; fork choice. Also not
-built on the room side: recovery of a sealed record left at a wrong version
-by a crash mid-race (it is reported as a typed read error).
+sent minimal, and Geb DROPS it: see "Round 4 answers"); `seat-ask` and `rc`
+handling; accepting a re-seat Welcome; dead-branch line re-post; fork choice.
+Also not built on the room side: recovery of a sealed record left at a wrong
+version by a crash mid-race (it is reported as a typed read error).
 
 ## Round 3 answers (2026-11-09, read at `fdf804d`): summary notes
 
@@ -406,7 +452,8 @@ checked against a live Geb; the status of each point is stated.
 ### Open items (recorded, not built)
 
 - `fc` fragments (large-room joins fail; see Capabilities).
-- A proper `rs` status body `s:{e, a, chain, ...}`, `rc`, `seat-ask`, and
+- A proper `rs` status body `s:{e, a, chain, ...}` (THE NEXT TASK: Geb drops our
+  minimal `rs`, so it currently has no effect at all), `rc`, `seat-ask`, and
   accepting a re-seat Welcome (P1). Until then our `rs` is the minimal
   `{k:"g", op:"rs", room:{id}}`.
 - Re-stocking a SEATED member every 7 days (re-seat needs it; there is no natural
@@ -415,21 +462,92 @@ checked against a live Geb; the status of each point is stated.
 - A `link add` check for direct rooms (needs a network read).
 - An oversize outbox entry (cannot come out of the mapping layer, which cuts at
   20,000 bytes) would be retried every tick, not dropped.
-- Leave, persona-card intake, fork choice.
+- Sending a leave, healer duty, persona-card intake, fork choice.
 
 ### UNVERIFIED points that still stand
 
-The seven round-2 follow-ups under "Open questions for Geb" are all still open;
-round 3 narrows only the first (Geb pins 0.8.2 as stated; whether it carries a
-`[patch]` is still unanswered). Added by round 3:
+Round 4 settled most of the round 2 and 3 follow-ups (see "Round 4 answers").
+Still open: OpenMLS 0.8.2's own acceptance of …
+… path; which of failed and refused fires for a by-reference
+commit; the live relay limits (see below); whether the `lv` line's `sg` uses the
+usual wrapper; and, from round 3:
 
-- **`rs` for `seat-check`:** our `rs` has no status body, which Geb's
-  `cleanStatus` requires, so it most likely does NOT satisfy a seat-check
-  (nothing worse follows: silence never commits). `geb/mls/client.rs`.
 - **`kp-low` / `seat-check` frames:** field types are read from the answers
   (`gen`, `n` integers; `e` an epoch integer), not from a vector.
 - **`fc:0` in `cap`:** Geb reads `fc` only when exactly `1`; `0` is "stated, not
-  fragments". The effect on large Welcomes is as Geb describes, unobserved.
-- **Event and line limits:** 120,000 / 20,000 come from the answers; whether
-  the live relay (256 KB claim vs 131,072 in the repo copy) still takes 131,072
-  is unconfirmed.
+  fragments". An over-budget frame is sent to an `fc:0` peer WHOLE (round 4 Q11),
+  so a Welcome above the relay's per-event cap is never delivered; no fallback.
+- **Event and line limits:** 120,000 / 20,000 come from the answers; the live
+  relay's per-event cap is UNCONFIRMED (131,072 in the repo copy, raised to
+  256 KB on 2026-11-02 per Geb's record).
+
+## Round 4 answers (2026-11-09, `Geb's path B answers, round 4`, read at `fdf804d`)
+
+Geb's word as written; none checked against a live Geb. Four of our readings
+would have forked us (Q1, Q2, Q6, Q7); all four are fixed (`git log`).
+
+**Acted on.** Q1: the settle walk never stops on any candidate (refused and
+failed both skip; cursor and `rs` only if nothing merged). Q2: `selfHeal`. Q6:
+Geb's exact removes rule, with the persisted halt kept ONLY for the
+card-dependent residue (a deliberate bridge-side choice). Q7: signed leaves are
+received (room line and dyad frame) and feed rule (2).
+
+**Confirmed (no longer UNVERIFIED).**
+- Q3: a heal needs the same DID and, if a binding is present, a valid one; the
+  new key is not compared with the old.
+- Q4: root and admin are an EXACT DID compare (`roleOf`, `mayRemove`,
+  `mayChangePolicy`, `unboundClaim`); persona cards widen only …
+  … adds. A root's sibling
+  device has no rights.
+- Q5: a DID removed in the same commit still counts as seated: an unbound
+  re-seat leaf is refused (`unboundClaim`).
+- Q7: an unacked dyad frame never blocks the ratchet; ack-and-ignore is safe for
+  `rc`, `seat-ask` and unknown ops, not for `leave`.
+- Q8: an `rs` with no valid body `s` is DROPPED (`cleanStatus`, then `return
+  null`): never a fork signal, never marks us "seen", never gets us `rc` or a
+  re-seat. **So our current minimal `rs` has no effect at all; the proper `rs`
+  status body is the next task.** An unanswered seat-check commits nothing
+  ("silence alone never commits").
+- Q9 (for the `rs`/re-seat task, not built): `rc`'s …
+  … (receivers judge at once when `e` equals theirs, keep up to 64
+  for later epochs, drop below). `forkMineWins(hashWins, mine, theirs, others)`:
+  (1) `theirs > mine` and every `other > mine`: I lose; (2) `theirs < mine` and
+  every `other > theirs`: I win; else `hashWins` (at the lowest common epoch where
+  authenticators differ, the lower authenticator wins). …
+  … when behind (same `(mine, theirs)` pair seen
+  again a settle window later) or when evicted/missing, at most once per 600 s;
+  it sends `seat-ask` with no `kp`, after which our `rs` stays quiet 600 s.
+- Q10: after a re-seat each device re-posts ITS OWN dead-branch lines (original
+  `id` and `at`, `{t:"l", ..., fk:1, id}`, at most 100, text only); we cannot
+  leave it to others. Not built.
+- Q11: an over-budget frame is sent whole to an `fc:0` peer; Geb's sender sets
+  it aside only above 258,048 bytes; no fallback route; members per room before
+  a Welcome needs fragments is not measured.
+- Q12: no fragment sample exists yet (owed).
+- Q15: a KeyPackage lifetime of exactly 84 d + 1 h is NOT refused (receivers
+  check only that now is in `[not_before, not_after]`; Geb adds no check).
+- Q16: `kp-low` with `n:0` is valid (`n` from 0 to `STOCK_N - 1`); the gen after
+  a loss is `max(last gen sent, their gen) + 1`, i.e. theirs + 1 as implemented.
+- Q17: more than 16 `kp-stock` entries: the first 16 that pass the pattern and
+  length filter are kept.
+- Q18: `ieee7012Agreed` is a required boolean whose value is never checked;
+  `false` is accepted.
+- Q19: Geb's OpenMLS 0.8.2 is stock (registry source, no `[patch]`, no `.cargo`).
+
+**Relay figures are now UNCONFIRMED (Q13, Q14).** Geb's repo copy of the strfry
+config is out of date: per-event 131,072 there, raised to 256 KB on 2026-11-02 per
+Geb's record (and); subscriptions per connection 20 there,
+raised to 200 on 2026-11-04 (round 3's "20" was stale); future `created_at`
+900 s, no change recorded; NIP-40 deletion vs hiding unconfirmed. Geb will read
+the live config. We keep planning to 120,000 bytes either way and keep our 8
+concurrent catch-up reads.
+
+**Not decided yet (Geb, Geb's maintainers decide):** which of seven cases the compatibility
+run uses and whether test switches run on throwaway Geb nodes; a fragmented
+frame sample; publishing the live relay config; …
+… joining.
+
+**Q20/Q21.** The fixed transcript follows separately. Every case in Q21 can be
+staged from the `geb` CLI today (bound add, unbound add, heal with
+`GEB_TEST_NO_BINDING=1`, forced fork + re-seat, `geb group leave`, a line over
+20,000 characters, a Commit Geb refuses).
