@@ -259,6 +259,38 @@ async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
             .contains("not halted")
     );
 
+    // A fork split: the unsealed marker is shown by `status` (and a paused
+    // link reads PAUSED). No keys are needed to read it.
+    {
+        use vti_geb_bridge::geb::forkmark::{self, ForkMarker, ForkState};
+        let s = FjallStore::open(&store_dir).unwrap();
+        forkmark::write(
+            &s,
+            &ForkMarker {
+                v: 1,
+                link: "l1".into(),
+                state: ForkState::WaitingForReseat,
+                fork_epoch: 7,
+                our_epoch: 9,
+                their_epoch: 8,
+                detected_at_ms: 1_700_000_000_000,
+                reseated_at_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let (ok, out, err) = run(&["status", "--link", "l1"]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("fork waiting-for-reseat (epoch 7, ours 9 theirs 8"),
+        "{out}"
+    );
+    assert!(
+        out.contains("PAUSED"),
+        "a link that is not enabled reads PAUSED: {out}"
+    );
+
     // A removal needs the extra flag.
     {
         let s = FjallStore::open(&store_dir).unwrap();

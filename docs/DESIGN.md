@@ -510,7 +510,13 @@ without `geb-mls` (`UnsupportedGroup` refuses each tick), which fail per tick wi
 
 **What `status` shows.** The pinned Geb reading, then per link: `enabled` or `PAUSED`, the browse
 version, the foreign cursor (seconds), the outbox depth (journalled, not yet posted), the time of
-the last relayed post, and `ok` or `HALTED (<reason>)`.
+the last relayed post, and `ok` or `HALTED (<reason>)`. When the Geb room has split, a second line
+shows the **fork marker** (`geb/forkmark.rs`): state (`waiting-for-reseat` when our branch lost,
+`branch-won`, or `reseated` once a re-seat Welcome was accepted), the fork epoch, our and their
+epochs at detection and the times. The split itself lives in the sealed MLS snapshot, which `status`
+cannot open, so the client mirrors a minimal record in the store's `fork` cursor, unsealed like the
+halt record, written when the split is recorded and moved to `reseated` when the Welcome is
+accepted. It holds numbers and names only: no key, no plaintext, no commit bytes, no peer identity.
 
 **Kill switch (`link pause` / `link resume`, `pause.rs`).** `link pause` sets `enabled = false` in
 the config file (an atomic replace). The store is locked by the running process, so the config is

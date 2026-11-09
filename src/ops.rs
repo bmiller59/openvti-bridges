@@ -78,6 +78,9 @@ pub struct Status {
     pub last_relayed_secs: Option<u64>,
     /// Why the link is halted, if it is.
     pub halted: Option<HaltReason>,
+    /// The Geb room's last recorded fork split and where it stands, if any
+    /// (a non-secret marker; the split itself is in the sealed MLS snapshot).
+    pub fork: Option<crate::geb::forkmark::ForkMarker>,
     /// The pinned Geb reading.
     pub geb: String,
 }
@@ -95,6 +98,7 @@ pub async fn status(store: &dyn BridgeStore) -> Result<Status> {
         outbox_depth: store.outbox_unposted().await?.len(),
         last_relayed_secs: be8(store.cursor(LAST_RELAYED).await?),
         halted: crate::halt::read(store).await?,
+        fork: crate::geb::forkmark::read(store).await?,
         geb: crate::geb::status_line(),
     })
 }

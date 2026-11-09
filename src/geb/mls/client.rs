@@ -17,6 +17,7 @@ use crate::geb::policy::CommitCheckInputs;
 use crate::geb::settle::{CommitHash, Outcome, SettleQueue, Verdict};
 use crate::geb::traits::{GebDyad, GebGroup, GebSigner, OpenedMessage, SettleReport};
 use crate::geb::wire::{Frame, GroupOp, RoomInfo, RoomRef};
+use crate::store::BridgeStore;
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -207,6 +208,10 @@ pub struct MlsGroupClient {
     inputs: Arc<dyn CommitCheckInputs>,
     inner: Mutex<Inner>,
     persist: Option<Arc<dyn GroupStateStore>>,
+    /// Where the non-secret fork marker goes (`geb::forkmark`), and the link
+    /// it names. `None`: no marker is kept (tests, an embedding without
+    /// `status`).
+    fork_sink: Option<(Arc<dyn BridgeStore>, String)>,
     clock: Clock,
 }
 
@@ -251,8 +256,17 @@ impl MlsGroupClient {
                 heal: heal::HealState::default(),
             }),
             persist: None,
+            fork_sink: None,
             clock: Arc::new(system_now_ms),
         })
+    }
+
+    /// Keep the non-secret fork marker (`geb::forkmark`) in `store` for
+    /// `link_id`, written when a split is recorded and updated when a re-seat
+    /// Welcome is accepted, so `status` can show it without the MLS keys.
+    pub fn with_fork_marker(mut self, store: Arc<dyn BridgeStore>, link_id: &str) -> Self {
+        self.fork_sink = Some((store, link_id.to_string()));
+        self
     }
 
     /// Use `clock` (milliseconds) for KeyPackage lifetimes, stock ages and
@@ -1020,6 +1034,7 @@ impl GebGroup for MlsGroupClient {
                         };
                         match outcome {
                             Ok(()) => {
+                                self.sync_fork_marker().await;
                                 self.send_rs_all(true, &[]).await;
                                 return Ok(JoinState::Seated);
                             }

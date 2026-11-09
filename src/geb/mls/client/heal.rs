@@ -80,6 +80,16 @@ pub struct Split {
     pub asked: bool,
     /// A re-seat replaced our group since.
     pub resolved: bool,
+    /// Our epoch when the split was detected (0 in a snapshot from before
+    /// this was kept).
+    #[serde(default)]
+    pub our_epoch: u64,
+    /// The peer's epoch when it was detected (0 likewise).
+    #[serde(default)]
+    pub their_epoch: u64,
+    /// When a re-seat resolved it, ms (`None` until one did).
+    #[serde(default)]
+    pub resolved_at_ms: Option<u64>,
 }
 
 /// One line we sent, kept for a dead-branch re-post.
@@ -486,6 +496,9 @@ impl MlsGroupClient {
                         at_ms,
                         asked: we_won,
                         resolved: false,
+                        our_epoch: mine.e,
+                        their_epoch: theirs.e,
+                        resolved_at_ms: None,
                     });
                     plan.answer = true;
                 }
@@ -510,6 +523,9 @@ impl MlsGroupClient {
             }
             plan
         };
+        // The split (if this status showed one) is in the sealed snapshot
+        // state now; mirror it where `status` can read it.
+        self.sync_fork_marker().await;
         for f in &plan.rc {
             if let Err(e) = self.dyad.send(peer, f).await {
                 tracing::warn!(error = %e, "could not send a Commit (rc)");
@@ -595,7 +611,45 @@ impl MlsGroupClient {
         };
         if joined {
             tracing::warn!("re-seated from a Welcome: the old group was replaced");
+            self.sync_fork_marker().await;
             self.send_rs_all(true, &[]).await;
+        }
+    }
+
+    /// Bring the non-secret fork marker (`geb::forkmark`) in line with the
+    /// split the sealed snapshot holds. Cheap and idempotent: it writes only
+    /// when the record differs. A failed write is logged and never fails the
+    /// caller; the marker is informational.
+    pub(super) async fn sync_fork_marker(&self) {
+        use crate::geb::forkmark::{self, ForkMarker, ForkState};
+        let Some((store, link)) = &self.fork_sink else {
+            return;
+        };
+        let Some(split) = self.split() else { return };
+        let state = if split.resolved {
+            ForkState::Reseated
+        } else if split.we_won {
+            ForkState::BranchWon
+        } else {
+            ForkState::WaitingForReseat
+        };
+        let marker = ForkMarker {
+            v: 1,
+            link: link.clone(),
+            state,
+            fork_epoch: split.epoch,
+            our_epoch: split.our_epoch,
+            their_epoch: split.their_epoch,
+            detected_at_ms: split.at_ms,
+            reseated_at_ms: split.resolved_at_ms,
+        };
+        match forkmark::read(store.as_ref()).await {
+            Ok(Some(old)) if old == marker => return,
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not read the fork marker"),
+        }
+        if let Err(e) = forkmark::write(store.as_ref(), &marker).await {
+            tracing::warn!(error = %e, "could not write the fork marker");
         }
     }
 
@@ -656,6 +710,9 @@ impl MlsGroupClient {
             let skip = take.len().saturating_sub(OWN_LINES_MAX);
             h.p.pending_reposts = take.into_iter().skip(skip).collect();
             if let Some(s) = h.p.split.as_mut() {
+                if !s.resolved {
+                    s.resolved_at_ms = Some(now);
+                }
                 s.resolved = true;
             }
         }

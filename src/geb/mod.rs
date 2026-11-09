@@ -46,6 +46,7 @@ pub mod crypto;
 pub mod dyad;
 pub mod event;
 pub mod fake;
+pub mod forkmark;
 pub mod leave;
 #[cfg(feature = "geb-mls")]
 pub mod mls;

@@ -164,6 +164,9 @@ pub async fn status(config_path: &Path, only: Option<&str>) -> Result<()> {
                 None => "ok".into(),
             },
         );
+        if let Some(f) = &s.fork {
+            println!("{}:   {}", l.id, f.describe());
+        }
     }
     Ok(())
 }

@@ -276,6 +276,10 @@ second concurrent call fails with "dyad busy".
   every wait, `close` on every exit, backoff reset only after a healthy session,
   `Refused` and `UndecidableCommit` halt for good and the halt is persisted, health derived from the
   time of the last good tick). Config load reads one file and contacts nothing.
+- **Fork marker** (`geb::forkmark`, store cursor `fork`, unsealed, numbers only): the MLS client
+  mirrors a recorded split (`heal::Split`, sealed snapshot) so `status` can show it without
+  keys: `waiting-for-reseat` / `branch-won` -> `reseated` when a re-seat Welcome is accepted
+  (`MlsGroupClient::with_fork_marker`, `sync_fork_marker`). Never add a secret to it.
 - `wiring::assemble` builds a link; the end-to-end test (`tests/e2e.rs`,
   features `harness geb-live geb-mls`) uses the same assembly. Its header says
   what it does not prove (byte-compatibility with real Geb).

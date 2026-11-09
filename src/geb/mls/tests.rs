@@ -57,6 +57,8 @@ struct World {
     room: GebRoom,
     our_did: String,
     our_dev: SigningKey,
+    /// Where the client keeps its non-secret fork marker.
+    marks: Arc<crate::store::MemoryStore>,
 }
 
 impl World {
@@ -101,6 +103,7 @@ impl World {
         // The client follows the world's clock (so a test steps both with
         // `at`), anchored at the real time its KeyPackage lifetimes need.
         let real0 = now_secs() * 1000;
+        let marks = Arc::new(crate::store::MemoryStore::new());
         let c1 = clock.clone();
         let client = Arc::new(
             MlsGroupClient::new(
@@ -111,7 +114,8 @@ impl World {
                 &MemoryVault::default(),
             )
             .unwrap()
-            .with_clock(Arc::new(move || real0 + c1.load(Ordering::SeqCst) - 10_000)),
+            .with_clock(Arc::new(move || real0 + c1.load(Ordering::SeqCst) - 10_000))
+            .with_fork_marker(marks.clone(), "l1"),
         );
         client.set_unprompted_statuses(false);
         let c2 = clock.clone();
@@ -136,6 +140,7 @@ impl World {
             room,
             our_did,
             our_dev,
+            marks,
         }
     }
 

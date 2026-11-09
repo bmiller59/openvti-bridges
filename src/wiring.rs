@@ -133,7 +133,8 @@ pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
                 .unwrap_or_else(|| Arc::new(NoLocalKnowledge)),
             &sigkey,
         )?
-        .with_state_store(Arc::new(state))?,
+        .with_state_store(Arc::new(state))?
+        .with_fork_marker(store.clone(), &i.link.id),
     );
     let geb_room = Arc::new(GebRoom::new(
         i.link.geb_room_id.clone(),

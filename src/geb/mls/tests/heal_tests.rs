@@ -792,3 +792,88 @@ async fn own_lines_are_kept_bounded_to_100() {
     let s = w.client.room_status().unwrap();
     assert_eq!(s.lines.unwrap()[&w.our_did].n, 100);
 }
+
+// ---- the non-secret fork marker `status` reads (geb::forkmark) ----------------
+
+#[tokio::test]
+async fn a_recorded_split_is_mirrored_in_the_unsealed_marker() {
+    use crate::geb::forkmark::{self, ForkState};
+    let (w, b_status) = forked_world().await;
+    assert_eq!(
+        forkmark::read(&*w.marks).await.unwrap(),
+        None,
+        "no split yet"
+    );
+    w.client
+        .on_rs(&w.b.did, Some(room_ref()), Some(b_status.clone()))
+        .await;
+    let split = w.client.split().expect("the split is recorded");
+    let m = forkmark::read(&*w.marks).await.unwrap().expect("a marker");
+    assert_eq!(m.link, "l1");
+    assert_eq!(m.fork_epoch, split.epoch);
+    assert_eq!((m.our_epoch, m.their_epoch), (split.our_epoch, b_status.e));
+    assert_eq!(m.detected_at_ms, split.at_ms);
+    assert_eq!(m.reseated_at_ms, None);
+    assert_eq!(
+        m.state,
+        if split.we_won {
+            ForkState::BranchWon
+        } else {
+            ForkState::WaitingForReseat
+        }
+    );
+    // The same status again changes nothing.
+    w.client
+        .on_rs(&w.b.did, Some(room_ref()), Some(b_status))
+        .await;
+    assert_eq!(forkmark::read(&*w.marks).await.unwrap(), Some(m));
+}
+
+#[tokio::test]
+async fn accepting_a_reseat_welcome_marks_the_split_reseated() {
+    use crate::geb::forkmark::{self, ForkState};
+    let mut w = World::build(Arc::new(AllKnown), "");
+    let kps = w.seat_raw().await;
+    sent(&w);
+    // The fork, as in `forked_world`: B commits alone from the common epoch.
+    let _ = w.b.stage_self_update();
+    w.b.merge_pending();
+    a_commits_and_we_settle(&mut w).await;
+    sent(&w);
+    let b_status = st(
+        w.b.epoch(),
+        &w.b.auth16(),
+        vec![entry(w.b.epoch(), "bbbbbbbbbbbbbbbb", &w.b.auth16())],
+    );
+    w.client
+        .on_rs(&w.b.did, Some(room_ref()), Some(b_status))
+        .await;
+    let before = forkmark::read(&*w.marks).await.unwrap().expect("marker");
+    assert_ne!(before.state, ForkState::Reseated);
+    // The healer re-seats us; the Welcome is accepted.
+    let (_commit, welcome) = w.a.stage_reseat_full(&w.our_did.clone(), parse_kp(&kps[1]));
+    let frame = welcome_frame(ROOM, &w.a.did, &w.policy, &welcome);
+    w.a.merge_pending();
+    w.bus.put(&w.a.did, &w.our_did, frame);
+    w.at(w.now() + 6_000);
+    w.poll().await.unwrap();
+    assert_eq!(w.client.reseats(), 1);
+    let after = forkmark::read(&*w.marks).await.unwrap().expect("marker");
+    assert_eq!(after.state, ForkState::Reseated);
+    assert!(after.reseated_at_ms.is_some());
+    assert_eq!(
+        (
+            after.fork_epoch,
+            after.our_epoch,
+            after.their_epoch,
+            after.detected_at_ms
+        ),
+        (
+            before.fork_epoch,
+            before.our_epoch,
+            before.their_epoch,
+            before.detected_at_ms
+        ),
+        "the detection facts are kept"
+    );
+}
