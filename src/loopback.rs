@@ -153,7 +153,7 @@ impl ForeignRoom for Loopback {
     }
     fn capabilities(&self) -> RoomCapabilities {
         RoomCapabilities {
-            max_message_bytes: 1_000_000,
+            max_message_units: 1_000_000,
             supports_edit: true,
             supports_delete: true,
             supports_replies: true,

@@ -339,8 +339,8 @@ impl ForeignRoom for GebRoom {
         }
         // Geb counts a line's text in UTF-16 code units (JavaScript string
         // length) and every receiver drops a longer one (round 3 section 6):
-        // refuse, never truncate. The mapping layer already cuts text to the
-        // byte cap in `capabilities()`, which is never more than 20,000 units.
+        // refuse, never truncate. The mapping layer already cuts text to
+        // `capabilities().max_message_units`, counted in the same units.
         let units = utf16_len(&event.text);
         if units > MAX_LINE_CHARS {
             return Err(Error::Foreign(format!(
@@ -449,11 +449,10 @@ impl GebRoom {
 
     fn capabilities_inner(&self) -> RoomCapabilities {
         RoomCapabilities {
-            // Geb caps a line at 20,000 UTF-16 code units; a byte cap of
-            // 20,000 satisfies that for any UTF-8 text (a unit is at least
-            // one byte), at the price of cutting multi-byte text early.
-            // `post` itself counts units.
-            max_message_bytes: MAX_LINE_CHARS,
+            // Geb caps a line at 20,000 UTF-16 code units, counted by the
+            // mapping layer (which cuts at a char boundary, never over it).
+            // `post` counts units too and refuses over the limit.
+            max_message_units: MAX_LINE_CHARS,
             supports_edit: false,
             supports_delete: false,
             // `re` is the derived id of the line answered (answer 10).

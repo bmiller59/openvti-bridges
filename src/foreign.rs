@@ -29,8 +29,11 @@ pub enum Verifiability {
 /// from the adapter's identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoomCapabilities {
-    /// Largest message body the room accepts, in UTF-8 bytes.
-    pub max_message_bytes: usize,
+    /// Largest message body the room accepts, in UTF-16 code units (a
+    /// JavaScript string's `length`: a character outside the BMP counts 2, so
+    /// this is neither bytes nor `char`s). [`crate::mapping::utf16_units`]
+    /// counts it.
+    pub max_message_units: usize,
     /// A post can be edited in place.
     pub supports_edit: bool,
     /// A post can be deleted.

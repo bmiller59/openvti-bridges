@@ -72,8 +72,12 @@ pub struct Status {
     pub browse_version: u64,
     /// Newest Geb relay `created_at` read (seconds), if any.
     pub foreign_cursor_secs: Option<u64>,
-    /// Outbound events journalled but not yet posted.
+    /// Outbound events journalled but not yet posted (entries given up on for
+    /// good are not pending and are counted in `oversize_failed`).
     pub outbox_depth: usize,
+    /// Outbound entries given up on for good because they could not be made to
+    /// fit the foreign room's size limit (journalled, never retried).
+    pub oversize_failed: u64,
     /// When a post was last read back from the relay (unix seconds).
     pub last_relayed_secs: Option<u64>,
     /// Why the link is halted, if it is.
@@ -92,10 +96,20 @@ fn be8(b: Option<Vec<u8>>) -> Option<u64> {
 
 /// Read a link's status from its store alone: no network, no keys.
 pub async fn status(store: &dyn BridgeStore) -> Result<Status> {
+    let mut outbox_depth = 0;
+    for (key, _) in store.outbox_unposted().await? {
+        if !store
+            .xref_has(&format!("{}{key}", crate::pump::FAILED_PREFIX))
+            .await?
+        {
+            outbox_depth += 1;
+        }
+    }
     Ok(Status {
         browse_version: be8(store.cursor(CURSOR_BROWSE).await?).unwrap_or(0),
         foreign_cursor_secs: be8(store.cursor(CURSOR_FOREIGN).await?),
-        outbox_depth: store.outbox_unposted().await?.len(),
+        outbox_depth,
+        oversize_failed: be8(store.cursor(crate::pump::OVERSIZE_FAILED).await?).unwrap_or(0),
         last_relayed_secs: be8(store.cursor(LAST_RELAYED).await?),
         halted: crate::halt::read(store).await?,
         fork: crate::geb::forkmark::read(store).await?,

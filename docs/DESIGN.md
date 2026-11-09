@@ -151,13 +151,13 @@ trait ForeignRoom {
     fn identity(&self) -> ForeignIdentity;
     fn capabilities(&self) -> RoomCapabilities;
 }
-// RoomCapabilities { max_message_bytes, supports_edit, supports_delete,
+// RoomCapabilities { max_message_units, supports_edit, supports_delete,
 //                    supports_replies, authors_verifiable }
 ```
 
 Behaviour that varies by room is chosen from `RoomCapabilities`, never from an adapter's name.
 Example: `prepare_outbound` turns a retraction into a notice line when `supports_delete` is false,
-and cuts the text to `max_message_bytes`. The `Cursor` is opaque bytes that only the adapter can
+and cuts the text to `max_message_units`. The `Cursor` is opaque bytes that only the adapter can
 read; the core stores and returns it.
 
 `loopback::Loopback` is the second adapter. It supports everything and delivers instantly, and
@@ -198,9 +198,10 @@ Geb line   ---> poll (verify sg) ---> foreign_to_record ---> create-only put (ba
   members cannot verify the VTC author. The text is `> <author> wrote:\n<title>\n\n<body>`, with
   the author label stripped of control characters and cut to 200 characters, control characters
   other than newline and tab removed from the body, and the whole text cut to
-  `max_message_bytes` (20,000 bytes for Geb, which never exceeds Geb's 20,000 UTF-16 unit limit,
-  at the cost of cutting multi-byte text early; `post` itself counts units and refuses over the
-  limit).
+  `max_message_units`: UTF-16 code units (JavaScript string length; an emoji counts 2), 20,000
+  for Geb. `mapping::truncate_utf16` cuts at a char boundary, never over the limit, and ends with a
+  `[truncated]` marker inside it (earlier versions counted bytes and so cut multi-byte text at
+  half the limit or less). `post` counts units too and refuses over the limit.
 - **Re-signing is inherent.** Geb verifies lines against a Geb device DID key and cannot check our
   credentials or persona signature. The VTA's signing oracle is domain-separated and will not
   emit a signature Geb accepts. So the bridge is always the signer on the Geb side, and the quoted
@@ -388,7 +389,7 @@ the first read starts at the 7-day retention floor, never unbounded.
 |---|---|---|
 | Identity, dyad, VRC v2, mailbox envelopes, ratchet | Built; vectors bind the primitives; the whole flow only against our own test relay | Interop with a live Geb is unproven |
 | MLS seating, lines, settle rule, 0.5.15 commit rules | Built behind `geb-mls`; tested only against an in-process second OpenMLS client | Wire compatibility with Geb's OpenMLS 0.8.2 is inferred, not shown |
-| Healer duty (electing, committing a re-seat or Remove) | Not built, deliberately: the bridge follows | A fork the bridge wins needs a Geb member to heal the loser; the bridge only marks the loser "asked". The recorded split is in the sealed MLS snapshot, not shown by `status` |
+| Healer duty (electing, committing a re-seat or Remove) | Not built, deliberately: the bridge follows | A fork the bridge wins needs a Geb member to heal the loser; the bridge only marks the loser "asked". The recorded split is in the sealed MLS snapshot; `status` shows its non-secret fork marker (section 8) |
 | `rs`, `rc`, `seat-ask`, re-seat Welcome, dead-branch re-post | Built (round 2 sections 5 and 8, round 4 Q8-Q10): proper `rs` body, `compareStatus` and `forkMineWins`, `rc` both ways, `seat-ask` (no `kp` when behind, bound `kp` otherwise), group replacement from a re-seat Welcome, own-line re-post | Several details are UNVERIFIED (CLAUDE.md "Room status, catch-up and re-seat"): the exact `compareStatus`, the chain before our join (empty), authenticator truncation, the `fk` shape. Tested only against the in-process second client, never a Geb node. Commit bytes for `rc` are memory-only |
 | Signed leave, receiving (`{t:"lv", at, ls}`, dyad `leave`) | Built (`geb/leave.rs`) | Feeds `validCommit` rule (2) |
 | Signed leave, sending; healer duty; Remove commits | Not built; `leave` fails closed | The bridge cannot leave a room cleanly; the leaf stays until someone removes it. Also, a refused direct-room Welcome leaves the adder's leaf in that room |
@@ -567,8 +568,10 @@ unless something changed. Both commands open the link's store, so `run` must be 
 - A restart loses the settle queue (re-read from the relay; the cursor barrier holds the position)
   and the dedup window (the journal covers it).
 - After a real fork the bridge asks and waits: a Geb member must commit the re-seat (healer duty is not built). A re-seat Welcome is accepted; if it never comes the bridge asks again with a fresh bound package every 600 s.
-- An oversize outbox entry cannot come out of the mapping layer (it cuts at 20,000 bytes), but if
-  one existed it would be retried every tick rather than dropped.
+- An oversize outbox entry cannot come out of the mapping layer (it cuts at the room's unit limit),
+  but one journalled under another limit could exist. It is a permanent failure: journalled
+  (xref `failed:<outbox key>` with the reason), counted (`status` shows `oversize_failed`), logged
+  once, never retried and no longer counted in `outbox_depth`; the entries behind it still go out.
 
 **Supervision.** `run::supervise` observes the stop signal at every wait, lets a tick in flight
 finish, closes on every exit path, doubles the backoff to a cap with jitter and resets it only after

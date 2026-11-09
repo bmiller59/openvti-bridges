@@ -31,6 +31,43 @@ pub fn strip_controls(s: &str) -> String {
         .collect()
 }
 
+/// Length of `s` in UTF-16 code units (a JavaScript string's `length`): a
+/// character outside the BMP counts 2.
+pub fn utf16_units(s: &str) -> usize {
+    s.chars().map(char::len_utf16).sum()
+}
+
+/// Cut `s` to at most `max` UTF-16 code units, on a char boundary (a surrogate
+/// pair is never split), marking the cut inside the limit. Returns `s`
+/// unchanged when it already fits. The result is never longer than `max` units:
+/// when `max` is shorter than the marker the text is cut without one.
+pub fn truncate_utf16(s: &str, max: usize) -> String {
+    if utf16_units(s) <= max {
+        return s.to_string();
+    }
+    let mark = utf16_units(TRUNCATION_MARK);
+    let (budget, with_mark) = if max >= mark {
+        (max - mark, true)
+    } else {
+        (max, false)
+    };
+    let mut units = 0;
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        let n = c.len_utf16();
+        if units + n > budget {
+            break;
+        }
+        units += n;
+        end = i + c.len_utf8();
+    }
+    let mut out = s[..end].to_string();
+    if with_mark {
+        out.push_str(TRUNCATION_MARK);
+    }
+    out
+}
+
 /// Cut `s` to at most `max` bytes on a char boundary, marking the cut inside
 /// the limit. Returns `s` unchanged when it already fits.
 pub fn truncate_bytes(s: &str, max: usize) -> String {
@@ -207,9 +244,9 @@ pub fn prepare_outbound(
         body.push_str("\n\n");
     }
     body.push_str(&strip_controls(&ev.text));
-    let text = truncate_bytes(
+    let text = truncate_utf16(
         &format!("> {author} wrote:\n{body}"),
-        caps.max_message_bytes,
+        caps.max_message_units,
     );
     BridgeEvent {
         title: None,
@@ -319,7 +356,7 @@ mod tests {
 
     fn caps(edit: bool, del: bool, max: usize) -> RoomCapabilities {
         RoomCapabilities {
-            max_message_bytes: max,
+            max_message_units: max,
             supports_edit: edit,
             supports_delete: del,
             supports_replies: false,
@@ -446,15 +483,22 @@ mod tests {
     }
 
     #[test]
-    fn truncation_respects_bytes_and_chars() {
+    fn truncation_counts_utf16_units_not_bytes() {
+        // Two-byte text: 20,000 units is far more than 20,000 bytes of room;
+        // the old byte cap cut it at 10,000 characters.
         let big = "é".repeat(30_000);
         let e = record_to_event(&rec("did:a", &big, 1), "l", "p", |_| false, None).unwrap();
         let out = prepare_outbound(&e, &caps(false, false, 20_000), &Notices::default(), |_| {
             None
         });
-        assert!(out.text.len() <= 20_000);
-        assert!(out.text.chars().count() <= 20_000);
+        assert!(utf16_units(&out.text) <= 20_000);
+        assert!(
+            utf16_units(&out.text) > 19_980,
+            "uses the limit, not half of it: {}",
+            utf16_units(&out.text)
+        );
         assert!(out.text.ends_with("[truncated]"));
+        assert!(out.text.len() > 20_000, "bytes are not the measure");
         let small = prepare_outbound(
             &record_to_event(&rec("a", "x", 1), "l", "p", |_| false, None).unwrap(),
             &caps(false, false, 20_000),
@@ -462,6 +506,50 @@ mod tests {
             |_| None,
         );
         assert!(!small.text.contains("truncated"));
+    }
+
+    #[test]
+    fn utf16_truncation_is_exact_at_boundaries_and_never_splits_a_pair() {
+        // ASCII: exactly at the limit is kept whole, one over is cut.
+        assert_eq!(truncate_utf16("abcd", 4), "abcd");
+        let cut = truncate_utf16(&"a".repeat(100), 50);
+        assert_eq!(utf16_units(&cut), 50, "fills the limit exactly");
+        assert!(cut.ends_with("[truncated]"));
+        // Emoji are 2 units (4 bytes) each; a pair is never split.
+        assert_eq!(utf16_units("\u{1F600}"), 2);
+        for max in [12usize, 13, 14, 15, 99, 100, 101] {
+            let s = "\u{1F600}".repeat(200);
+            let out = truncate_utf16(&s, max);
+            assert!(utf16_units(&out) <= max, "max {max}: {}", utf16_units(&out));
+            assert!(
+                utf16_units(&out) + 1 >= max,
+                "max {max} wastes more than a unit"
+            );
+            assert!(out.is_char_boundary(out.len()));
+            assert!(out.ends_with("[truncated]"));
+        }
+        // Mixed: 3-byte CJK (1 unit) and emoji (2 units) never exceed.
+        let mixed = "日\u{1F680}本".repeat(10_000);
+        let out = truncate_utf16(&mixed, 20_000);
+        assert!(utf16_units(&out) <= 20_000 && utf16_units(&out) >= 19_998);
+        // A limit shorter than the marker: cut, no marker, still within.
+        let tiny = truncate_utf16("\u{1F600}\u{1F600}\u{1F600}", 5);
+        assert_eq!(tiny, "\u{1F600}\u{1F600}");
+        assert_eq!(truncate_utf16("abc", 0), "");
+        // Fits: untouched, no marker.
+        assert_eq!(truncate_utf16("\u{1F600}", 2), "\u{1F600}");
+    }
+
+    #[test]
+    fn an_emoji_line_goes_out_under_the_limit_through_prepare_outbound() {
+        let body = "\u{1F600}".repeat(15_000); // 30,000 units, 60,000 bytes
+        let e = record_to_event(&rec("did:a", &body, 1), "l", "p", |_| false, None).unwrap();
+        let out = prepare_outbound(&e, &caps(false, false, 20_000), &Notices::default(), |_| {
+            None
+        });
+        assert!(utf16_units(&out.text) <= 20_000);
+        assert!(utf16_units(&out.text) >= 19_999);
+        assert!(out.text.starts_with("> did:a wrote:\n"));
     }
 
     #[test]

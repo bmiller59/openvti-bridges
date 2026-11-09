@@ -41,6 +41,13 @@ pub const CURSOR_BROWSE: &str = BROWSE_CURSOR;
 pub const CURSOR_FOREIGN: &str = FOREIGN_CURSOR;
 /// Halt record name, for `status`.
 pub const CURSOR_HALT: &str = HALT;
+/// Count (big-endian u64) of outbox entries given up on for good because they
+/// could not be made to fit the foreign room's size limit; `status` shows it.
+pub const OVERSIZE_FAILED: &str = "oversize_failed";
+/// Prefix of the xref entry that journals such a permanent failure, keyed by
+/// the outbox key; its value is the reason. An entry with one is never posted
+/// again and no longer counts as pending.
+pub const FAILED_PREFIX: &str = "failed:";
 
 /// What a link needs at run time.
 #[derive(Debug, Clone)]
@@ -96,6 +103,19 @@ pub struct TickReport {
     pub written: usize,
     /// Events skipped (echo, deny-list, already bridged, already journalled).
     pub skipped: usize,
+    /// Outbound entries given up on for good this tick (over the room's size
+    /// limit and not postable): journalled, never retried.
+    pub failed: usize,
+}
+
+/// What became of one outbox entry.
+enum Step {
+    /// Posted.
+    Posted,
+    /// The kill switch is on: nothing was done; stop the tick.
+    Paused,
+    /// Permanently failed (journalled): carry on with the next one.
+    Failed,
 }
 
 /// One link's pump.
@@ -283,17 +303,61 @@ impl Pump {
         Ok(())
     }
 
-    /// Post one journalled event. `false` when the kill switch is on: nothing
-    /// is posted and nothing is marked, so the entry stays unposted in the
-    /// outbox and the next tick after a resume posts it exactly once.
+    /// Give up on an outbox entry for good: journal why (xref `failed:<key>`),
+    /// count it for `status` and log it. The entry is never posted again and
+    /// is not retried every tick; the browse cursor is already past it.
+    async fn fail_permanently(&self, key: &str, why: &str, r: &mut TickReport) -> Result<()> {
+        self.store
+            .xref_set(&format!("{FAILED_PREFIX}{key}"), why)
+            .await?;
+        let n = self
+            .store
+            .cursor(OVERSIZE_FAILED)
+            .await?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+        self.store
+            .set_cursor(OVERSIZE_FAILED, &(n + 1).to_be_bytes())
+            .await?;
+        tracing::error!(link = %self.link.id, entry = %key, reason = %why,
+            "an outbound entry cannot be made to fit the foreign room; given up on, not retried");
+        r.failed += 1;
+        Ok(())
+    }
+
+    /// Post one journalled event. [`Step::Paused`] when the kill switch is on:
+    /// nothing is posted and nothing is marked, so the entry stays unposted in
+    /// the outbox and the next tick after a resume posts it exactly once. An
+    /// entry over the room's size limit (it should have come out of the
+    /// mapping layer smaller; an entry journalled under another limit may not)
+    /// is a permanent, journalled failure rather than a retry every tick.
     async fn post_one(
         &self,
         key: &str,
         ev: &crate::model::BridgeEvent,
         r: &mut TickReport,
-    ) -> Result<bool> {
+    ) -> Result<Step> {
         if self.is_paused() {
-            return Ok(false);
+            return Ok(Step::Paused);
+        }
+        if self
+            .store
+            .xref_has(&format!("{FAILED_PREFIX}{key}"))
+            .await?
+        {
+            return Ok(Step::Failed);
+        }
+        let limit = self.foreign.capabilities().max_message_units;
+        let units = crate::mapping::utf16_units(&ev.text);
+        if units > limit {
+            self.fail_permanently(
+                key,
+                &format!("oversize: {units} UTF-16 code units, the room's limit is {limit}"),
+                r,
+            )
+            .await?;
+            return Ok(Step::Failed);
         }
         let posted = self.foreign.post(ev).await?;
         // Keep the foreign id of the line: a later retraction answers it.
@@ -325,13 +389,13 @@ impl Pump {
                 .await?;
         }
         r.posted += 1;
-        Ok(true)
+        Ok(Step::Posted)
     }
 
     async fn push_foreign(&self, report: &mut TickReport) -> Result<()> {
         // Resume anything journalled but never posted.
         for (key, ev) in self.store.outbox_unposted().await? {
-            if !self.post_one(&key, &ev, report).await? {
+            if matches!(self.post_one(&key, &ev, report).await?, Step::Paused) {
                 return Ok(());
             }
         }
@@ -398,7 +462,7 @@ impl Pump {
                         .await?;
                     // Paused between the journal and the post: the entry is
                     // unposted in the outbox and goes out first after a resume.
-                    if !self.post_one(&key, &prepared, report).await? {
+                    if matches!(self.post_one(&key, &prepared, report).await?, Step::Paused) {
                         return Ok(());
                     }
                 }
@@ -1136,5 +1200,91 @@ mod tests {
         sw.set(false);
         assert_eq!(pump.start().await.unwrap(), JoinState::Seated);
         assert_eq!(pump.tick().await.unwrap().posted, 1);
+    }
+
+    // ---- an entry that cannot fit is a permanent, journalled failure ----
+
+    /// A room that caps a line far below what the outbox holds: a stand-in for
+    /// an entry journalled under a bigger limit than today's.
+    struct SmallRoom(Arc<Loopback>, usize);
+    #[async_trait::async_trait]
+    impl ForeignRoom for SmallRoom {
+        async fn join(&self) -> Result<JoinState> {
+            self.0.join().await
+        }
+        async fn leave(&self) -> Result<()> {
+            self.0.leave().await
+        }
+        async fn poll(&self, a: Option<&Cursor>) -> Result<Vec<crate::foreign::Polled>> {
+            self.0.poll(a).await
+        }
+        async fn post(&self, e: &BridgeEvent) -> Result<crate::foreign::Posted> {
+            self.0.post(e).await
+        }
+        fn identity(&self) -> crate::foreign::ForeignIdentity {
+            self.0.identity()
+        }
+        fn capabilities(&self) -> crate::foreign::RoomCapabilities {
+            crate::foreign::RoomCapabilities {
+                max_message_units: self.1,
+                ..self.0.capabilities()
+            }
+        }
+    }
+
+    fn event_of(text: &str) -> BridgeEvent {
+        BridgeEvent {
+            origin: Origin::Vtc,
+            origin_id: "big|1".into(),
+            link: "l1".into(),
+            author: "did:alice".into(),
+            at: 1,
+            title: None,
+            text: text.into(),
+            kind: EventKind::Post,
+            reply_to: None,
+            record_key: None,
+            provenance: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversize_outbox_entry_fails_once_for_good_and_is_not_retried() {
+        let (room, lb, store) = parts();
+        // The room takes 100 units; the outbox holds a 500-unit entry and a
+        // fitting one behind it.
+        let small = Arc::new(SmallRoom(lb.clone(), 100));
+        let pump = Pump::new(link(), room.clone(), small, store.clone());
+        pump.start().await.unwrap();
+        store
+            .outbox_insert("l1|big|1", &event_of(&"x".repeat(500)))
+            .await
+            .unwrap();
+        let mut ok = event_of("fits");
+        ok.origin_id = "ok|1".into();
+        store.outbox_insert("l1|ok|1", &ok).await.unwrap();
+
+        let r = pump.tick().await.unwrap();
+        assert_eq!(
+            (r.failed, r.posted),
+            (1, 1),
+            "the next entry still goes out"
+        );
+        assert_eq!(lb.posted().len(), 1);
+        assert!(lb.posted()[0].text.contains("fits"));
+        let why = store.xref_get("failed:l1|big|1").await.unwrap().unwrap();
+        assert!(why.contains("500") && why.contains("100"), "{why}");
+        let count = |s: Option<Vec<u8>>| u64::from_be_bytes(s.unwrap().try_into().unwrap());
+        assert_eq!(count(store.cursor(OVERSIZE_FAILED).await.unwrap()), 1);
+
+        // Many ticks later: no second failure, no post, no growth of the counter.
+        for _ in 0..5 {
+            let r = pump.tick().await.unwrap();
+            assert_eq!((r.failed, r.posted), (0, 0));
+        }
+        assert_eq!(count(store.cursor(OVERSIZE_FAILED).await.unwrap()), 1);
+        assert_eq!(lb.posted().len(), 1);
+        // And it is not bridged: nothing claims it was.
+        assert!(!store.xref_has("vtc:big|1").await.unwrap());
     }
 }
