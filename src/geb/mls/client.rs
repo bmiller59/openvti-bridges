@@ -20,6 +20,7 @@ use base64::engine::general_purpose::STANDARD;
 use openmls::prelude::*;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
+use openmls_traits::storage::{CURRENT_VERSION, StorageProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -29,10 +30,39 @@ use tls_codec::Serialize as _;
 pub const LABEL_NOSTR: &str = "geb/room/v2/nostr";
 /// Exporter label for the room's AEAD key.
 pub const LABEL_AEAD: &str = "geb/room/v2/aead";
-/// Most KeyPackages in one `kp-stock`.
+/// Most KeyPackages in one `kp-stock` (receivers keep at most 16).
 pub const MAX_STOCK: usize = 16;
-/// Default size of a stock.
-pub const DEFAULT_STOCK: usize = 8;
+/// Default size of a stock: Geb sends six per stock (round 3 section 5,
+/// `STOCK_N`).
+pub const DEFAULT_STOCK: usize = 6;
+/// A contact is re-stocked when our last stock to them is older than this
+/// (Geb's `STOCK_STALE_MS`, 7 days).
+pub const STOCK_STALE_MS: u64 = 7 * 24 * 3600 * 1000;
+/// Single packages (a `kp` answer, a seat-ask package) keep their private
+/// keys this long.
+pub const SINGLE_KEEP_MS: u64 = 7 * 24 * 3600 * 1000;
+/// A stock minted this recently is always kept, whatever its generation.
+pub const RECENT_KEEP_MS: u64 = 3600 * 1000;
+/// Stock generations kept per contact (the newest two): a holder may still
+/// spend the previous one.
+pub const STOCK_GENS_KEPT: usize = 2;
+/// A `kp-low` is answered at most this often per contact. OUR CHOICE (not
+/// Geb's): a stock is six key pairs and a persisted snapshot, so a peer that
+/// repeats `kp-low` cannot make us mint and persist without bound.
+pub const KP_LOW_MIN_INTERVAL_MS: u64 = 60_000;
+/// While seated the dyads are read for `kp-low` / `seat-check` at most this
+/// often (each read is a relay fetch per peer).
+pub const SERVICE_EVERY_MS: u64 = 30_000;
+
+/// Clock in milliseconds.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+fn system_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// What the client needs to know about its room.
 #[derive(Debug, Clone)]
@@ -70,11 +100,40 @@ pub trait GroupStateStore: Send + Sync {
     fn save(&self, snapshot: &[u8]) -> Result<()>;
 }
 
+/// KeyPackages minted together for one contact. `refs` are the KeyPackage hash
+/// references under which OpenMLS keeps the private halves, so pruning can
+/// delete them.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct Batch {
+    /// The stock generation, `0` for a single package.
+    generation: u64,
+    at_ms: u64,
+    refs: Vec<Vec<u8>>,
+}
+
+/// What we know of the packages we gave one contact (a device DID).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct Contact {
+    /// The last stock generation of ours SENT to them (`gen` counts the stocks
+    /// we have sent to this one contact, never packages, never global).
+    last_gen: u64,
+    last_sent_ms: u64,
+    /// When we last answered a `kp-low` from them.
+    last_low_ms: u64,
+    stocks: Vec<Batch>,
+    singles: Vec<Batch>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     v: u32,
+    /// Legacy (one global stock flag); read only to migrate.
+    #[serde(default)]
     stocked: bool,
+    #[serde(default)]
     stock_gen: u64,
+    #[serde(default)]
+    contacts: std::collections::BTreeMap<String, Contact>,
     /// Set once a merged commit removed us; the link is over.
     removed: Option<String>,
     /// OpenMLS storage entries, base64.
@@ -95,8 +154,8 @@ struct Inner {
     state: State,
     queue: SettleQueue,
     judged: HashMap<CommitHash, Verdict>,
-    stock_gen: u64,
-    stocked: bool,
+    contacts: std::collections::BTreeMap<String, Contact>,
+    last_service_ms: u64,
 }
 
 /// The Geb-side MLS client.
@@ -107,6 +166,7 @@ pub struct MlsGroupClient {
     inputs: Arc<dyn CommitCheckInputs>,
     inner: Mutex<Inner>,
     persist: Option<Arc<dyn GroupStateStore>>,
+    clock: Clock,
 }
 
 fn mls<E: std::fmt::Debug>(what: &str, e: E) -> Error {
@@ -144,11 +204,19 @@ impl MlsGroupClient {
                 state: State::Unseated,
                 queue: SettleQueue::new(),
                 judged: HashMap::new(),
-                stock_gen: 0,
-                stocked: false,
+                contacts: Default::default(),
+                last_service_ms: 0,
             }),
             persist: None,
+            clock: Arc::new(system_now_ms),
         })
+    }
+
+    /// Use `clock` (milliseconds) for KeyPackage lifetimes, stock ages and
+    /// pruning. Tests only; the default is the system clock.
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Keep the group state in `store` and resume from it: when a snapshot
@@ -192,8 +260,23 @@ impl MlsGroupClient {
                     values.insert(dec(k)?, dec(v)?);
                 }
             }
-            g.stocked = snap.stocked;
-            g.stock_gen = snap.stock_gen;
+            g.contacts = snap.contacts;
+            if g.contacts.is_empty() && snap.stocked && snap.stock_gen > 0 {
+                // A snapshot from before stock state was per contact: one
+                // stock of this generation went to every peer. Their keys are
+                // not tracked, so they are never pruned.
+                let now = (self.clock)();
+                for peer in &self.cfg.peers {
+                    g.contacts.insert(
+                        peer.clone(),
+                        Contact {
+                            last_gen: snap.stock_gen,
+                            last_sent_ms: now,
+                            ..Contact::default()
+                        },
+                    );
+                }
+            }
             g.state = match snap.removed {
                 Some(why) => State::Removed(why),
                 None => match MlsGroup::load(
@@ -232,8 +315,9 @@ impl MlsGroupClient {
             .collect();
         let snap = Snapshot {
             v: SNAPSHOT_V,
-            stocked: g.stocked,
-            stock_gen: g.stock_gen,
+            stocked: false,
+            stock_gen: 0,
+            contacts: g.contacts.clone(),
             removed,
             values,
         };
@@ -305,16 +389,290 @@ impl MlsGroupClient {
         self.lock().map(|g| g.queue.len()).unwrap_or(0)
     }
 
-    fn make_kp(&self, g: &Inner) -> Result<Vec<u8>> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+    /// Whether OpenMLS still holds the private halves of the KeyPackage `b64`.
+    #[cfg(test)]
+    pub(crate) fn holds_key_package(&self, b64: &str) -> bool {
+        let g = self.lock().unwrap();
+        let raw = STANDARD.decode(b64).unwrap();
+        let r =
+            openmls::ciphersuite::hash_ref::make_key_package_ref(&raw, SUITE, g.provider.crypto())
+                .unwrap();
+        StorageProvider::<CURRENT_VERSION>::key_package::<KeyPackageRef, KeyPackageBundle>(
+            g.provider.storage(),
+            &r,
+        )
+        .unwrap()
+        .is_some()
+    }
+
+    /// Mint one outgoing KeyPackage (always bound, always with a lifetime valid
+    /// now): its standard base64 and the hash reference its private halves are
+    /// stored under.
+    fn make_kp(&self, g: &Inner, now_ms: u64) -> Result<(String, Vec<u8>)> {
         let kp = g
             .ident
-            .key_package(&g.provider, self.device.as_ref(), now_secs)?;
-        kp.tls_serialize_detached()
-            .map_err(|e| mls("serialise key package", e))
+            .key_package(&g.provider, self.device.as_ref(), now_ms / 1000)?;
+        let hash_ref = kp
+            .hash_ref(g.provider.crypto())
+            .map_err(|e| mls("key package reference", e))?;
+        let raw = kp
+            .tls_serialize_detached()
+            .map_err(|e| mls("serialise key package", e))?;
+        let b64 = STANDARD.encode(raw);
+        if b64.len() > crate::geb::wire::MAX_STOCK_KP_CHARS {
+            return Err(Error::Crypto("a KeyPackage over 65,536 characters".into()));
+        }
+        // TLS-encoded, so pruning can rebuild the reference.
+        let hash_ref = hash_ref
+            .tls_serialize_detached()
+            .map_err(|e| mls("serialise key package reference", e))?;
+        Ok((b64, hash_ref))
+    }
+
+    /// Mint a stock of `gen` for `peer` and remember its keys. The send is the
+    /// caller's; `last_gen` moves only when it succeeds.
+    fn mint_stock(&self, g: &mut Inner, peer: &str, generation: u64, now_ms: u64) -> Result<Frame> {
+        let mut kps = Vec::new();
+        let mut refs = Vec::new();
+        for _ in 0..self.cfg.stock_size {
+            let (b64, r) = self.make_kp(g, now_ms)?;
+            kps.push(b64);
+            refs.push(r);
+        }
+        g.contacts
+            .entry(peer.to_string())
+            .or_default()
+            .stocks
+            .push(Batch {
+                generation,
+                at_ms: now_ms,
+                refs,
+            });
+        Ok(Frame::Group(GroupOp::KpStock { generation, kps }))
+    }
+
+    /// Delete the private halves of everything past its keep rule: per
+    /// contact the newest TWO stock generations (the newest batch of each) plus
+    /// any batch … for 7 days.
+    /// Returns whether anything was removed.
+    fn prune(&self, g: &mut Inner, now_ms: u64) -> bool {
+        let Inner {
+            provider, contacts, ..
+        } = g;
+        let mut changed = false;
+        for c in contacts.values_mut() {
+            let mut gens: Vec<u64> = c.stocks.iter().map(|b| b.generation).collect();
+            gens.sort_unstable_by(|a, b| b.cmp(a));
+            gens.dedup();
+            gens.truncate(STOCK_GENS_KEPT);
+            let newest_at: std::collections::HashMap<u64, u64> =
+                gens.iter().fold(Default::default(), |mut m, g_| {
+                    let at = c
+                        .stocks
+                        .iter()
+                        .filter(|b| b.generation == *g_)
+                        .map(|b| b.at_ms)
+                        .max()
+                        .unwrap_or(0);
+                    m.insert(*g_, at);
+                    m
+                });
+            let recent = |b: &Batch| b.at_ms.saturating_add(RECENT_KEEP_MS) > now_ms;
+            let keep_stock = |b: &Batch| {
+                recent(b)
+                    || newest_at
+                        .get(&b.generation)
+                        .is_some_and(|at| *at == b.at_ms)
+            };
+            let keep_single = |b: &Batch| b.at_ms.saturating_add(SINGLE_KEEP_MS) > now_ms;
+            for (list, keep) in [
+                (&mut c.stocks, &keep_stock as &dyn Fn(&Batch) -> bool),
+                (&mut c.singles, &keep_single as &dyn Fn(&Batch) -> bool),
+            ] {
+                list.retain(|b| {
+                    if keep(b) {
+                        return true;
+                    }
+                    for r in &b.refs {
+                        let Ok(r) =
+                            <KeyPackageRef as tls_codec::Deserialize>::tls_deserialize_exact(r)
+                        else {
+                            tracing::warn!("a stored KeyPackage reference is unreadable; skipped");
+                            continue;
+                        };
+                        if let Err(e) = StorageProvider::<CURRENT_VERSION>::delete_key_package(
+                            provider.storage(),
+                            &r,
+                        ) {
+                            tracing::warn!(error = ?e, "could not delete a pruned KeyPackage");
+                        }
+                    }
+                    changed = true;
+                    false
+                });
+            }
+        }
+        changed
+    }
+
+    /// Stock `peer` again at `generation`: mint (persisted before the frame
+    /// leaves, so a Welcome after a restart can be opened), send, and only then
+    /// record the generation as sent.
+    async fn send_stock(&self, peer: &str, generation: u64) -> bool {
+        let now = (self.clock)();
+        let frame = {
+            let Ok(mut g) = self.lock() else { return false };
+            let frame = match self.mint_stock(&mut g, peer, generation, now) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not mint a stock");
+                    return false;
+                }
+            };
+            if let Err(e) = self.persist_state(&g) {
+                tracing::warn!(error = %e, "could not persist a new stock; not sending it");
+                return false;
+            }
+            frame
+        };
+        match self.dyad.send(peer, &frame).await {
+            Ok(()) => {
+                if let Ok(mut g) = self.lock() {
+                    let c = g.contacts.entry(peer.to_string()).or_default();
+                    c.last_gen = c.last_gen.max(generation);
+                    c.last_sent_ms = now;
+                    self.prune(&mut g, now);
+                    if let Err(e) = self.persist_state(&g) {
+                        tracing::warn!(error = %e, "could not persist the sent stock");
+                    }
+                }
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not send kp-stock");
+                false
+            }
+        }
+    }
+
+    /// Answer `kp-low {gen, n}` with a new stock at
+    /// `max(our last gen sent to them, their gen) + 1`.
+    async fn answer_kp_low(&self, peer: &str, their_gen: u64) {
+        let now = (self.clock)();
+        let generation = {
+            let Ok(mut g) = self.lock() else { return };
+            let c = g.contacts.entry(peer.to_string()).or_default();
+            if c.last_low_ms != 0 && now < c.last_low_ms.saturating_add(KP_LOW_MIN_INTERVAL_MS) {
+                tracing::debug!("kp-low repeated too soon; not re-stocking again");
+                return;
+            }
+            c.last_low_ms = now;
+            c.last_gen.max(their_gen) + 1
+        };
+        self.send_stock(peer, generation).await;
+    }
+
+    /// Answer `kp-req` with one KeyPackage, whose keys are kept for 7 days.
+    async fn answer_kp_req(&self, peer: &str) {
+        let now = (self.clock)();
+        let kp = {
+            let Ok(mut g) = self.lock() else { return };
+            let (kp, r) = match self.make_kp(&g, now) {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not mint a KeyPackage");
+                    return;
+                }
+            };
+            g.contacts
+                .entry(peer.to_string())
+                .or_default()
+                .singles
+                .push(Batch {
+                    generation: 0,
+                    at_ms: now,
+                    refs: vec![r],
+                });
+            self.prune(&mut g, now);
+            if let Err(e) = self.persist_state(&g) {
+                tracing::warn!(error = %e, "could not persist a KeyPackage; not sending it");
+                return;
+            }
+            kp
+        };
+        let reply = Frame::Group(GroupOp::Kp {
+            room: RoomRef {
+                id: self.cfg.room_id.clone(),
+                name: None,
+            },
+            kp,
+        });
+        if let Err(e) = self.dyad.send(peer, &reply).await {
+            tracing::warn!(error = %e, "could not answer kp-req");
+        }
+    }
+
+    /// Answer `seat-check {room, e}`: with `rs` when we hold the room.
+    // UNVERIFIED: the `rs` we send is the minimal `{k:"g", op:"rs", room:{id}}`.
+    // Geb's `cleanStatus` (round 2 section 5) requires a status body
+    // `s:{e, a, chain, ...}` that we do not build (P1), so Geb most likely
+    // reads it as malformed and ignores it: it does NOT satisfy a seat-check.
+    // Nothing worse follows (round 3 section 3: silence never commits). When
+    // we do not hold the room Geb expects a `seat-ask` carrying a fresh
+    // package, which is not built either, so we send nothing.
+    async fn answer_seat_check(&self, peer: &str, room: &RoomRef) {
+        if room.id != self.cfg.room_id {
+            return;
+        }
+        let seated = self
+            .lock()
+            .map(|g| matches!(g.state, State::Seated(_)))
+            .unwrap_or(false);
+        if !seated {
+            tracing::debug!("seat-check while not seated; seat-ask is not built, no answer");
+            return;
+        }
+        self.send_rs_to(peer).await;
+    }
+
+    /// While seated: read each peer's dyad for `kp-low` and `seat-check`
+    /// (at most every [`SERVICE_EVERY_MS`]); everything else is dropped.
+    async fn service_dyads(&self, now_ms: u64) {
+        {
+            let Ok(mut g) = self.lock() else { return };
+            if g.last_service_ms != 0 && now_ms < g.last_service_ms.saturating_add(SERVICE_EVERY_MS)
+            {
+                return;
+            }
+            g.last_service_ms = now_ms;
+        }
+        for peer in &self.cfg.peers {
+            let frames = match self.dyad.recv(peer).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::debug!(error = %e, "dyad read failed while seated");
+                    continue;
+                }
+            };
+            for frame in frames {
+                match frame {
+                    Frame::Group(GroupOp::KpLow { generation, .. }) => {
+                        self.answer_kp_low(peer, generation).await;
+                    }
+                    Frame::Group(GroupOp::SeatCheck { room, .. }) => {
+                        self.answer_seat_check(peer, &room).await;
+                    }
+                    other => tracing::debug!(?other, "ignoring a dyad frame while seated"),
+                }
+            }
+        }
+        let now = (self.clock)();
+        if let Ok(mut g) = self.lock()
+            && self.prune(&mut g, now)
+            && let Err(e) = self.persist_state(&g)
+        {
+            tracing::warn!(error = %e, "could not persist after pruning");
+        }
     }
 
     /// Validate a Welcome frame the way answer 8 says and join from it.
@@ -384,17 +742,24 @@ impl MlsGroupClient {
         Ok(RelayKeys::from_parts(x(LABEL_NOSTR)?, x(LABEL_AEAD)?))
     }
 
-    async fn send_rs(&self) {
-        let frame = Frame::Group(GroupOp::Rs {
+    fn rs_frame(&self) -> Frame {
+        Frame::Group(GroupOp::Rs {
             room: Some(RoomRef {
                 id: self.cfg.room_id.clone(),
                 name: None,
             }),
-        });
+        })
+    }
+
+    async fn send_rs_to(&self, peer: &str) {
+        if let Err(e) = self.dyad.send(peer, &self.rs_frame()).await {
+            tracing::warn!(error = %e, "could not send the room status request");
+        }
+    }
+
+    async fn send_rs(&self) {
         for peer in &self.cfg.peers {
-            if let Err(e) = self.dyad.send(peer, &frame).await {
-                tracing::warn!(error = %e, "could not send the room status request");
-            }
+            self.send_rs_to(peer).await;
         }
     }
 }
@@ -402,43 +767,34 @@ impl MlsGroupClient {
 #[async_trait]
 impl GebGroup for MlsGroupClient {
     async fn ensure_seated(&self) -> Result<JoinState> {
-        // 1. Stock KeyPackages once (a stock counts as consent to be added).
-        let stock = {
-            let mut g = self.lock()?;
-            match &g.state {
+        // 1. Stock KeyPackages (a stock counts as consent to be added): a
+        // first stock for every contact never stocked, and a new generation
+        // for one whose last stock is older than 7 days (this idle wait for a
+        // Welcome is the natural place; a seated member is not re-stocked,
+        // see CLAUDE.md "Open items").
+        {
+            match &self.lock()?.state {
                 State::Removed(w) => return Err(Error::Refused(w.clone())),
                 State::Seated(_) => return Ok(JoinState::Seated),
                 State::Unseated => {}
             }
-            if g.stocked {
-                None
-            } else {
-                let mut kps = Vec::new();
-                for _ in 0..self.cfg.stock_size {
-                    kps.push(STANDARD.encode(self.make_kp(&g)?));
-                }
-                g.stock_gen += 1;
-                // The private halves exist now; keep them before the public
-                // halves leave, or a Welcome after a restart cannot be used.
-                self.persist_state(&g)?;
-                Some(Frame::Group(GroupOp::KpStock {
-                    generation: g.stock_gen,
-                    kps,
-                }))
-            }
-        };
-        if let Some(frame) = stock {
-            let mut sent = false;
-            for peer in &self.cfg.peers {
-                match self.dyad.send(peer, &frame).await {
-                    Ok(()) => sent = true,
-                    Err(e) => tracing::warn!(error = %e, "could not send kp-stock"),
-                }
-            }
-            if sent {
-                let mut g = self.lock()?;
-                g.stocked = true;
-                self.persist_state(&g)?;
+            let now = (self.clock)();
+            let due: Vec<(String, u64)> = {
+                let g = self.lock()?;
+                self.cfg
+                    .peers
+                    .iter()
+                    .filter_map(|p| {
+                        let c = g.contacts.get(p);
+                        let last = c.map_or(0, |c| c.last_gen);
+                        let at = c.map_or(0, |c| c.last_sent_ms);
+                        (last == 0 || now >= at.saturating_add(STOCK_STALE_MS))
+                            .then(|| (p.clone(), last + 1))
+                    })
+                    .collect()
+            };
+            for (peer, generation) in due {
+                self.send_stock(&peer, generation).await;
             }
         }
         // 2. Answer kp-req, accept a welcome.
@@ -453,22 +809,13 @@ impl GebGroup for MlsGroupClient {
             for frame in frames {
                 match frame {
                     Frame::Group(GroupOp::KpReq { room }) if room.id == self.cfg.room_id => {
-                        let kp = {
-                            let g = self.lock()?;
-                            let kp = STANDARD.encode(self.make_kp(&g)?);
-                            self.persist_state(&g)?;
-                            kp
-                        };
-                        let reply = Frame::Group(GroupOp::Kp {
-                            room: RoomRef {
-                                id: self.cfg.room_id.clone(),
-                                name: None,
-                            },
-                            kp,
-                        });
-                        if let Err(e) = self.dyad.send(peer, &reply).await {
-                            tracing::warn!(error = %e, "could not answer kp-req");
-                        }
+                        self.answer_kp_req(peer).await;
+                    }
+                    Frame::Group(GroupOp::KpLow { generation, .. }) => {
+                        self.answer_kp_low(peer, generation).await;
+                    }
+                    Frame::Group(GroupOp::SeatCheck { room, .. }) => {
+                        self.answer_seat_check(peer, &room).await;
                     }
                     Frame::Group(GroupOp::Welcome { room, w, .. }) => {
                         let mut g = self.lock()?;
@@ -582,6 +929,13 @@ impl GebGroup for MlsGroupClient {
     }
 
     async fn settle(&self, now_ms: u64) -> Result<SettleReport> {
+        let seated = self
+            .lock()
+            .map(|g| matches!(g.state, State::Seated(_)))
+            .unwrap_or(false);
+        if seated {
+            self.service_dyads(now_ms).await;
+        }
         let mut ask_status = false;
         let report = {
             let mut g = self.lock()?;

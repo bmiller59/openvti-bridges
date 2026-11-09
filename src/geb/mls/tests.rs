@@ -2,6 +2,7 @@
 //! client playing a Geb member (`sim.rs`). Self-consistency only: this is not
 //! evidence of byte-compatibility with real Geb.
 
+use super::client::KP_LOW_MIN_INTERVAL_MS;
 use super::sim::{Bus, MemDyad, Sim, mc, ml, post, welcome_frame};
 use super::*;
 use crate::Error;
@@ -1638,4 +1639,323 @@ async fn a_corrupt_snapshot_refuses_to_start() {
     .unwrap()
     .with_state_store(store);
     assert!(r.is_err());
+}
+
+// ---- stock handling (round 3 section 5 and 3) ------------------------------
+
+struct StockWorld {
+    client: Arc<MlsGroupClient>,
+    room: GebRoom,
+    bus: Arc<Bus>,
+    dyad: Arc<MemDyad>,
+    peer: String,
+    me: String,
+    dev: SigningKey,
+    clock: Arc<AtomicU64>,
+    store: Arc<MemState>,
+    vault: Arc<MemoryVault>,
+}
+
+const HOUR_MS: u64 = 3_600_000;
+const DAY_MS: u64 = 24 * HOUR_MS;
+
+impl StockWorld {
+    /// A client on a controllable clock that starts at the real time (its
+    /// KeyPackage lifetimes must be valid for the parsing helpers).
+    fn new() -> Self {
+        let bus = Bus::new();
+        let peer = Sim::new(1).did;
+        let dev = SigningKey::from_bytes(&[60u8; 32]);
+        let me = did_peer::encode(&dev.verifying_key().to_bytes(), &[60u8; 32], None).unwrap();
+        let clock = Arc::new(AtomicU64::new(now_secs() * 1000));
+        let dyad = MemDyad::new(&me, &bus);
+        let store = Arc::new(MemState::default());
+        let vault = Arc::new(MemoryVault::default());
+        let (client, room) = Self::boot(&dev, &me, &peer, &dyad, &clock, &store, &vault);
+        StockWorld {
+            client,
+            room,
+            bus,
+            dyad,
+            peer,
+            me,
+            dev,
+            clock,
+            store,
+            vault,
+        }
+    }
+
+    fn boot(
+        dev: &SigningKey,
+        me: &str,
+        peer: &str,
+        dyad: &Arc<MemDyad>,
+        clock: &Arc<AtomicU64>,
+        store: &Arc<MemState>,
+        vault: &Arc<MemoryVault>,
+    ) -> (Arc<MlsGroupClient>, GebRoom) {
+        let device: Arc<dyn GebSigner> = Arc::new(crate::geb::crypto::sign::LocalSigner::new(
+            me.to_string(),
+            dev.clone(),
+        ));
+        let c1 = clock.clone();
+        let client = Arc::new(
+            MlsGroupClient::new(
+                MlsConfig::new(ROOM, vec![peer.to_string()]),
+                device.clone(),
+                dyad.clone(),
+                Arc::new(NoLocalKnowledge),
+                vault.as_ref(),
+            )
+            .unwrap()
+            .with_clock(Arc::new(move || c1.load(Ordering::SeqCst)))
+            .with_state_store(store.clone())
+            .unwrap(),
+        );
+        let c2 = clock.clone();
+        let room = GebRoom::new(
+            ROOM.into(),
+            Arc::new(FakeRelay::new()),
+            client.clone(),
+            device,
+            Arc::new(GuideCodec),
+            Arc::new(move || c2.load(Ordering::SeqCst)),
+        );
+        (client, room)
+    }
+
+    fn advance(&self, ms: u64) {
+        self.clock.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    /// Frames we sent to the peer since the last call.
+    fn sent(&self) -> Vec<Frame> {
+        self.bus.take(&self.me, &self.peer)
+    }
+
+    fn deliver(&self, f: Frame) {
+        self.bus.put(&self.peer, &self.me, f);
+    }
+
+    fn stock(&self) -> (u64, Vec<String>) {
+        let mut stocks: Vec<_> = self
+            .sent()
+            .into_iter()
+            .filter_map(|f| match f {
+                Frame::Group(GroupOp::KpStock { generation, kps }) => Some((generation, kps)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stocks.len(), 1, "exactly one stock was sent");
+        stocks.remove(0)
+    }
+
+    fn kp_low(&self, generation: u64) {
+        self.deliver(Frame::Group(GroupOp::KpLow { generation, n: 1 }));
+    }
+}
+
+#[tokio::test]
+async fn the_first_stock_is_gen_1_of_six_bound_packages_with_a_lifetime() {
+    let w = StockWorld::new();
+    assert_eq!(w.room.join().await.unwrap(), JoinState::Pending);
+    let (generation, kps) = w.stock();
+    assert_eq!((generation, kps.len()), (1, 6));
+    assert_eq!(DEFAULT_STOCK, 6);
+    for k in &kps {
+        assert!(
+            k.len() <= 65_536
+                && k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+        );
+        assert_outgoing_kp(&parse_kp(k), &w.dev, &w.me);
+    }
+    // Not re-sent while pending.
+    assert_eq!(w.room.join().await.unwrap(), JoinState::Pending);
+    assert!(w.sent().is_empty());
+}
+
+#[tokio::test]
+async fn kp_low_is_answered_with_max_of_our_last_gen_and_theirs_plus_one() {
+    let w = StockWorld::new();
+    w.room.join().await.unwrap();
+    assert_eq!(w.stock().0, 1);
+    // They hold our gen 1: the next is 2.
+    w.kp_low(1);
+    w.advance(KP_LOW_MIN_INTERVAL_MS);
+    w.room.join().await.unwrap();
+    let (g2, kps) = w.stock();
+    assert_eq!((g2, kps.len()), (2, 6));
+    // Their gen is ahead of ours (we lost state, or they count differently):
+    // theirs + 1.
+    w.kp_low(9);
+    w.advance(KP_LOW_MIN_INTERVAL_MS);
+    w.room.join().await.unwrap();
+    assert_eq!(w.stock().0, 10);
+    // A stale kp-low (their gen below ours) still moves us forward, never back.
+    w.kp_low(1);
+    w.advance(KP_LOW_MIN_INTERVAL_MS);
+    w.room.join().await.unwrap();
+    assert_eq!(w.stock().0, 11);
+    // A kp-low repeated within a minute is not answered again (our choice).
+    w.kp_low(11);
+    w.room.join().await.unwrap();
+    assert!(w.sent().is_empty());
+}
+
+#[tokio::test]
+async fn the_last_gen_sent_survives_a_restart() {
+    let w = StockWorld::new();
+    w.room.join().await.unwrap();
+    w.stock();
+    w.kp_low(1);
+    w.advance(KP_LOW_MIN_INTERVAL_MS);
+    w.room.join().await.unwrap();
+    assert_eq!(w.stock().0, 2);
+    let (_c, room) = StockWorld::boot(
+        &w.dev, &w.me, &w.peer, &w.dyad, &w.clock, &w.store, &w.vault,
+    );
+    // No second first-stock after a restart.
+    room.join().await.unwrap();
+    assert!(w.sent().is_empty());
+    w.kp_low(2);
+    w.advance(KP_LOW_MIN_INTERVAL_MS);
+    room.join().await.unwrap();
+    assert_eq!(w.stock().0, 3, "gen continues from the persisted last gen");
+}
+
+#[tokio::test]
+async fn a_stock_older_than_seven_days_is_replaced_while_pending() {
+    let w = StockWorld::new();
+    w.room.join().await.unwrap();
+    assert_eq!(w.stock().0, 1);
+    w.advance(7 * DAY_MS - 1000);
+    w.room.join().await.unwrap();
+    assert!(w.sent().is_empty(), "not yet stale");
+    w.advance(2000);
+    w.room.join().await.unwrap();
+    assert_eq!(w.stock().0, 2);
+}
+
+#[tokio::test]
+async fn private_keys_are_kept_for_the_newest_two_gens_and_the_last_hour_only() {
+    let w = StockWorld::new();
+    w.room.join().await.unwrap();
+    let g1 = w.stock().1;
+    let mut later = Vec::new();
+    for generation in [1u64, 2, 3] {
+        w.kp_low(generation);
+        w.advance(2 * HOUR_MS);
+        w.room.join().await.unwrap();
+        later.push(w.stock().1);
+    }
+    let (g2, g3, g4) = (&later[0], &later[1], &later[2]);
+    // g4 and g3 are the newest two; g4 was minted just now, g3 two hours ago.
+    assert!(w.client.holds_key_package(&g4[0]));
+    assert!(w.client.holds_key_package(&g3[0]));
+    assert!(
+        !w.client.holds_key_package(&g2[0]),
+        "third newest, older than an hour"
+    );
+    assert!(!w.client.holds_key_package(&g1[0]));
+    // A gen minted within the last hour is kept even beyond the newest two.
+    w.kp_low(4);
+    w.advance(KP_LOW_MIN_INTERVAL_MS);
+    w.room.join().await.unwrap();
+    let g5 = w.stock().1;
+    w.kp_low(5);
+    w.advance(KP_LOW_MIN_INTERVAL_MS);
+    w.room.join().await.unwrap();
+    let g6 = w.stock().1;
+    for k in [&g4, &g5, &g6] {
+        assert!(
+            w.client.holds_key_package(&k[0]),
+            "g4 is the third newest but was minted within the hour"
+        );
+    }
+    assert!(!w.client.holds_key_package(&g3[0]));
+}
+
+#[tokio::test]
+async fn single_packages_are_kept_seven_days_then_pruned() {
+    let w = StockWorld::new();
+    w.deliver(Frame::Group(GroupOp::KpReq {
+        room: crate::geb::wire::RoomRef {
+            id: ROOM.into(),
+            name: None,
+        },
+    }));
+    w.room.join().await.unwrap();
+    let sent = w.sent();
+    let kp = sent
+        .iter()
+        .find_map(|f| match f {
+            Frame::Group(GroupOp::Kp { kp, .. }) => Some(kp.clone()),
+            _ => None,
+        })
+        .expect("a kp answer");
+    assert_outgoing_kp(&parse_kp(&kp), &w.dev, &w.me);
+    w.advance(7 * DAY_MS - HOUR_MS);
+    w.kp_low(1);
+    w.room.join().await.unwrap();
+    assert!(w.client.holds_key_package(&kp), "still inside 7 days");
+    w.advance(2 * HOUR_MS);
+    w.kp_low(2);
+    w.room.join().await.unwrap();
+    // The kp-low just answered pruned it.
+    assert!(!w.client.holds_key_package(&kp), "pruned after 7 days");
+}
+
+#[tokio::test]
+async fn seat_check_is_answered_with_the_minimal_rs_when_seated_and_not_otherwise() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    let check = |e| {
+        Frame::Group(GroupOp::SeatCheck {
+            room: crate::geb::wire::RoomRef {
+                id: ROOM.into(),
+                name: None,
+            },
+            e,
+        })
+    };
+    // Unseated: nothing is sent for it (seat-ask is not built).
+    let u = StockWorld::new();
+    u.deliver(check(1));
+    u.room.join().await.unwrap();
+    assert!(
+        u.sent()
+            .iter()
+            .all(|f| !matches!(f, Frame::Group(GroupOp::Rs { .. })))
+    );
+    w.seat().await;
+    w.bus.take(&w.our_did, &w.a.did);
+    // Seated: the next settle pass reads the dyad and answers the asker.
+    w.bus.put(&w.a.did, &w.our_did, check(2));
+    w.poll().await.unwrap();
+    let out = w.bus.take(&w.our_did, &w.a.did);
+    assert_eq!(
+        out,
+        vec![Frame::Group(GroupOp::Rs {
+            room: Some(crate::geb::wire::RoomRef {
+                id: ROOM.into(),
+                name: None
+            })
+        })]
+    );
+    // Another room's seat-check is not ours.
+    w.at(w.now() + 60_000);
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        Frame::Group(GroupOp::SeatCheck {
+            room: crate::geb::wire::RoomRef {
+                id: "other-room-9".into(),
+                name: None,
+            },
+            e: 1,
+        }),
+    );
+    w.poll().await.unwrap();
+    assert!(w.bus.take(&w.our_did, &w.a.did).is_empty());
 }

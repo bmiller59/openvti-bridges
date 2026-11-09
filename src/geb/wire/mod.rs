@@ -19,6 +19,8 @@ pub const MAX_LINE_CHARS: usize = 20_000;
 /// Largest Nostr event we post, in bytes of NIP-01 JSON.
 pub const MAX_EVENT_BYTES: usize = 65_536;
 
+/// Longest KeyPackage in a `kp-stock`, in base64 characters.
+pub const MAX_STOCK_KP_CHARS: usize = 65_536;
 /// Most ack ids in one envelope.
 pub const MAX_ACK_IDS: usize = 200;
 /// Most mentions on a line.
@@ -308,6 +310,21 @@ pub enum GroupOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ent: Option<u64>,
     },
+    /// `{k:"g", op:"kp-low", gen, n}`: a holder spent one of our packages (or
+    /// holds fewer than six) and asks for a new stock. `gen` is the stock
+    /// generation it holds from us, `n` how many it holds. Answered with a
+    /// `kp-stock` at `max(our last gen to them, gen) + 1` (round 3 section 5).
+    #[serde(rename = "kp-low")]
+    KpLow {
+        #[serde(rename = "gen")]
+        generation: u64,
+        n: u64,
+    },
+    /// `{k:"g", op:"seat-check", room:{id}, e}`: a member that added us asks
+    /// whether we hold the room, `e` being the epoch of its add. Answered with
+    /// `rs` when seated (round 3 section 3); silence never commits.
+    #[serde(rename = "seat-check")]
+    SeatCheck { room: RoomRef, e: u64 },
     /// A group op this bridge does not implement (`rc`, `seat-ask`, `leave`, or
     /// any other `op`). Never built by serde: only [`parse_frame`] makes it,
     /// so a peer's unknown op is not a parse failure. It carries the op name
@@ -318,7 +335,15 @@ pub enum GroupOp {
 }
 
 /// The `op` values [`GroupOp`] has typed variants for.
-const KNOWN_GROUP_OPS: [&str; 5] = ["kp-stock", "kp-req", "rs", "kp", "welcome"];
+const KNOWN_GROUP_OPS: [&str; 7] = [
+    "kp-stock",
+    "kp-req",
+    "rs",
+    "kp",
+    "welcome",
+    "kp-low",
+    "seat-check",
+];
 
 /// Parse the JSON of a dyad frame. Strict about *kinds* (an unknown `k`
 /// fails: a kind may carry authority, so the caller fails closed), tolerant of
@@ -447,14 +472,29 @@ impl Frame {
             }
             Frame::Reaction(r) => r.validate(),
             Frame::Group(GroupOp::Welcome { room, .. }) => room.validate(),
-            Frame::Group(GroupOp::KpStock { kps, .. }) => {
-                if kps.len() > 16 || kps.iter().any(|k| !is_std_b64(k)) {
+            Frame::Group(GroupOp::KpStock { generation, kps }) => {
+                // Round 3 section 5: `gen` an integer >= 1, at most 16
+                // packages kept, each standard base64 of at most 65,536
+                // characters.
+                if *generation == 0
+                    || kps.len() > 16
+                    || kps
+                        .iter()
+                        .any(|k| !is_std_b64(k) || k.len() > MAX_STOCK_KP_CHARS)
+                {
                     return Err(Error::Wire(
-                        "kp-stock: at most 16 KeyPackages, standard base64 (^[A-Za-z0-9+/=]+$)"
+                        "kp-stock: gen >= 1, at most 16 KeyPackages, each standard base64 \
+                         (^[A-Za-z0-9+/=]+$) of at most 65,536 characters"
                             .into(),
                     ));
                 }
                 Ok(())
+            }
+            Frame::Group(GroupOp::KpLow { generation, .. }) if *generation == 0 => {
+                Err(Error::Wire("kp-low: gen must be >= 1".into()))
+            }
+            Frame::Group(GroupOp::SeatCheck { room, .. }) if !is_room_id(&room.id) => {
+                Err(Error::Wire("seat-check: bad room id".into()))
             }
             Frame::Group(GroupOp::Kp { kp, .. }) => {
                 if !is_std_b64(kp) {
@@ -988,6 +1028,43 @@ mod tests {
             };
             assert!(f.validate().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn kp_low_and_seat_check_parse_typed_and_stock_limits_hold() {
+        let low = parse_frame(br#"{"k":"g","op":"kp-low","gen":3,"n":2}"#).unwrap();
+        assert_eq!(
+            low,
+            Frame::Group(GroupOp::KpLow {
+                generation: 3,
+                n: 2
+            })
+        );
+        assert!(low.validate().is_ok());
+        assert!(
+            Frame::Group(GroupOp::KpLow {
+                generation: 0,
+                n: 0
+            })
+            .validate()
+            .is_err()
+        );
+        // A known op with a bad body fails (it is not "ignored").
+        assert!(parse_frame(br#"{"k":"g","op":"kp-low","gen":"x"}"#).is_err());
+        let sc = parse_frame(br#"{"k":"g","op":"seat-check","room":{"id":"geb-room-0001"},"e":4}"#)
+            .unwrap();
+        assert!(matches!(sc, Frame::Group(GroupOp::SeatCheck { e: 4, .. })));
+        assert!(sc.validate().is_ok());
+        let stock =
+            |generation, kps: Vec<String>| Frame::Group(GroupOp::KpStock { generation, kps });
+        assert!(stock(1, vec!["AAAA".into(); 16]).validate().is_ok());
+        assert!(
+            stock(0, vec!["AAAA".into()]).validate().is_err(),
+            "gen >= 1"
+        );
+        assert!(stock(1, vec!["AAAA".into(); 17]).validate().is_err());
+        assert!(stock(1, vec!["A".repeat(65_536)]).validate().is_ok());
+        assert!(stock(1, vec!["A".repeat(65_537)]).validate().is_err());
     }
 
     #[test]
