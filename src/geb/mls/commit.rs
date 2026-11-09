@@ -20,11 +20,11 @@
 //! 4. no added leaf carries a **forged** binding (a binding that is present
 //!    and does not verify). A missing binding passes: "seated, unverified".
 //!
-//! Since 0.5.15 (answers round 2, sections 2 and 7) the judge also REFUSES,
-//! each a *refusal* (the walk goes on to the next hash, see below), a commit:
-//! carrying any proposal by reference (we never store a proposal, so it shows
-//! as `MissingProposal`), a standalone Proposal in an `mc` (never stored),
-//! whose update-path leaf names another DID than its sender (`leafAuth`) or
+//! Since 0.5.15 (answers round 2, sections 2 and 7) the judge also skips (the
+//! walk goes on to the next hash, see below) a commit: carrying any proposal
+//! by reference (we never store a proposal, so it shows as `MissingProposal`,
+//! recorded failed), a standalone Proposal in an `mc` (never stored; failed),
+//! and REFUSES one whose update-path leaf names another DID than its sender (`leafAuth`) or
 //! carries a forged binding, that adds an unbound leaf naming the root, an
 //! admin or a seated DID (`unboundClaim`), or whose sender's leaf is unbound
 //! and who removes, re-seats or changes the policy (`validCommit`, with the
@@ -33,10 +33,13 @@
 //! At join, `tree_refusal` refuses a Welcome whose tree holds a forged leaf …
 //! … unbound.
 //!
-//! Refused versus failed (the settle walk): `Verdict::Refused` = dropped, next
-//! hash tried, cursor moves; `Verdict::Unprocessable` = cannot be processed at
-//! all (replay, other branch, unparsable bytes): recorded failed, the walk
-//! STOPS, `rs` is sent once. Everything above is a refusal.
+//! Refused versus failed (the settle walk, answers round 4 Q1): the walk NEVER
+//! stops on either. `Verdict::Refused` = staged, then failed `leafAuth` /
+//! `validCommit`: dropped, next hash tried. `Verdict::Unprocessable` = MLS
+//! processing threw or the result is not a staged Commit (replay, other branch,
+//! unparsable bytes, a standalone Proposal in an `mc`, a proposal by
+//! reference): recorded failed, ALSO skipped; only if nothing merges does the
+//! cursor stay before it and one `rs` go out.
 //!
 //! Why that is safe: answer 9 and round 2 section 7 state `validCommit` as a
 //! list of conditions, and name the three places where persona cards matter
@@ -270,11 +273,13 @@ impl GroupJudge<'_> {
         let processed = match self.group.process_message(self.provider, msg) {
             Ok(p) => p,
             // We never store a proposal, so a commit that names one by
-            // reference cannot be staged: that is the by-reference refusal
-            // (0.5.15) seen from the receiving side, and a refusal, not a
-            // failure, so the walk goes on to the next hash.
+            // reference cannot be processed: Geb's binding never stores one
+            // either (`mls.rs:325-328`), so MLS cannot process it and it is
+            // "failed" in the app (answers round 4 Q1). UNVERIFIED which of
+            // failed and refused (by `leafAuth`, if staged) fires; both are
+            // skipped by the walk, so only the cursor and `rs` differ.
             Err(ProcessMessageError::InvalidCommit(StageCommitError::MissingProposal)) => {
-                return Verdict::Refused("a commit carries a proposal by reference".into());
+                return unprocessable("a commit carries a proposal by reference".into());
             }
             Err(e) => return unprocessable(format!("process: {e:?}")),
         };
@@ -284,15 +289,16 @@ impl GroupJudge<'_> {
         };
         let staged = match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) => staged,
-            // 0.5.15: a standalone Proposal is refused and NEVER stored (we
-            // never call `store_pending_proposal`; `process_message` itself
-            // does not store it). A refusal, so the walk goes on to the next
-            // hash. UNVERIFIED: that Geb's walk treats this report the same
-            // as a `validCommit` failure (gap-analysis question 3); the
-            // alternative reading is `failed`, which would stop the walk.
+            // A standalone Proposal is never stored (we never call
+            // `store_pending_proposal`; Geb's binding returns
+            // `{kind:"proposal", refused:true}`, `mls.rs:324-334`). In an `mc`
+            // … (answers round 4
+            // Q1:); the walk skips it.
             ProcessedMessageContent::ProposalMessage(_)
             | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
-                return Verdict::Refused("a standalone Proposal is refused, never stored".into());
+                return unprocessable(
+                    "a standalone Proposal in an mc is not a staged Commit".into(),
+                );
             }
             _ => return unprocessable("an mc envelope that is not a commit".into()),
         };

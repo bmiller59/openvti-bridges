@@ -987,14 +987,19 @@ impl GebGroup for MlsGroupClient {
             let mut epoch_changed = false;
             match outcome {
                 Outcome::Idle | Outcome::Holding { .. } | Outcome::AllRefused { .. } => {}
-                Outcome::Merged { refused, .. } => {
+                Outcome::Merged {
+                    refused, failed, ..
+                } => {
                     epoch_changed = true;
                     // Candidates of the old epoch can never be tested again.
                     judged.clear();
-                    if !refused.is_empty() {
+                    if !refused.is_empty() || !failed.is_empty() {
+                        // A failed candidate changes nothing once one merged:
+                        // no `rs`, no cursor barrier.
                         tracing::warn!(
                             refused = refused.len(),
-                            "dropped commits that failed validCommit"
+                            failed = failed.len(),
+                            "skipped commits below the merged one"
                         );
                     }
                 }

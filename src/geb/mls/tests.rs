@@ -1101,14 +1101,26 @@ async fn refused_then_next_wins(w: &mut World, mk_bad_on_b: &dyn Fn(&mut Sim) ->
     assert!(w.our_keys_match(&w.a));
 }
 
+fn rs_count(d: &MemDyad) -> usize {
+    d.sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, f)| matches!(f, Frame::Group(GroupOp::Rs { .. })))
+        .count()
+}
+
+/// Answers round 4 Q1: a standalone Proposal in an `mc` and a proposal by
+/// reference are "failed" (MLS cannot process them), and a failed candidate
+/// never stops the walk: the valid higher hash merges.
 #[tokio::test]
-async fn by_reference_proposals_and_standalone_proposals_are_refused_not_failed() {
+async fn by_reference_proposals_and_standalone_proposals_are_failed_and_skipped() {
     let kp = Sim::new(30).key_package();
     let mut w = World::build(Arc::new(AllKnown), "");
     w.seat().await;
-    // A commit that names its proposal by reference.
+    // A commit that names its proposal by reference, lower hash than A's.
     refused_then_next_wins(&mut w, &|s| s.stage_by_ref_add(kp.clone()).1).await;
-    // A standalone Proposal in an `mc` is refused and never stored.
+    // A standalone Proposal in an `mc`, lower hash than A's: skipped, A's wins.
     let mut w = World::build(Arc::new(AllKnown), "");
     w.seat().await;
     refused_then_next_wins(&mut w, &|s| s.stage_proposal(kp.clone())).await;
@@ -1116,7 +1128,10 @@ async fn by_reference_proposals_and_standalone_proposals_are_refused_not_failed(
         !w.client.members().iter().any(|m| m == &Sim::new(30).did),
         "nobody was added by a proposal"
     );
-    // A lone one: refused, nothing held afterwards, nothing failed.
+    assert_eq!(rs_count(&w.dyad), 0, "a merge means no rs, no barrier");
+    assert_eq!(w.client.held_commits(), 0);
+    // A lone one: failed, nothing merged, so it stays held (the cursor stays
+    // before it) and ONE `rs` goes out.
     let mut w = World::build(Arc::new(AllKnown), "");
     w.seat().await;
     let e = w.client.epoch();
@@ -1124,8 +1139,12 @@ async fn by_reference_proposals_and_standalone_proposals_are_refused_not_failed(
     w.post_mc(&w.b, &p).await;
     settle_posted(&w).await.unwrap();
     assert_eq!(w.client.epoch(), e);
-    assert!(w.client.failed_commits().is_empty());
-    assert_eq!(w.client.held_commits(), 0);
+    assert_eq!(w.client.failed_commits().len(), 1);
+    assert_eq!(w.client.held_commits(), 1);
+    assert_eq!(rs_count(&w.dyad), 1);
+    w.at(w.now() + 5_000);
+    w.poll().await.unwrap();
+    assert_eq!(rs_count(&w.dyad), 1, "not asked again");
 }
 
 #[tokio::test]

@@ -11,9 +11,15 @@
 //!   staged commit is discarded), reported refused, the next hash is tried;
 //! - the first that passes is merged;
 //! - all refused: nothing settles, the epoch stays;
-//! - …
-//!   … **failed**; the read cursor stays before it and the device asks
-//!   for the room status (`{k:"g", op:"rs"}`), which starts fork repair.
+//! - … branch, a
+//!   standalone Proposal): recorded **failed** and SKIPPED exactly like a
+//!   refusal. The walk NEVER stops on any candidate (answers round 4 Q1,
+//!): the first candidate that passes is
+//!   merged, whatever failed below it. The two differ only after the walk: if
+//!   NOTHING merged and one failed, the read cursor stays before it (so a
+//!   later replay is judged again) and the device asks for the room status
+//!   (`{k:"g", op:"rs"}`) once; if one merged, a failed candidate changes
+//!   nothing.
 //!
 //! This module knows nothing of MLS. A [`Judge`] tests and merges a candidate;
 //! time is an argument (`now_ms`), so tests never sleep.
@@ -24,8 +30,6 @@
 //!   held commit, not at the event's `created_at`;
 //! - a commit arriving after its epoch's candidates were settled (all refused)
 //!   is a new candidate with a new window;
-//! - an `unprocessable` candidate stops the walk: higher hashes are not tried
-//!   (the read cursor "stays before it", so nothing past it is read);
 //! - commits made from an epoch ahead of ours are held, never tested, and at
 //!   most [`MAX_HELD`] are kept: more than that is a hard stop, because
 //!   dropping a candidate could change the winner.
@@ -91,20 +95,26 @@ pub enum Outcome {
     Idle,
     /// The window has not run out; look again in `wait_ms`.
     Holding { wait_ms: u64 },
-    /// `winner` was merged; `refused` were tried before it (ascending).
+    /// `winner` was merged; `refused` and `failed` were tried before it
+    /// (ascending) and skipped. A failed one changes nothing once one merged.
     Merged {
         winner: CommitHash,
         refused: Vec<CommitHash>,
+        failed: Vec<CommitHash>,
     },
     /// Every candidate was refused; the epoch stays.
     AllRefused { refused: Vec<CommitHash> },
-    /// A candidate could not be processed: recorded failed. `ask_status` is
-    /// true the first time only (the caller sends `{k:"g",op:"rs"}`).
+    /// Nothing merged and a candidate could not be processed: recorded
+    /// failed, the cursor stays before it. `hash` and `reason` are the lowest
+    /// failed one; `failed` lists all. `ask_status` is true when a newly
+    /// failed one was recorded, the first time only (the caller sends
+    /// `{k:"g",op:"rs"}` once).
     Failed {
         hash: CommitHash,
         reason: String,
         ask_status: bool,
         refused: Vec<CommitHash>,
+        failed: Vec<CommitHash>,
     },
     /// A candidate needs knowledge this device lacks: stop.
     Blocked { hash: CommitHash, reason: String },
@@ -218,6 +228,7 @@ impl SettleQueue {
         // Ascending SHA-256 of the commit bytes.
         mine.sort_by_key(|c| c.hash);
         let mut refused = Vec::new();
+        let mut failed: Vec<(CommitHash, String)> = Vec::new();
         for c in &mine {
             match judge.judge(c) {
                 Verdict::Valid => {
@@ -225,12 +236,16 @@ impl SettleQueue {
                         Ok(()) => {
                             // The winner and every candidate tried before it
                             // are settled; the rest were made from a parent
-                            // epoch that no longer exists.
+                            // epoch that no longer exists. A failed candidate
+                            // changes nothing once one merged.
                             self.held.retain(|h| h.parent_epoch != epoch);
                             self.refused.extend(refused.iter().copied());
+                            let held = &self.held;
+                            self.failed.retain(|h| held.iter().any(|c| c.hash == *h));
                             Outcome::Merged {
                                 winner: c.hash,
                                 refused,
+                                failed: failed.into_iter().map(|(h, _)| h).collect(),
                             }
                         }
                         Err(reason) => {
@@ -245,17 +260,8 @@ impl SettleQueue {
                 Verdict::Refused(_) => {
                     refused.push(c.hash);
                 }
-                Verdict::Unprocessable(reason) => {
-                    // Candidates refused before it stay dropped.
-                    self.drop_refused(&refused);
-                    let ask_status = self.failed.insert(c.hash);
-                    return Outcome::Failed {
-                        hash: c.hash,
-                        reason,
-                        ask_status,
-                        refused,
-                    };
-                }
+                // Skipped, the walk goes on to the next hash.
+                Verdict::Unprocessable(reason) => failed.push((c.hash, reason)),
                 Verdict::Undecidable(reason) => {
                     // Nothing is dropped: the refused ones were refused on
                     // grounds that need no local knowledge, so they stay so.
@@ -266,6 +272,23 @@ impl SettleQueue {
                     };
                 }
             }
+        }
+        if let Some((hash, reason)) = failed.first().cloned() {
+            // Nothing merged and a candidate failed: the refused ones are
+            // dropped; the failed ones stay held, so the cursor stays before
+            // them and a later replay is judged again.
+            self.drop_refused(&refused);
+            let mut ask_status = false;
+            for (h, _) in &failed {
+                ask_status |= self.failed.insert(*h);
+            }
+            return Outcome::Failed {
+                hash,
+                reason,
+                ask_status,
+                refused,
+                failed: failed.into_iter().map(|(h, _)| h).collect(),
+            };
         }
         self.held.retain(|h| h.parent_epoch != epoch);
         self.refused.extend(refused.iter().copied());
@@ -375,7 +398,8 @@ mod tests {
                 out,
                 Outcome::Merged {
                     winner: commit_hash(&lo),
-                    refused: vec![]
+                    refused: vec![],
+                    failed: vec![]
                 }
             );
             assert_eq!(j.merged, vec![lo.clone()]);
@@ -417,7 +441,8 @@ mod tests {
             out,
             Outcome::Merged {
                 winner: commit_hash(&mid),
-                refused: vec![commit_hash(&lo)]
+                refused: vec![commit_hash(&lo)],
+                failed: vec![]
             }
         );
         assert_eq!(j.tested, vec![lo.clone(), mid.clone()]);
@@ -447,8 +472,38 @@ mod tests {
         assert_eq!(q.settle(0, 0, 0, &mut j), Outcome::Idle);
     }
 
+    /// Answers round 4 Q1: a failed candidate never stops the walk. A lower
+    /// hash that fails is skipped and the valid higher hash is merged.
     #[test]
-    fn an_unprocessable_candidate_is_recorded_once_and_stops_the_walk() {
+    fn a_failed_candidate_with_a_lower_hash_does_not_stop_the_walk() {
+        let (lo, mid, hi) = by_hash();
+        let mut q = SettleQueue::new();
+        for c in [&hi, &lo, &mid] {
+            q.hold(0, c.clone(), 7, 0).unwrap();
+        }
+        let mut j = Script::default();
+        j.verdicts
+            .insert(lo.clone(), Verdict::Unprocessable("replay".into()));
+        j.verdicts.insert(mid.clone(), Verdict::Refused("r".into()));
+        let out = q.settle(0, 0, 0, &mut j);
+        assert_eq!(
+            out,
+            Outcome::Merged {
+                winner: commit_hash(&hi),
+                refused: vec![commit_hash(&mid)],
+                failed: vec![commit_hash(&lo)]
+            }
+        );
+        assert_eq!(j.tested, vec![lo.clone(), mid.clone(), hi.clone()]);
+        assert_eq!(j.merged, vec![hi]);
+        // One merged: the failed candidate changes nothing (no rs, no cursor
+        // barrier, nothing recorded failed).
+        assert!(q.is_empty() && q.barrier_secs().is_none());
+        assert!(q.failed().is_empty());
+    }
+
+    #[test]
+    fn with_no_merge_a_failed_candidate_keeps_the_cursor_and_asks_for_status_once() {
         let (lo, mid, _) = by_hash();
         let mut q = SettleQueue::new();
         q.hold(0, lo.clone(), 7, 0).unwrap();
@@ -456,6 +511,7 @@ mod tests {
         let mut j = Script::default();
         j.verdicts
             .insert(lo.clone(), Verdict::Unprocessable("replay".into()));
+        j.verdicts.insert(mid.clone(), Verdict::Refused("r".into()));
         let out = q.settle(0, 0, 0, &mut j);
         assert_eq!(
             out,
@@ -463,14 +519,18 @@ mod tests {
                 hash: commit_hash(&lo),
                 reason: "replay".into(),
                 ask_status: true,
-                refused: vec![]
+                refused: vec![commit_hash(&mid)],
+                failed: vec![commit_hash(&lo)]
             }
         );
-        assert!(j.merged.is_empty(), "a higher hash is not tried past it");
-        assert_eq!(j.tested, vec![lo.clone()]);
-        // Still held, so the cursor stays before it; asked for status once.
+        assert!(j.merged.is_empty());
+        assert_eq!(j.tested, vec![lo.clone(), mid.clone()], "the walk went on");
+        // The refused one is dropped; the failed one stays held, so the
+        // cursor stays before it.
+        assert_eq!(q.len(), 1);
         assert_eq!(q.barrier_secs(), Some(7));
         assert!(q.failed().contains(&commit_hash(&lo)));
+        // Judged again on the next settle, but the status is asked only once.
         let again = q.settle(0, 0, 10, &mut j);
         assert!(matches!(
             again,
