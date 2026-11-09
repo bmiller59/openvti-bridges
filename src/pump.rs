@@ -289,25 +289,27 @@ impl Pump {
         }
         let r = self.run_directions(&mut report).await;
         self.guard(r).await?;
-        self.maybe_prune().await;
+        self.maybe_prune().await?;
         Ok(report)
     }
 
-    /// Prune what is past retention, at most once an hour. Housekeeping: a
-    /// failure is logged and tried again later, never a tick error.
-    async fn maybe_prune(&self) {
+    /// Prune what is past retention, at most once an hour. A failure of the
+    /// prune itself is housekeeping (logged, tried again next tick); the
+    /// cursor reads and writes are the store's own and are errors like any
+    /// other store error.
+    async fn maybe_prune(&self) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let last = match self.store.cursor(LAST_PRUNE).await {
-            Ok(c) => c
-                .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
-                .map(u64::from_be_bytes),
-            Err(_) => return,
-        };
+        let last = self
+            .store
+            .cursor(LAST_PRUNE)
+            .await?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes);
         if last.is_some_and(|l| now.saturating_sub(l) < PRUNE_EVERY_SECS) {
-            return;
+            return Ok(());
         }
         let keep = u64::from(self.link.retention_days.max(1)) * 86_400;
         match self.store.prune(now, keep).await {
@@ -316,14 +318,15 @@ impl Pump {
                     tracing::info!(link = %self.link.id, journal = st.journal,
                         outbox = st.outbox, xref = st.xref, "pruned past retention");
                 }
-                if let Err(e) = self.store.set_cursor(LAST_PRUNE, &now.to_be_bytes()).await {
-                    tracing::warn!(link = %self.link.id, error = %e, "could not record the prune");
-                }
+                self.store
+                    .set_cursor(LAST_PRUNE, &now.to_be_bytes())
+                    .await?;
             }
             Err(e) => {
                 tracing::warn!(link = %self.link.id, error = %e, "pruning failed; will retry")
             }
         }
+        Ok(())
     }
 
     /// Run both directions, each with its own cursor, even when one fails: a
