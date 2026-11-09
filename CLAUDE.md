@@ -31,7 +31,7 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   changes behind `GebCodec` and the other `geb::traits`, and mark anything the
   answers do not settle `// UNVERIFIED:`. Remaining markers: the `did:peer`
   purpose-element order, a few `parsePolicy` details (see `geb/policy.rs`), the
-  VRC field layout beyond what the guide states (`geb/vrc.rs`) and the dyad's
+  VRC acceptance by a live Geb (`geb/vrc.rs`: the v2 shape matches Geb's vector byte for byte; `ieee7012Agreed` is sent `false`) and the dyad's
   unstated choices (list at the top of `geb/dyad.rs`). The Nostr event id and
   BIP-340 signature are resolved (`geb/event.rs`, bound to the published
   BIP-340 vectors).
@@ -68,7 +68,12 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   `Relayed`, after reading our own event back.
 - **No invented test vectors.** Geb's vectors are vendored at
   `tests/fixtures/geb-path-b-vectors.json` (fixed labelled test keys and public
-  outputs only) and bound in `tests/vectors.rs`. Other tests are round-trips
+  outputs only) and bound in `tests/vectors.rs`; round 2
+  (`geb-path-b-vectors-2.json`: commit hash and settle winner, exporter, signed
+  leaf, persona card, VRC v2) is bound in `tests/vectors2.rs`. Of those, the exporter
+  is re-derived by a test-only RFC 9420 implementation (our code derives it only
+  through OpenMLS) and the persona card by a test-only verifier (this crate has no
+  card type). Other tests are round-trips
   and re-derivations and say so; never present this crate's own output as
   Geb's.
 - Inbound foreign text is untrusted: records are `basis: "observed"`, with a
