@@ -34,8 +34,10 @@
 //! - whether the pair mailbox is also where a response/completion for an
 //!   *existing* dyad would travel again (we accept them only in the matching
 //!   handshake phase);
-//! - `fc` fragments are not supported, so a frame must fit one event (about
-//!   36,000 bytes of plaintext);
+//! - `fc` fragments are not supported (we say `fc:0`), so a frame must fit one
+//!   event (about 36,000 bytes of plaintext), and a frame Geb sends that does
+//!   not fit one 120,000-byte event, such as a Welcome for a large room, never
+//!   reaches us: KNOWN LIMITATION, open item;
 //! - retransmission policy (callers decide when; we never loop).
 
 use super::codec::GuideCodec;
@@ -895,12 +897,13 @@ impl StatefulDyad {
     async fn send_inner(&self, p: &mut Peer, peer: &str, frame: &Frame) -> Result<()> {
         frame.validate()?;
         // The bridge claims no capability it lacks (guide: never dm:1 without
-        // rooms; never fc or rv = 1 without reassembling them).
+        // rooms; never fc or rv = 1 without reassembling them). `fc:0` is the
+        // honest statement of "no fragments" (round 3 section 3).
         if let Frame::Cap { dm, fc, rv, .. } = frame {
             let one = |v: &Option<Value>| v.as_ref().is_some_and(|x| x == &Value::from(1));
             if dm.as_f64().is_none_or(|n| n >= 1.0) || one(fc) || one(rv) {
                 return Err(Error::Foreign(
-                    "the bridge sends cap with dm:0 and never fc or rv".into(),
+                    "the bridge sends cap with dm:0 and fc:0 and never rv, and never claims fc or rv of 1".into(),
                 ));
             }
         }
@@ -1110,12 +1113,13 @@ mod tests {
     async fn connect_when_apart_then_acked_messages_both_ways() {
         let w = world();
         connect(&w).await;
-        // Both sent cap (dm:0, no fc/rv) as the first frame on the ratchet.
+        // Both sent cap (dm:0, fc:0, no rv) as the first frame on the ratchet.
         w.now.fetch_add(1, Ordering::SeqCst);
         w.a.sync(w.b.did()).await.unwrap();
         let cap = w.a.peer_cap(w.b.did()).await.unwrap().unwrap();
         assert_eq!(cap["dm"], 0);
-        assert!(cap["fc"].is_null() && cap["rv"].is_null());
+        assert_eq!(cap["fc"], 0, "fc is stated, not left unknown");
+        assert!(cap["rv"].is_null());
         assert!(w.b.peer_cap(w.a.did()).await.unwrap().is_some());
         for t in ["one", "two", "three"] {
             w.a.send(w.b.did(), &msg(t)).await.unwrap();

@@ -369,7 +369,9 @@ pub enum Frame {
     /// floored by receivers; … room".
     /// `fc` and `rv` count only when exactly `1` (fragments, room events over
     /// the dyad); `wp` is … The
-    /// bridge sends `dm: 0` and never `fc` / `rv` ([`Frame::bridge_cap`]).
+    /// bridge sends `dm: 0` and `fc: 0` (stated, because an UNKNOWN `fc` makes
+    /// Geb hold a large frame back until it hears from us), and leaves `rv`
+    /// and `wp` unset ([`Frame::bridge_cap`]).
     #[serde(rename = "cap")]
     Cap {
         dm: serde_json::Number,
@@ -467,11 +469,18 @@ impl Frame {
     }
 
     /// A `cap` frame that is safe to send: `dm: 0` (never claims direct
-    /// rooms), no fragments (`fc`), no room events over the dyad (`rv`).
+    /// rooms), `fc: 0` (we do not reassemble `{k:"fc"}` fragments; round 3
+    /// section 3), `rv` unset (no room events over the dyad), no `wp`.
+    ///
+    /// KNOWN LIMITATION (open item): with `fc:0` Geb sends a frame that does
+    /// not fit one 120,000-byte event whole, and the relay refuses it, so a
+    /// Welcome too large for one event (a big room: the ratchet tree rides in
+    /// it) never reaches us and joining a large room fails. Implementing
+    /// `fc` fragments (`{k:"fc", id, i, n, d}`, `n` <= 64) is not done.
     pub fn bridge_cap() -> Frame {
         Frame::Cap {
             dm: 0.into(),
-            fc: None,
+            fc: Some(Value::from(0)),
             rv: None,
             wp: None,
         }
@@ -982,10 +991,10 @@ mod tests {
     }
 
     #[test]
-    fn the_bridge_sends_dm_zero_and_no_fc_or_rv() {
+    fn the_bridge_sends_dm_zero_fc_zero_and_no_rv() {
         let v = serde_json::to_value(Frame::bridge_cap()).unwrap();
-        assert_eq!(v, json!({"k":"cap","dm":0}));
-        assert!(v.get("fc").is_none() && v.get("rv").is_none());
+        assert_eq!(v, json!({"k":"cap","dm":0,"fc":0}));
+        assert!(v.get("rv").is_none() && v.get("wp").is_none());
     }
 
     #[test]
