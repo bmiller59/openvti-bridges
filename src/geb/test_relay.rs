@@ -2,12 +2,14 @@
 //! `127.0.0.1` on an ephemeral port and nowhere else; nothing here can reach
 //! a real relay. It speaks enough NIP-01 (`EVENT`, `REQ`, `CLOSE`) and NIP-40
 //! for the dyad tests, and checks what a real relay checks: event id and
-//! signature, the 65,536-byte cap, expiry. It has knobs to misbehave on
+//! signature, the 131,072-byte cap, expiry, an event dated more than 900 s
+//! ahead of its clock, and the `limit` / `until` of a `REQ`; it records every
+//! `REQ` filter and the most subscriptions open at once on a connection. It has knobs to misbehave on
 //! purpose: drop every connection, return events oldest first, repeat every
 //! event on a fetch, and store events unchecked (a hostile relay).
 
 use super::traits::RelayEvent;
-use super::wire::MAX_EVENT_BYTES;
+use super::wire::MAX_RECV_EVENT_BYTES;
 use crate::{Error, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -27,6 +29,9 @@ struct Shared {
     generation: watch::Sender<u64>,
     publishes: AtomicU64,
     drop_before_ok: AtomicU64,
+    reqs: Mutex<Vec<Value>>,
+    max_open: AtomicU64,
+    eose_delay_ms: AtomicU64,
 }
 
 /// The relay. Dropping it stops the listener.
@@ -61,6 +66,9 @@ impl TestRelay {
             generation,
             publishes: AtomicU64::new(0),
             drop_before_ok: AtomicU64::new(0),
+            reqs: Mutex::new(Vec::new()),
+            max_open: AtomicU64::new(0),
+            eose_delay_ms: AtomicU64::new(0),
         });
         let sh = shared.clone();
         let task = tokio::spawn(async move {
@@ -94,6 +102,27 @@ impl TestRelay {
     /// How many `EVENT` messages the relay has received (accepted or not).
     pub fn publishes_seen(&self) -> u64 {
         self.shared.publishes.load(Ordering::SeqCst)
+    }
+
+    /// Every `REQ` filter received so far, in order.
+    pub fn req_filters(&self) -> Vec<Value> {
+        self.shared
+            .reqs
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// The most subscriptions that were open at once on one connection (a
+    /// `REQ` opens one, a `CLOSE` ends it).
+    pub fn max_open_subscriptions(&self) -> u64 {
+        self.shared.max_open.load(Ordering::SeqCst)
+    }
+
+    /// Delay every `EOSE` by this many milliseconds, so concurrent requests
+    /// overlap.
+    pub fn set_eose_delay_ms(&self, ms: u64) {
+        self.shared.eose_delay_ms.store(ms, Ordering::SeqCst);
     }
 
     /// Close every open connection abruptly (no close handshake). Clients may
@@ -161,6 +190,7 @@ async fn serve(stream: tokio::net::TcpStream, sh: Arc<Shared>) {
         return;
     };
     let mut gen_rx = sh.generation.subscribe();
+    let mut open: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         tokio::select! {
             _ = gen_rx.changed() => return, // drop the socket without a close frame
@@ -179,8 +209,26 @@ async fn serve(stream: tokio::net::TcpStream, sh: Arc<Shared>) {
                         }
                         vec![ok]
                     }
-                    Some("REQ") => on_req(&sh, &msg),
-                    Some("CLOSE") => vec![],
+                    Some("REQ") => {
+                        if let Some(sub) = msg.get(1).and_then(Value::as_str) {
+                            open.insert(sub.to_string());
+                            sh.max_open.fetch_max(open.len() as u64, Ordering::SeqCst);
+                        }
+                        if let (Ok(mut r), Some(f)) = (sh.reqs.lock(), msg.get(2)) {
+                            r.push(f.clone());
+                        }
+                        let d = sh.eose_delay_ms.load(Ordering::SeqCst);
+                        if d > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(d)).await;
+                        }
+                        on_req(&sh, &msg)
+                    }
+                    Some("CLOSE") => {
+                        if let Some(sub) = msg.get(1).and_then(Value::as_str) {
+                            open.remove(sub);
+                        }
+                        vec![]
+                    }
                     _ => vec![json!(["NOTICE", "unsupported"])],
                 };
                 for o in out {
@@ -204,8 +252,11 @@ fn on_event(sh: &Shared, ev: Option<&Value>) -> Value {
     let Some(Ok(e)) = ev.map(RelayEvent::from_json) else {
         return no("invalid: malformed event");
     };
-    if e.json_len() > MAX_EVENT_BYTES {
+    if e.json_len() > MAX_RECV_EVENT_BYTES {
         return no("invalid: event too large");
+    }
+    if e.created_at > sh.now.load(Ordering::SeqCst) + super::nostr::MAX_FUTURE_SECS {
+        return no("invalid: created_at too far in the future");
     }
     if e.verify().is_err() {
         return no("invalid: bad id or signature");
@@ -241,7 +292,16 @@ fn on_req(sh: &Shared, msg: &[Value]) -> Vec<Value> {
         })
         .unwrap_or_default();
     hits.sort_by_key(|e| e.created_at);
-    if !sh.oldest_first.load(Ordering::SeqCst) {
+    hits.reverse(); // newest first
+    // `limit` keeps the newest N, as a relay does.
+    if let Some(l) = filters
+        .iter()
+        .filter_map(|f| f.get("limit").and_then(Value::as_u64))
+        .min()
+    {
+        hits.truncate(l as usize);
+    }
+    if sh.oldest_first.load(Ordering::SeqCst) {
         hits.reverse();
     }
     let mut out = Vec::new();

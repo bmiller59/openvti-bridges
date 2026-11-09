@@ -260,3 +260,167 @@ async fn connect_when_apart_and_acked_messages_over_a_real_socket() {
     n.now.fetch_add(8 * 86_400, Ordering::SeqCst);
     assert!(n.b.recv(n.a.did()).await.unwrap().is_empty());
 }
+
+// ---- relay manners (round 3 section 7 and 6) --------------------------------
+
+fn sk() -> [u8; 32] {
+    [7u8; 32]
+}
+
+fn event_at(secs: u64, content: &str) -> RelayEvent {
+    RelayEvent::sign(&sk(), KIND_MAILBOX, secs, vec![], content.into()).unwrap()
+}
+
+fn author() -> String {
+    event_at(T0, "x").pubkey
+}
+
+#[tokio::test]
+async fn a_catch_up_pages_with_limit_200_and_until_and_never_asks_from_zero() {
+    let now = Arc::new(AtomicU64::new(T0 + 10_000));
+    let relay = TestRelay::start(now).await.unwrap();
+    for i in 0..450u64 {
+        relay.inject_unchecked(event_at(T0 + i, &format!("e{i}")));
+    }
+    let c = NostrRelay::new(cfg(&relay.url())).unwrap();
+    let got = c
+        .fetch(KIND_MAILBOX, &author(), Some(T0 - 300))
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 450, "every event, once, across three pages");
+    let reqs = relay.req_filters();
+    assert_eq!(reqs.len(), 3, "{reqs:?}");
+    for r in &reqs {
+        assert_eq!(r["limit"], 200, "every page asks limit 200");
+        assert_eq!(r["since"], T0 - 300);
+        assert_ne!(r["since"], 0);
+    }
+    assert!(
+        reqs[0].get("until").is_none(),
+        "the first page has no until"
+    );
+    // `until` is inclusive: the oldest of the page just read (T0+250), then
+    // of the next (T0+51); the overlap is dropped by id.
+    assert_eq!(reqs[1]["until"], T0 + 250);
+    assert_eq!(reqs[2]["until"], T0 + 51);
+}
+
+#[tokio::test]
+async fn a_page_that_adds_nothing_new_ends_the_catch_up() {
+    let now = Arc::new(AtomicU64::new(T0 + 10_000));
+    let relay = TestRelay::start(now).await.unwrap();
+    // 250 events in one second: `until` cannot move past them.
+    for i in 0..250 {
+        relay.inject_unchecked(event_at(T0, &format!("same{i}")));
+    }
+    let c = NostrRelay::new(cfg(&relay.url())).unwrap();
+    let got = c
+        .fetch(KIND_MAILBOX, &author(), Some(T0 - 300))
+        .await
+        .unwrap();
+    assert!(got.len() >= 200 && got.len() <= 250);
+    assert!(relay.req_filters().len() <= 3, "it stops, it does not spin");
+}
+
+#[tokio::test]
+async fn at_most_eight_catch_up_reqs_are_open_at_once() {
+    let now = Arc::new(AtomicU64::new(T0 + 10));
+    let relay = TestRelay::start(now).await.unwrap();
+    relay.inject_unchecked(event_at(T0, "one"));
+    relay.set_eose_delay_ms(60);
+    let c = Arc::new(NostrRelay::new(cfg(&relay.url())).unwrap());
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        let c = c.clone();
+        let a = author();
+        tasks.push(tokio::spawn(async move {
+            c.fetch(KIND_MAILBOX, &a, Some(T0 - 300))
+                .await
+                .unwrap()
+                .len()
+        }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), 1, "every waiting fetch is answered");
+    }
+    let open = relay.max_open_subscriptions();
+    assert!(open >= 2, "they did overlap ({open})");
+    assert!(open <= 8, "never more than 8 open at once ({open})");
+    assert!(open <= 20);
+}
+
+#[tokio::test]
+async fn a_reconnect_continues_the_page_instead_of_starting_over() {
+    let now = Arc::new(AtomicU64::new(T0 + 10_000));
+    let relay = TestRelay::start(now).await.unwrap();
+    for i in 0..250u64 {
+        relay.inject_unchecked(event_at(T0 + i, &format!("e{i}")));
+    }
+    relay.set_eose_delay_ms(150);
+    let c = Arc::new(NostrRelay::new(cfg(&relay.url())).unwrap());
+    let a = author();
+    let c2 = c.clone();
+    let f = tokio::spawn(async move { c2.fetch(KIND_MAILBOX, &a, Some(T0 - 300)).await });
+    tokio::time::sleep(Duration::from_millis(400)).await; // into page 2
+    relay.drop_connections();
+    let got = f.await.unwrap().unwrap();
+    assert_eq!(got.len(), 250);
+    for r in relay.req_filters() {
+        assert_eq!(r["limit"], 200);
+        assert_ne!(r["since"], 0);
+    }
+}
+
+#[tokio::test]
+async fn an_event_dated_over_900_seconds_ahead_is_not_posted() {
+    let sys = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let now = Arc::new(AtomicU64::new(sys));
+    let relay = TestRelay::start(now).await.unwrap();
+    let c = NostrRelay::new(cfg(&relay.url())).unwrap();
+    let e = c
+        .publish(event_at(sys + 1_000, "future"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("900"), "{e}");
+    assert_eq!(relay.publishes_seen(), 0, "it never left");
+    // 800 s ahead is inside the relay's tolerance.
+    c.publish(event_at(sys + 800, "soon")).await.unwrap();
+    assert_eq!(relay.events().len(), 1);
+    // And the relay refuses one that gets past a client with a skewed clock.
+    let (mut ws, _) = tokio_tungstenite::connect_async(relay.url().as_str())
+        .await
+        .unwrap();
+    ws.send(Message::Text(
+        serde_json::json!(["EVENT", event_at(sys + 2_000, "x").to_json()])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let Some(Ok(Message::Text(t))) = ws.next().await else {
+        panic!("no reply")
+    };
+    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+    assert_eq!(v[2], false, "{v}");
+}
+
+#[tokio::test]
+async fn posting_stops_at_120_000_bytes_without_truncating() {
+    let now = Arc::new(AtomicU64::new(T0));
+    let relay = TestRelay::start(now).await.unwrap();
+    let c = NostrRelay::new(cfg(&relay.url())).unwrap();
+    // Find the content length that makes the event exactly 120,000 bytes.
+    let base = event_at(T0, "").json_len();
+    let fit = event_at(T0, &"A".repeat(120_000 - base));
+    assert_eq!(fit.json_len(), 120_000);
+    c.publish(fit).await.unwrap();
+    let over = event_at(T0, &"A".repeat(120_001 - base));
+    assert_eq!(over.json_len(), 120_001);
+    let e = c.publish(over).await.unwrap_err().to_string();
+    assert!(e.contains("120000") && e.contains("not truncated"), "{e}");
+    assert_eq!(relay.events().len(), 1);
+}

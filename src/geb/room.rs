@@ -102,10 +102,15 @@ impl GebRoom {
     async fn poll_epoch(&self, after: Option<&Cursor>) -> Result<(Vec<Polled>, SettleReport)> {
         let keys = self.group.relay_keys()?;
         let mailbox = keys.pubkey_hex()?;
+        // Never an unbounded read: from the cursor minus 300 s, or on the first
+        // read from the start of the relay's 7-day retention (events carry a
+        // NIP-40 expiration of 7 days), so no read repeats from `since: 0`.
         let since = after
             .and_then(|c| <[u8; 8]>::try_from(c.0.as_slice()).ok())
             .map(u64::from_be_bytes)
-            .map(|t| t.saturating_sub(SINCE_SLACK_SECS));
+            .map(|t| t.saturating_sub(SINCE_SLACK_SECS))
+            .unwrap_or_else(|| ((self.clock)() / 1000).saturating_sub(EXPIRY_SECS));
+        let since = Some(since);
         let mut events = self.relay.fetch(KIND_MAILBOX, &mailbox, since).await?;
         // A relay's word is not enough: drop anything that does not verify,
         // or that is not the mailbox's own.
@@ -510,8 +515,16 @@ mod tests {
         let relay = Arc::new(FakeRelay::new());
         let (b, _, _) = room_for(&relay, 2, 1_700_000_001_000);
         let keys = FakeGroup::new("x").relay_keys().unwrap();
+        // Inside the 7-day window a first read starts at.
         let mk = |_id: &str, at: u64, content: String| {
-            RelayEvent::sign(&keys.nostr_secret, KIND_MAILBOX, at, vec![], content).unwrap()
+            RelayEvent::sign(
+                &keys.nostr_secret,
+                KIND_MAILBOX,
+                1_700_000_000 + at,
+                vec![],
+                content,
+            )
+            .unwrap()
         };
         relay.inject(mk("g1", 1, "!!not base64!!".into()));
         // A forged signature on an otherwise valid event is dropped too.
@@ -559,19 +572,6 @@ mod tests {
         assert!(relay.all().is_empty());
     }
 
-    #[tokio::test]
-    async fn m3_pieces_fail_closed() {
-        let relay = Arc::new(FakeRelay::new());
-        let (did, key) = device(1);
-        let r = GebRoom::new(
-            "room-1".into(),
-            relay,
-            Arc::new(UnsupportedGroup),
-            Arc::new(LocalSigner::new(did, key)),
-            Arc::new(GuideCodec),
-            Arc::new(|| 0),
-        );
-        assert!(matches!(r.join().await, Err(Error::Unsupported(_))));
     /// Round 3 section 6: a line is at most 20,000 UTF-16 code units, counted
     /// as JavaScript counts, not bytes and not characters.
     #[tokio::test]
@@ -693,6 +693,19 @@ mod tests {
         assert!(sent[0].json_len() > 65_536 && sent[0].json_len() <= MAX_EVENT_BYTES);
     }
 
+    #[tokio::test]
+    async fn m3_pieces_fail_closed() {
+        let relay = Arc::new(FakeRelay::new());
+        let (did, key) = device(1);
+        let r = GebRoom::new(
+            "room-1".into(),
+            relay,
+            Arc::new(UnsupportedGroup),
+            Arc::new(LocalSigner::new(did, key)),
+            Arc::new(GuideCodec),
+            Arc::new(|| 0),
+        );
+        assert!(matches!(r.join().await, Err(Error::Unsupported(_))));
         assert!(matches!(
             r.post(&post_event("x")).await,
             Err(Error::Unsupported(_))

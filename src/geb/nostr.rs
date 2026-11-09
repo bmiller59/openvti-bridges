@@ -16,8 +16,18 @@
 //!   re-running a `REQ` are idempotent, which is why this is safe; every call
 //!   has a deadline, after which it fails with [`Error::Foreign`].
 //! - Every event a relay returns is checked (shape, size, id, signature, kind,
-//!   author) before the caller sees it. Events over 65,536 bytes are refused
-//!   in both directions.
+//!   author) before the caller sees it. An event we would POST over 120,000
+//!   bytes is refused (an error, never truncated); one we would read over the
+//!   relay's own 131,072-byte cap is dropped.
+//! - Relay manners (round 3 section 7; the relay was overloaded on 2026-11-07
+//!   by clients re-asking from `since: 0`): a catch-up read pages with
+//!   `limit: 200` and `until` (one page per `REQ`, the next `until` being the
+//!   oldest `created_at` just read), at most 8 catch-up `REQ`s are open at once
+//!   (the rest wait; the relay allows 20 subscriptions per connection, and we
+//!   never open more than 8), a reconnect continues the page it was on instead
+//!   of starting over, and callers re-read from the newest event they have
+//!   delivered minus 300 s (`since`). An event whose `created_at` is more than
+//!   900 s in the future is refused locally (the relay refuses it too).
 //! - Health is read from the live socket ([`NostrRelay::is_connected`]); there
 //!   is no flag set once and left set.
 //!
@@ -27,7 +37,7 @@
 //! test may reach a real relay); only the plaintext 127.0.0.1 path is.
 
 use super::traits::{GebRelay, RelayEvent};
-use super::wire::MAX_EVENT_BYTES;
+use super::wire::{MAX_EVENT_BYTES, MAX_RECV_EVENT_BYTES};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -42,6 +52,17 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 pub const MAX_MESSAGE_BYTES: usize = 262_144;
 /// Most events one fetch will collect before it stops reading.
 pub const MAX_FETCH_EVENTS: usize = 5_000;
+/// Catch-up page size: `limit` of every `REQ` (Geb's client page size, round 3
+/// section 7; the relay's own cap is 500).
+pub const CATCHUP_PAGE: usize = 200;
+/// Most catch-up `REQ`s open at once on one connection.
+pub const MAX_CATCHUP_REQS: usize = 8;
+/// Subscriptions the relay allows per connection.
+pub const MAX_SUBSCRIPTIONS: usize = 20;
+const _: () = assert!(MAX_CATCHUP_REQS <= MAX_SUBSCRIPTIONS);
+/// An event dated further ahead than this (seconds) is refused by the relay,
+/// so we never post one.
+pub const MAX_FUTURE_SECS: u64 = 900;
 
 /// Client settings.
 #[derive(Debug, Clone)]
@@ -113,6 +134,8 @@ enum Cmd {
 enum Op {
     Publish {
         event: RelayEvent,
+        /// Whether the event has been sent on the current socket.
+        sent: bool,
         reply: oneshot::Sender<Result<()>>,
         deadline: Instant,
     },
@@ -120,7 +143,16 @@ enum Op {
         kind: u32,
         author: String,
         since: Option<u64>,
+        /// The current page reads events at or before this `created_at`.
+        until: Option<u64>,
         sub: String,
+        /// Whether the current page's `REQ` is open (counts against
+        /// [`MAX_CATCHUP_REQS`]).
+        active: bool,
+        /// Events of the current page, and how many of them were new.
+        page_total: usize,
+        page_new: usize,
+        page_oldest: Option<u64>,
         events: Vec<RelayEvent>,
         seen: HashSet<String>,
         reply: oneshot::Sender<Result<Vec<RelayEvent>>>,
@@ -186,7 +218,18 @@ impl NostrRelay {
 impl GebRelay for NostrRelay {
     async fn publish(&self, event: RelayEvent) -> Result<()> {
         if event.json_len() > MAX_EVENT_BYTES {
-            return Err(Error::Foreign("event over 65,536 bytes".into()));
+            return Err(Error::Foreign(format!(
+                "event over {MAX_EVENT_BYTES} bytes; refused, not truncated"
+            )));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if event.created_at > now.saturating_add(MAX_FUTURE_SECS) {
+            return Err(Error::Foreign(format!(
+                "event created_at is more than {MAX_FUTURE_SECS} s in the future; refused"
+            )));
         }
         event.verify()?;
         let (reply, rx) = oneshot::channel();
@@ -231,6 +274,7 @@ fn into_op(cmd: Cmd, op_timeout: Duration) -> Op {
     match cmd {
         Cmd::Publish { event, reply } => Op::Publish {
             event,
+            sent: false,
             reply,
             deadline,
         },
@@ -243,7 +287,12 @@ fn into_op(cmd: Cmd, op_timeout: Duration) -> Op {
             kind,
             author,
             since,
+            until: None,
             sub: new_sub(),
+            active: false,
+            page_total: 0,
+            page_new: 0,
+            page_oldest: None,
             events: Vec::new(),
             seen: HashSet::new(),
             reply,
@@ -341,30 +390,64 @@ enum Session {
     OwnerGone,
 }
 
-async fn send_op(ws: &mut Ws, op: &mut Op) -> std::result::Result<(), ()> {
-    let text = match op {
-        Op::Publish { event, .. } => json!(["EVENT", event.to_json()]).to_string(),
-        Op::Fetch {
-            kind,
-            author,
-            since,
-            sub,
-            events,
-            seen,
-            ..
-        } => {
-            // A re-sent REQ starts again from scratch.
-            events.clear();
-            seen.clear();
-            *sub = new_sub();
-            let mut f = json!({"kinds": [kind], "authors": [author]});
-            if let (Some(s), Some(o)) = (since, f.as_object_mut()) {
-                o.insert("since".into(), json!(s));
+/// Send what can be sent: every publish not yet sent on this socket, and as
+/// many waiting catch-up pages as the [`MAX_CATCHUP_REQS`] limit allows.
+async fn flush(ws: &mut Ws, ops: &mut [Op]) -> std::result::Result<(), ()> {
+    let mut open = ops
+        .iter()
+        .filter(|o| matches!(o, Op::Fetch { active: true, .. }))
+        .count();
+    for op in ops.iter_mut() {
+        let text = match op {
+            Op::Publish { event, sent, .. } if !*sent => {
+                *sent = true;
+                json!(["EVENT", event.to_json()]).to_string()
             }
-            json!(["REQ", sub, f]).to_string()
+            Op::Fetch {
+                kind,
+                author,
+                since,
+                until,
+                sub,
+                active,
+                page_total,
+                page_new,
+                page_oldest,
+                ..
+            } if !*active && open < MAX_CATCHUP_REQS => {
+                open += 1;
+                *active = true;
+                *page_total = 0;
+                *page_new = 0;
+                *page_oldest = None;
+                *sub = new_sub();
+                let mut f = json!({"kinds": [kind], "authors": [author], "limit": CATCHUP_PAGE});
+                if let Some(o) = f.as_object_mut() {
+                    if let Some(s) = since {
+                        o.insert("since".into(), json!(s));
+                    }
+                    if let Some(u) = until {
+                        o.insert("until".into(), json!(u));
+                    }
+                }
+                json!(["REQ", sub, f]).to_string()
+            }
+            _ => continue,
+        };
+        ws.send(Message::Text(text.into())).await.map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+/// A new socket: nothing is sent or open on it yet. A catch-up keeps what it
+/// has collected and continues from its current page.
+fn reset_for_new_socket(ops: &mut [Op]) {
+    for op in ops {
+        match op {
+            Op::Publish { sent, .. } => *sent = false,
+            Op::Fetch { active, .. } => *active = false,
         }
-    };
-    ws.send(Message::Text(text.into())).await.map_err(|_| ())
+    }
 }
 
 async fn session(
@@ -374,10 +457,9 @@ async fn session(
     cfg: &NostrConfig,
 ) -> Session {
     let mut worked = false;
-    for op in ops.iter_mut() {
-        if send_op(&mut ws, op).await.is_err() {
-            return Session::Lost(worked);
-        }
+    reset_for_new_socket(ops);
+    if flush(&mut ws, ops).await.is_err() {
+        return Session::Lost(worked);
     }
     loop {
         expire(ops);
@@ -385,10 +467,8 @@ async fn session(
         tokio::select! {
             c = rx.recv() => {
                 let Some(c) = c else { return Session::OwnerGone };
-                let mut op = into_op(c, cfg.op_timeout);
-                let sent = send_op(&mut ws, &mut op).await;
-                ops.push(op);
-                if sent.is_err() { return Session::Lost(worked); }
+                ops.push(into_op(c, cfg.op_timeout));
+                if flush(&mut ws, ops).await.is_err() { return Session::Lost(worked); }
             }
             m = ws.next() => {
                 let Some(Ok(msg)) = m else { return Session::Lost(worked) };
@@ -428,7 +508,12 @@ async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Resu
                     kind,
                     author,
                     since,
+                    until,
                     sub: s,
+                    active: true,
+                    page_total,
+                    page_new,
+                    page_oldest,
                     events,
                     seen,
                     ..
@@ -443,10 +528,15 @@ async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Resu
                             if e.kind == *kind
                                 && e.pubkey == *author
                                 && since.is_none_or(|s| e.created_at >= s)
-                                && e.json_len() <= MAX_EVENT_BYTES
+                                && until.is_none_or(|u| e.created_at <= u)
+                                && e.json_len() <= MAX_RECV_EVENT_BYTES
                                 && e.verify().is_ok() =>
                         {
+                            *page_total += 1;
+                            *page_oldest =
+                                Some(page_oldest.map_or(e.created_at, |o| o.min(e.created_at)));
                             if seen.insert(e.id.clone()) {
+                                *page_new += 1;
                                 events.push(e);
                             }
                         }
@@ -461,16 +551,51 @@ async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Resu
             let Some(sub) = msg.get(1).and_then(Value::as_str) else {
                 return Ok(());
             };
-            if let Some(i) = ops
+            let Some(i) = ops
                 .iter()
-                .position(|o| matches!(o, Op::Fetch { sub: s, .. } if s == sub))
-                && let Op::Fetch { events, reply, .. } = ops.remove(i)
-            {
-                let _ = ws
-                    .send(Message::Text(json!(["CLOSE", sub]).to_string().into()))
-                    .await;
+                .position(|o| matches!(o, Op::Fetch { sub: s, active: true, .. } if s == sub))
+            else {
+                return Ok(());
+            };
+            let _ = ws
+                .send(Message::Text(json!(["CLOSE", sub]).to_string().into()))
+                .await;
+            // Another page when this one was full, made progress and there is
+            // more room; otherwise the catch-up is complete.
+            let more = match &mut ops[i] {
+                Op::Fetch {
+                    since,
+                    until,
+                    active,
+                    page_total,
+                    page_new,
+                    page_oldest,
+                    events,
+                    deadline,
+                    ..
+                } => {
+                    let next = page_oldest.filter(|o| {
+                        *page_total >= CATCHUP_PAGE
+                            && *page_new > 0
+                            && events.len() < MAX_FETCH_EVENTS
+                            && since.is_none_or(|s| *o > s)
+                    });
+                    *active = false;
+                    if let Some(o) = next {
+                        *until = Some(o);
+                        *deadline = Instant::now() + Duration::from_secs(20);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Op::Publish { .. } => false,
+            };
+            if !more && let Op::Fetch { events, reply, .. } = ops.remove(i) {
                 let _ = reply.send(Ok(events));
             }
+            // A slot is free (or a next page is due): send what is waiting.
+            return flush(ws, ops).await;
         }
         "OK" => {
             let Some(id) = msg.get(1).and_then(Value::as_str) else {
@@ -503,6 +628,7 @@ async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Resu
             {
                 ops.remove(i)
                     .fail(&format!("relay closed the subscription: {why}"));
+                return flush(ws, ops).await;
             }
         }
         "NOTICE" => tracing::debug!(notice = ?msg.get(1), "relay notice"),

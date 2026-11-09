@@ -236,6 +236,10 @@ pub struct StatefulDyad {
     codec: Arc<dyn GebCodec>,
     clock: Clock,
     core: Mutex<Option<Core>>,
+    /// Newest inbox event read this run (seconds), so a repeated read starts
+    /// at `newest - 300`, never from the start. In memory only: after a
+    /// restart the first read starts at the 7-day retention floor.
+    inbox_newest: std::sync::atomic::AtomicU64,
 }
 
 fn to_bytes<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -269,6 +273,7 @@ impl StatefulDyad {
             codec: Arc::new(GuideCodec),
             clock,
             core: Mutex::new(Some(HashMap::new())),
+            inbox_newest: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -455,9 +460,29 @@ impl StatefulDyad {
         let mut lease = self.lease()?;
         let core = lease.core.get_or_insert_with(HashMap::new);
         let inbox_pub = hex::encode(inbox::inbox_pubkey(&self.id.e_public())?);
-        let mut events = self.relay.fetch(KIND_INBOX, &inbox_pub, None).await?;
-        events.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         let now = self.now();
+        // Never an unbounded read: inbox events expire after 7 days, so the
+        // first read starts there, and later ones at the newest seen minus 300 s.
+        let newest = self.inbox_newest.load(std::sync::atomic::Ordering::SeqCst);
+        let since = if newest > 0 {
+            newest.saturating_sub(SINCE_SLACK_SECS)
+        } else {
+            now.saturating_sub(EXPIRY_SECS)
+        };
+        let mut events = self
+            .relay
+            .fetch(KIND_INBOX, &inbox_pub, Some(since))
+            .await?;
+        events.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        if let Some(last) = events
+            .iter()
+            .filter(|e| e.pubkey == inbox_pub && e.verify().is_ok())
+            .map(|e| e.created_at)
+            .max()
+        {
+            self.inbox_newest
+                .fetch_max(last, std::sync::atomic::Ordering::SeqCst);
+        }
         let mut out: Vec<ReceivedInvitation> = Vec::new();
         for ev in events {
             if ev.pubkey != inbox_pub || ev.kind != KIND_INBOX || ev.verify().is_err() {
@@ -662,8 +687,17 @@ impl StatefulDyad {
         let peer_e = e_pub_of(peer)?;
         let keys = pair_keys(&self.id.e_secret, &peer_e)?;
         let mailbox = keys.pubkey_hex()?;
-        let since = (p.conn.newest > 0).then(|| p.conn.newest.saturating_sub(SINCE_SLACK_SECS));
-        let mut events = self.relay.fetch(KIND_MAILBOX, &mailbox, since).await?;
+        // Never `since: 0` / unbounded: the newest seen minus 300 s, or on the
+        // first read the 7-day retention floor.
+        let since = if p.conn.newest > 0 {
+            p.conn.newest.saturating_sub(SINCE_SLACK_SECS)
+        } else {
+            now.saturating_sub(EXPIRY_SECS)
+        };
+        let mut events = self
+            .relay
+            .fetch(KIND_MAILBOX, &mailbox, Some(since))
+            .await?;
         // Relays return newest first; open oldest first.
         events.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         let mine = my_side(&self.id.did, peer)?;
