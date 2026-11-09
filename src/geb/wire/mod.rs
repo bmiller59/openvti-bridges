@@ -335,7 +335,19 @@ pub enum GroupOp {
     /// `rs` when seated (round 3 section 3); silence never commits.
     #[serde(rename = "seat-check")]
     SeatCheck { room: RoomRef, e: u64 },
-    /// A group op this bridge does not implement (`rc`, `seat-ask`, `leave`, or
+    /// `{k:"g", op:"leave", room:{id}, by, at, sig}`: a signed leave
+    /// (round 2 section 8, round 4 Q7). `sig` is `sign_json` over
+    /// `{t:"leave", v:1, room, by, at}` by the device DID `by`. Received only:
+    /// the bridge never sends a leave. Verified at intake (`geb::leave`); a
+    /// malformed one parses as [`GroupOp::Ignored`] and is acked.
+    #[serde(rename = "leave")]
+    Leave {
+        room: RoomRef,
+        by: String,
+        at: u64,
+        sig: String,
+    },
+    /// A group op this bridge does not implement (`rc`, `seat-ask`, or
     /// any other `op`). Never built by serde: only [`parse_frame`] makes it,
     /// so a peer's unknown op is not a parse failure. It carries the op name
     /// for the log and nothing else; it is acked and ignored (see
@@ -345,7 +357,7 @@ pub enum GroupOp {
 }
 
 /// The `op` values [`GroupOp`] has typed variants for.
-const KNOWN_GROUP_OPS: [&str; 7] = [
+const KNOWN_GROUP_OPS: [&str; 8] = [
     "kp-stock",
     "kp-req",
     "rs",
@@ -353,17 +365,26 @@ const KNOWN_GROUP_OPS: [&str; 7] = [
     "welcome",
     "kp-low",
     "seat-check",
+    "leave",
 ];
 
 /// Parse the JSON of a dyad frame. Strict about *kinds* (an unknown `k`
 /// fails: a kind may carry authority, so the caller fails closed), tolerant of
 /// *group ops*: `{k:"g", op:<anything else>}` is [`GroupOp::Ignored`], because
-/// Geb sends ops this bridge does not build (`rc`, `seat-ask`, `leave`) and an
+/// Geb sends ops this bridge does not build (`rc`, `seat-ask`) and an
 /// op without authority here must neither fail the parse nor be dropped. A
 /// known op with a malformed body, or a `g` frame with no string `op`, still
 /// fails.
 pub fn parse_frame(bytes: &[u8]) -> Result<Frame> {
     let v: Value = serde_json::from_slice(bytes).map_err(|e| Error::Wire(format!("frame: {e}")))?;
+    // A `leave` with a malformed body is not a parse failure: Geb acks a frame
+    // before it reads its op, so ours is acked and ignored too.
+    if v.get("k").and_then(Value::as_str) == Some("g")
+        && v.get("op").and_then(Value::as_str) == Some("leave")
+    {
+        return Ok(serde_json::from_value(v)
+            .unwrap_or_else(|_| Frame::Group(GroupOp::Ignored("leave".into()))));
+    }
     if v.get("k").and_then(Value::as_str) == Some("g")
         && let Some(op) = v.get("op").and_then(Value::as_str)
         && !KNOWN_GROUP_OPS.contains(&op)
@@ -751,7 +772,7 @@ mod tests {
 
     #[test]
     fn unknown_group_ops_parse_as_ignored_but_unknown_kinds_and_bad_known_ops_fail() {
-        for op in ["rc", "seat-ask", "leave", "brand-new"] {
+        for op in ["rc", "seat-ask", "brand-new"] {
             let j = json!({"k":"g","op":op,"room":{"id":"r"},"e":1,"c":"AA"}).to_string();
             assert_eq!(
                 parse_frame(j.as_bytes()).unwrap(),
@@ -765,6 +786,30 @@ mod tests {
             panic!()
         };
         assert!(n.len() <= 32 && !n.contains('\n'));
+        // `leave` is typed now (round 4 Q7); a malformed one is ignored, not a
+        // failure.
+        let j = json!({"k":"g","op":"leave","room":{"id":"geb-room-0001"},"by":"did:x","at":1,"sig":"s"});
+        assert_eq!(
+            parse_frame(j.to_string().as_bytes()).unwrap(),
+            Frame::Group(GroupOp::Leave {
+                room: RoomRef {
+                    id: "geb-room-0001".into(),
+                    name: None
+                },
+                by: "did:x".into(),
+                at: 1,
+                sig: "s".into()
+            })
+        );
+        for bad in [
+            json!({"k":"g","op":"leave"}),
+            json!({"k":"g","op":"leave","room":{"id":"r"},"by":"d","at":-1,"sig":"s"}),
+        ] {
+            assert_eq!(
+                parse_frame(bad.to_string().as_bytes()).unwrap(),
+                Frame::Group(GroupOp::Ignored("leave".into()))
+            );
+        }
         // Known ops still parse typed.
         let j = json!({"k":"g","op":"kp-req","room":{"id":"r"}}).to_string();
         assert!(matches!(

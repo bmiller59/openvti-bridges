@@ -183,25 +183,26 @@ fn parse_inner(json: &str) -> Option<RoomPolicy> {
 /// leave" (from the signed leaves `{t:"lv", at, ls}` it has taken,
 /// `leave code:33-60`).
 ///
-/// We do not have Geb's persona code or leave code, so the only production
-/// implementation is [`NoLocalKnowledge`], which reports
-/// `can_evaluate() == false`. While that is false [`valid_commit`] answers
-/// [`CommitVerdict::Undecidable`] for every commit that removes a member or
-/// changes the policy (and for adds to a direct room), and the caller must
-/// stop rather than merge or skip it.
+/// The bridge takes signed leaves (`geb::leave`) but holds **no persona
+/// store** (persona-card intake is not built), so `same_person` is exact
+/// equality only and `can_evaluate()` is false in production. While that is
+/// false [`valid_commit`] answers [`CommitVerdict::Undecidable`] only for the
+/// commits a persona card could still rescue (see there), and the caller
+/// halts rather than merge or skip them.
 pub trait CommitCheckInputs: Send + Sync {
     /// Whether the two answers below are real. False means they are guesses
     /// and `validCommit` cannot be evaluated like Geb.
     fn can_evaluate(&self) -> bool;
     /// Whether devices (or persons) `a` and `b` are the same person.
     fn same_person(&self, a: &str, b: &str) -> bool;
-    /// Whether this device holds a signed leave for the person `device_did`
-    /// belongs to.
+    /// Whether this device holds a signed leave covering `device_did` (exactly
+    /// that DID without a persona store).
     fn has_signed_leave(&self, device_did: &str) -> bool;
 }
 
-/// The production inputs until persona cards and signed leaves exist:
-/// nothing is known, and [`CommitCheckInputs::can_evaluate`] is false.
+/// Inputs with no persona store and no signed leaves: nothing is known, and
+/// [`CommitCheckInputs::can_evaluate`] is false. (Production wraps this with
+/// the signed leaves the client holds.)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoLocalKnowledge;
 

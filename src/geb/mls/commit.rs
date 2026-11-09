@@ -3,10 +3,12 @@
 //!
 //! # Merging with partial local knowledge (read this before changing it)
 //!
-//! Geb's `validCommit` needs two things the bridge does not have: persona
-//! cards ("same person") and signed leaves (`{t:"lv"}`). With the production
-//! inputs ([`NoLocalKnowledge`](crate::geb::policy::NoLocalKnowledge),
-//! `can_evaluate() == false`) this module merges a commit **only if all of**:
+//! Geb's `validCommit` needs persona cards ("same person"), which the bridge
+//! does not hold; the signed leaves (`{t:"lv"}` lines, dyad `leave` frames) it
+//! does take (`geb::leave`). With the production inputs
+//! ([`NoLocalKnowledge`](crate::geb::policy::NoLocalKnowledge) plus the held
+//! signed leaves, `can_evaluate() == false`) this module merges a commit
+//! **only if all of**:
 //!
 //! 1. it processes under OpenMLS at our epoch (signature, membership tag,
 //!    confirmation tag, required capabilities: the same checks every member

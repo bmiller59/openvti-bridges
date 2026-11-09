@@ -183,6 +183,24 @@ impl GebRoom {
             if opened.sender_did == self.signer.did() {
                 continue; // our own leaf
             }
+            // A signed leave `{t:"lv", at, ls, sg}` (round 4 Q7): taken only when
+            // the line's own `sg` verifies for its sender; the group verifies
+            // `ls` and keeps the newest per signer. It is not a line.
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&opened.plaintext)
+                && let Some(lv) = super::leave::parse_leave_line(&v)
+            {
+                if super::leave::verify_room_sg(&self.room_id, &opened.sender_did, &v).is_ok() {
+                    if let Err(e) = self
+                        .group
+                        .note_signed_leave(&opened.sender_did, lv.at, &lv.ls)
+                    {
+                        tracing::warn!(error = %e, "could not keep a signed leave");
+                    }
+                } else {
+                    tracing::debug!("dropping a leave line whose sg does not verify");
+                }
+                continue;
+            }
             let line = match self.codec.decode_line(&opened.plaintext) {
                 Ok(l) => l,
                 // A kind we do not read (a reaction, `wp`, anything newer) is

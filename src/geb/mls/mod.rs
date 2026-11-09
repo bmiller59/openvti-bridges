@@ -55,8 +55,8 @@
 //!   `kp-req` / `welcome` while unseated, and `GebDyad::recv` clears what it
 //!   hands over, so the dyad must not be shared with another consumer of group
 //!   frames meanwhile.
-//! - Leaving: Geb's leave is a signed `{t:"lv"}` (leave code), which is
-//!   not built; `leave` fails closed.
+//! - Leaving: Geb's leave is a signed `{t:"lv"}` (leave code); we RECEIVE
+//!   one (`geb::leave`, round 4 Q7) but never send one: `leave` fails closed.
 //! - State is in memory unless `MlsGroupClient::with_state_store` is used; then a
 //!   restart resumes seated (see there for what is saved and what a restart
 //!   still loses: the settle queue and the dedup window).

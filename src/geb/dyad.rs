@@ -25,8 +25,10 @@
 //! - whether a receiver re-acks a frame it has already opened (we do);
 //! - whether an authenticated frame of an unknown kind (`k`) or non-JSON text is
 //!   acked (we drop it unacked; Geb shows non-JSON text). An unknown group
-//!   `op` (`rc`, `seat-ask`, `leave`, anything new) is NOT in this class: it is
-//!   acked and ignored (`wire::parse_frame`, `GroupOp::Ignored`);
+//!   `op` (`rc`, `seat-ask`, anything new) is NOT in this class: it is
+//!   acked and ignored (`wire::parse_frame`, `GroupOp::Ignored`). `leave` is a
+//!   real op (round 4 Q7): handed to the consumer, which verifies it, and
+//!   acked; a malformed one is acked and ignored;
 //! - the inbox is read from the start (no `since`) because inbox events expire
 //!   after 7 days; a processed invitation is remembered by its connection;
 //! - a second invitation from a peer we already hold a connection record for
@@ -832,7 +834,7 @@ impl StatefulDyad {
                                 to_ack.push(id);
                             }
                             // An op this bridge does not build (`rc`, `seat-ask`,
-                            // `leave`, anything new): no authority here, so it
+                            // anything new): no authority here, so it
                             // is neither a failure nor queued. Opening it
                             // already advanced our receive chain, so the frame
                             // is recorded done and ACKED: an unacked frame
@@ -1213,7 +1215,7 @@ mod tests {
         let ignored = [
             r#"{"k":"g","op":"rc","room":{"id":"geb-room-0001"},"e":3,"c":"AAAA"}"#,
             r#"{"k":"g","op":"seat-ask","room":{"id":"geb-room-0001"},"kp":"AAAA"}"#,
-            r#"{"k":"g","op":"leave","room":{"id":"geb-room-0001"},"by":"did:x","at":1,"sig":"s"}"#,
+            r#"{"k":"g","op":"leave","room":{"id":"geb-room-0001"}}"#, // malformed: acked, ignored
             r#"{"k":"g","op":"something-new","x":1}"#,
             // An `rl` batch (which may carry `{t:"wp"}` lines, section "what
             // changes" of round 3) is never opened here: no effect.
@@ -1243,6 +1245,27 @@ mod tests {
         let r = w.a.sync(w.b.did()).await.unwrap();
         assert_eq!(r.acked, 7, "{r:?}");
         assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), refused.len());
+    }
+
+    /// Round 4 Q7: a well-formed `leave` is a real op, handed to the consumer
+    /// (which verifies it) and still acked.
+    #[tokio::test]
+    async fn a_well_formed_leave_is_handed_to_the_consumer_and_acked() {
+        let w = world();
+        connect(&w).await;
+        w.b.recv(w.a.did()).await.unwrap();
+        let j = r#"{"k":"g","op":"leave","room":{"id":"geb-room-0001"},"by":"did:peer:2.x","at":5,"sig":"s"}"#;
+        w.a.send_raw(w.b.did(), j.as_bytes()).await.unwrap();
+        w.now.fetch_add(1, Ordering::SeqCst);
+        let got = w.b.recv(w.a.did()).await.unwrap();
+        assert!(
+            matches!(got.as_slice(), [Frame::Group(GroupOp::Leave { at: 5, .. })]),
+            "{got:?}"
+        );
+        w.now.fetch_add(1, Ordering::SeqCst);
+        let r = w.a.sync(w.b.did()).await.unwrap();
+        assert!(r.acked >= 1, "{r:?}");
+        assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), 0);
     }
 
     #[tokio::test]

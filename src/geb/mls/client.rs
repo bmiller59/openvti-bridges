@@ -9,6 +9,7 @@ use crate::foreign::JoinState;
 use crate::geb::crypto::b64_decode;
 use crate::geb::crypto::leaf;
 use crate::geb::crypto::rendezvous::RelayKeys;
+use crate::geb::leave::LeaveBook;
 use crate::geb::policy::CommitCheckInputs;
 use crate::geb::settle::{CommitHash, Outcome, SettleQueue, Verdict};
 use crate::geb::traits::{GebDyad, GebGroup, GebSigner, OpenedMessage, SettleReport};
@@ -140,6 +141,9 @@ struct Snapshot {
     stock_gen: u64,
     #[serde(default)]
     contacts: std::collections::BTreeMap<String, Contact>,
+    /// The newest verified signed leave per signer (round 4 Q7).
+    #[serde(default)]
+    leaves: LeaveBook,
     /// Set once a merged commit removed us; the link is over.
     removed: Option<String>,
     /// OpenMLS storage entries, base64.
@@ -161,7 +165,28 @@ struct Inner {
     queue: SettleQueue,
     judged: HashMap<CommitHash, Verdict>,
     contacts: std::collections::BTreeMap<String, Contact>,
+    /// Signed leaves held; they feed `validCommit` rule 2.
+    leaves: LeaveBook,
     last_service_ms: u64,
+}
+
+/// The configured inputs plus the signed leaves this client holds: a leave
+/// covers its signer's exact DID (there is no persona store to widen it).
+struct WithLeaves<'a> {
+    base: &'a dyn CommitCheckInputs,
+    leaves: &'a LeaveBook,
+}
+
+impl CommitCheckInputs for WithLeaves<'_> {
+    fn can_evaluate(&self) -> bool {
+        self.base.can_evaluate()
+    }
+    fn same_person(&self, a: &str, b: &str) -> bool {
+        self.base.same_person(a, b)
+    }
+    fn has_signed_leave(&self, device_did: &str) -> bool {
+        self.leaves.covers(device_did) || self.base.has_signed_leave(device_did)
+    }
 }
 
 /// The Geb-side MLS client.
@@ -211,6 +236,7 @@ impl MlsGroupClient {
                 queue: SettleQueue::new(),
                 judged: HashMap::new(),
                 contacts: Default::default(),
+                leaves: LeaveBook::default(),
                 last_service_ms: 0,
             }),
             persist: None,
@@ -267,6 +293,7 @@ impl MlsGroupClient {
                 }
             }
             g.contacts = snap.contacts;
+            g.leaves = snap.leaves;
             if g.contacts.is_empty() && snap.stocked && snap.stock_gen > 0 {
                 // A snapshot from before stock state was per contact: one
                 // stock of this generation went to every peer. Their keys are
@@ -324,6 +351,7 @@ impl MlsGroupClient {
             stocked: false,
             stock_gen: 0,
             contacts: g.contacts.clone(),
+            leaves: g.leaves.clone(),
             removed,
             values,
         };
@@ -668,6 +696,9 @@ impl MlsGroupClient {
                     Frame::Group(GroupOp::SeatCheck { room, .. }) => {
                         self.answer_seat_check(peer, &room).await;
                     }
+                    Frame::Group(GroupOp::Leave { room, by, at, sig }) => {
+                        self.take_leave_frame(&room, &by, at, &sig);
+                    }
                     other => tracing::debug!(?other, "ignoring a dyad frame while seated"),
                 }
             }
@@ -765,6 +796,37 @@ impl MlsGroupClient {
         Ok(RelayKeys::from_parts(x(LABEL_NOSTR)?, x(LABEL_AEAD)?))
     }
 
+    /// A dyad `leave` frame: verified like a room line's `ls`, and kept when it
+    /// is the signer's newest. A frame for another room is dropped.
+    fn take_leave_frame(&self, room: &RoomRef, by: &str, at: u64, sig: &str) {
+        if room.id != self.cfg.room_id {
+            return;
+        }
+        if let Err(e) = self.take_signed_leave(by, at, sig) {
+            tracing::warn!(error = %e, "could not keep a signed leave");
+        }
+    }
+
+    /// Verify and keep a signed leave by the device DID `by` for this room
+    /// (the same payload whether it came as a room line or a dyad frame).
+    /// Returns whether it was new. Persisted before return, so a restart keeps
+    /// it.
+    pub fn take_signed_leave(&self, by: &str, at: u64, sig: &str) -> Result<bool> {
+        let mut g = self.lock()?;
+        if !g.leaves.take(&self.cfg.room_id, by, at, sig) {
+            return Ok(false);
+        }
+        self.persist_state(&g)?;
+        Ok(true)
+    }
+
+    /// The device DIDs a held signed leave covers.
+    pub fn signed_leaves(&self) -> Vec<String> {
+        self.lock()
+            .map(|g| g.leaves.signers().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
     fn rs_frame(&self) -> Frame {
         Frame::Group(GroupOp::Rs {
             room: Some(RoomRef {
@@ -840,6 +902,9 @@ impl GebGroup for MlsGroupClient {
                     Frame::Group(GroupOp::SeatCheck { room, .. }) => {
                         self.answer_seat_check(peer, &room).await;
                     }
+                    Frame::Group(GroupOp::Leave { room, by, at, sig }) => {
+                        self.take_leave_frame(&room, &by, at, &sig);
+                    }
                     Frame::Group(GroupOp::Welcome { room, w, .. }) => {
                         let mut g = self.lock()?;
                         match self.join_from_welcome(&mut g, &room, &w) {
@@ -872,6 +937,10 @@ impl GebGroup for MlsGroupClient {
     fn relay_keys(&self) -> Result<RelayKeys> {
         let g = self.lock()?;
         Self::keys_of(&g, &self.cfg.room_id)
+    }
+
+    fn note_signed_leave(&self, by: &str, at: u64, sig: &str) -> Result<bool> {
+        self.take_signed_leave(by, at, sig)
     }
 
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -969,6 +1038,7 @@ impl GebGroup for MlsGroupClient {
                 state,
                 queue,
                 judged,
+                leaves,
                 ..
             } = &mut *g;
             let State::Seated(grp) = state else {
@@ -981,7 +1051,11 @@ impl GebGroup for MlsGroupClient {
             queue.prune_below(epoch);
             let window = group_policy(grp).settle_window_ms;
             let outcome = {
-                let mut judge = GroupJudge::new(grp, provider, self.inputs.as_ref(), judged);
+                let inputs = WithLeaves {
+                    base: self.inputs.as_ref(),
+                    leaves,
+                };
+                let mut judge = GroupJudge::new(grp, provider, &inputs, judged);
                 queue.settle(epoch, window, now_ms, &mut judge)
             };
             let mut epoch_changed = false;

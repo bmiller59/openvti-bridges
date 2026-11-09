@@ -14,7 +14,7 @@ use crate::geb::policy::{CommitCheckInputs, NoLocalKnowledge};
 use crate::geb::room::{GebRoom, KIND_MAILBOX};
 use crate::geb::settle::commit_hash;
 use crate::geb::traits::{GebCodec, GebGroup, GebRelay, GebSigner};
-use crate::geb::wire::{Envelope, Frame, GroupOp, signing_doc};
+use crate::geb::wire::{Envelope, Frame, GroupOp, RoomRef, signing_doc};
 use crate::model::{AuthorCheck, BridgeEvent, EventKind, Origin};
 use ed25519_dalek::SigningKey;
 use openmls::prelude::*;
@@ -2033,7 +2033,61 @@ async fn a_welcome_into_a_direct_room_is_refused_and_nothing_is_kept() {
     }
 }
 
-// ---- round 4: Q6 removes ------------------------------------------------------------
+// ---- round 4: Q6 removes, Q7 signed leaves -----------------------------------------
+
+/// A room plaintext `{t:"lv", at, ls, sg}` as `sender` posts it. `ls_by` is the
+/// DID the leave names and `ls_key` signs it; `sg_key` signs the line (honest:
+/// the sender's own key).
+fn lv_plaintext(
+    room: &str,
+    sender: &str,
+    at: u64,
+    ls_by: &str,
+    ls_key: &SigningKey,
+    sg_key: &SigningKey,
+) -> Vec<u8> {
+    let ls = crate::geb::crypto::sign::sign_json(
+        ls_key,
+        &crate::geb::leave::leave_payload(room, ls_by, at),
+    )
+    .unwrap();
+    let mut line = serde_json::json!({"t": "lv", "at": at, "ls": ls});
+    let doc = serde_json::json!({"v": 1, "room": room, "author": sender, "body": line});
+    line["sg"] = serde_json::json!(crate::geb::crypto::sign::sign_json(sg_key, &doc).unwrap());
+    serde_json::to_vec(&line).unwrap()
+}
+
+fn seal_pt(s: &mut Sim, pt: &[u8]) -> Vec<u8> {
+    use tls_codec::Serialize as _;
+    let (p, sg) = (&s.provider, &s.signer);
+    s.group
+        .as_mut()
+        .unwrap()
+        .create_message(p, sg, pt)
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap()
+}
+
+fn leave_frame(by: &str, at: u64, sig: &str) -> Frame {
+    Frame::Group(GroupOp::Leave {
+        room: RoomRef {
+            id: ROOM.into(),
+            name: None,
+        },
+        by: by.into(),
+        at,
+        sig: sig.into(),
+    })
+}
+
+fn good_leave(room: &str, who: &Sim, at: u64) -> String {
+    crate::geb::crypto::sign::sign_json(
+        &who.dev,
+        &crate::geb::leave::leave_payload(room, &who.did, at),
+    )
+    .unwrap()
+}
 
 /// F3 (4): a non-root, non-admin member's re-seat of someone else merges with
 /// no card (any member with a bound leaf), and in a v1 policy room any bound
@@ -2087,6 +2141,32 @@ async fn an_admin_may_remove_in_a_v2_room_and_a_plain_member_may_not() {
     assert!(!w.client.members().contains(&l.did));
 }
 
+/// F4 + F3 (2): a held signed leave lets a plain member's Remove of the
+/// leaver merge; without one it halts (no persona store); with a persona
+/// store it is refused and the walk goes on.
+#[tokio::test]
+async fn a_signed_leave_room_line_lets_the_healer_remove_the_leaver() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    let mut l = Sim::new(60);
+    add_member(&mut w, &mut l).await;
+    // L's signed leave arrives as a room line under the current epoch.
+    let pt = lv_plaintext(ROOM, &l.did, 777, &l.did, &l.dev, &l.dev);
+    let m = seal_pt(&mut l, &pt);
+    w.post_ml(&l, &m).await;
+    let got = w.poll().await.unwrap();
+    assert!(got.is_empty(), "a leave is not a line");
+    assert_eq!(w.client.signed_leaves(), vec![l.did.clone()]);
+    w.at(w.now() + 10_000);
+    // B (not root, not admin) removes L: covered by the signed leave, no adds.
+    let c = w.b.stage_remove(&l.did);
+    w.post_mc(&w.b, &c).await;
+    w.b.merge_pending();
+    settle_posted(&w).await.unwrap();
+    assert!(!w.client.members().contains(&l.did));
+    assert!(w.our_keys_match(&w.b));
+}
+
 #[tokio::test]
 async fn without_a_signed_leave_the_healers_remove_halts_or_is_refused_by_who_holds_the_cards() {
     // No persona store (production): the card-dependent residual halts.
@@ -2131,5 +2211,132 @@ async fn without_a_signed_leave_the_healers_remove_halts_or_is_refused_by_who_ho
     assert!(
         w.client.members().contains(&l.did),
         "the remove was refused"
+    );
+}
+
+#[tokio::test]
+async fn a_forged_or_misdirected_leave_is_dropped() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    let mut l = Sim::new(60);
+    add_member(&mut w, &mut l).await;
+    let b_dev = w.b.dev.clone();
+    // (1) L's line, but `ls` signed by B's key: forged.
+    let pt = lv_plaintext(ROOM, &l.did, 5, &l.did, &b_dev, &l.dev);
+    let m = seal_pt(&mut l, &pt);
+    w.post_ml(&l, &m).await;
+    // (2) the line's `sg` is not the sender's.
+    let pt = lv_plaintext(ROOM, &l.did, 6, &l.did, &l.dev, &b_dev);
+    let m = seal_pt(&mut l, &pt);
+    w.post_ml(&l, &m).await;
+    // (3) a member posting someone else's leave as a room line: `ls` names L
+    // but the sender is B, and `ls` is verified for the sender.
+    let pt = lv_plaintext(ROOM, &w.b.did, 7, &l.did, &l.dev, &b_dev);
+    let m = seal_pt(&mut w.b, &pt);
+    w.post_ml(&w.b, &m).await;
+    // (4) a leave signed for another room.
+    let pt = lv_plaintext("geb-room-9999", &l.did, 8, &l.did, &l.dev, &l.dev);
+    let m = seal_pt(&mut l, &pt);
+    w.post_ml(&l, &m).await;
+    // (5) dyad frames: a bad signature, a bad DID, and another room's leave.
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        leave_frame(&l.did, 9, &good_leave(ROOM, &w.b, 9)),
+    );
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        leave_frame("did:peer:2.zz", 9, "AAAA"),
+    );
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        leave_frame(&l.did, 9, &good_leave("geb-room-9999", &l, 9)),
+    );
+    w.poll().await.unwrap();
+    assert!(w.client.signed_leaves().is_empty(), "nothing was taken");
+    // So B's Remove of L is not covered: it halts (no persona store).
+    w.at(w.now() + 10_000);
+    let c = w.b.stage_remove(&l.did);
+    w.post_mc(&w.b, &c).await;
+    w.b.drop_pending();
+    let t = w.now();
+    w.poll().await.unwrap();
+    w.at(t + 3000);
+    assert!(matches!(w.poll().await, Err(Error::UndecidableCommit(_))));
+}
+
+/// The dyad `leave` frame is a real op: taken, verified like the room line,
+/// and the newest per signer wins.
+#[tokio::test]
+async fn a_dyad_leave_frame_is_taken_and_the_newest_wins() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    let l = Sim::new(60);
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        leave_frame(&l.did, 20, &good_leave(ROOM, &l, 20)),
+    );
+    w.at(w.now() + 31_000);
+    w.poll().await.unwrap();
+    assert_eq!(w.client.signed_leaves(), vec![l.did.clone()]);
+    // An older leave changes nothing; a newer one replaces.
+    assert!(
+        !w.client
+            .take_signed_leave(&l.did, 10, &good_leave(ROOM, &l, 10))
+            .unwrap()
+    );
+    assert!(
+        !w.client
+            .take_signed_leave(&l.did, 20, &good_leave(ROOM, &l, 20))
+            .unwrap()
+    );
+    assert!(
+        w.client
+            .take_signed_leave(&l.did, 30, &good_leave(ROOM, &l, 30))
+            .unwrap()
+    );
+    assert_eq!(w.client.signed_leaves().len(), 1);
+}
+
+#[tokio::test]
+async fn held_signed_leaves_survive_a_restart() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    let store = Arc::new(MemState::default());
+    let vault = MemoryVault::default();
+    let (c1, room1) = restarted(&w, store.clone(), &vault);
+    assert_eq!(room1.join().await.unwrap(), JoinState::Pending);
+    let stock = w.bus.take(&w.our_did, &w.a.did);
+    let Some(Frame::Group(GroupOp::KpStock { kps, .. })) = stock.first().cloned() else {
+        panic!("no kp-stock")
+    };
+    let (commit, welcome) = w.a.stage_add(parse_kp(&kps[0]));
+    w.a.merge_pending();
+    w.b.apply(&commit).unwrap();
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        welcome_frame(ROOM, &w.a.did, &w.policy, &welcome),
+    );
+    assert_eq!(room1.join().await.unwrap(), JoinState::Seated);
+    let l = Sim::new(60);
+    assert!(
+        c1.take_signed_leave(&l.did, 5, &good_leave(ROOM, &l, 5))
+            .unwrap()
+    );
+    drop((c1, room1));
+    let (c2, _room2) = restarted(&w, store, &vault);
+    assert_eq!(c2.signed_leaves(), vec![l.did.clone()]);
+    // And it still covers the leaver after the restart: a newer one replaces
+    // the persisted one, an older one does not.
+    assert!(
+        !c2.take_signed_leave(&l.did, 4, &good_leave(ROOM, &l, 4))
+            .unwrap()
+    );
+    assert!(
+        c2.take_signed_leave(&l.did, 6, &good_leave(ROOM, &l, 6))
+            .unwrap()
     );
 }

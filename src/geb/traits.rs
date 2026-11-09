@@ -83,6 +83,13 @@ pub trait GebGroup: Send + Sync {
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>>;
     /// Open an application message.
     fn open(&self, message: &[u8]) -> Result<OpenedMessage>;
+    /// A signed leave `{t:"lv", at, ls}` read from the room (the line's `sg`
+    /// already verified by the caller) by `by`, the MLS sender. The group
+    /// verifies `ls` and keeps the newest per signer. Returns whether it was
+    /// new. The default keeps nothing.
+    fn note_signed_leave(&self, _by: &str, _at: u64, _sig: &str) -> Result<bool> {
+        Ok(false)
+    }
     /// Hold a commit read from the room (`mc`): `parent_epoch` is `mc.e`,
     /// `event_secs` the relay event's `created_at`, `now_ms` the local clock.
     /// Never applies it. The default fails closed: a group that cannot run the
