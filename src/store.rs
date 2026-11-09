@@ -23,6 +23,18 @@ pub enum StateSpace {
     Ratchets,
 }
 
+/// What one [`BridgeStore::prune`] removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Journal rows deleted.
+    pub journal: usize,
+    /// Outbox rows deleted (only rows whose remote effect is confirmed, or
+    /// that were retired).
+    pub outbox: usize,
+    /// Expiring xref keys (`foreign:*`, `failed:*`) deleted.
+    pub xref: usize,
+}
+
 /// What the pump persists.
 #[async_trait]
 pub trait BridgeStore: Send + Sync {
@@ -40,6 +52,37 @@ pub trait BridgeStore: Send + Sync {
     async fn outbox_receipt(&self, key: &str) -> Result<Option<Receipt>>;
     /// Outbound events never posted, in insertion-key order.
     async fn outbox_unposted(&self) -> Result<Vec<(String, BridgeEvent)>>;
+    /// The keys of the outbound events not yet posted and not retired, with no
+    /// event bodies read: what `status` counts, so it needs no keys. The
+    /// default derives it from [`Self::outbox_unposted`].
+    async fn outbox_pending_keys(&self) -> Result<Vec<String>> {
+        Ok(self
+            .outbox_unposted()
+            .await?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect())
+    }
+    /// Give up on an outbox entry for good (a dead-lettered one): it stops
+    /// counting as pending and becomes prunable after the retention period. A
+    /// store with no pruning keeps the entry (the pump's own `failed:` check
+    /// still stops it being posted).
+    async fn outbox_retire(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Like [`Self::xref_set`] for a key that may be forgotten after the
+    /// retention period (`foreign:*` and `failed:*`). Never for `vtc:*` or
+    /// `vtkey:*`, which prevent re-bridging.
+    async fn xref_set_expiring(&self, a: &str, b: &str) -> Result<()> {
+        self.xref_set(a, b).await
+    }
+    /// Delete what is older than `retention_secs` and no longer needed: journal
+    /// rows, outbox rows whose remote effect is confirmed (or that were
+    /// retired) and the expiring xref keys. Never an entry that was not
+    /// posted. A store with no pruning removes nothing.
+    async fn prune(&self, _now_secs: u64, _retention_secs: u64) -> Result<PruneStats> {
+        Ok(PruneStats::default())
+    }
     /// Read an adapter-owned record. A store that does not provide adapter
     /// state refuses rather than pretending.
     async fn state_get(&self, _space: StateSpace, _key: &str) -> Result<Option<Vec<u8>>> {

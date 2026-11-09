@@ -235,6 +235,7 @@ impl Env {
             display_name: None,
             announce: false,
             notices: Default::default(),
+            retention_days: vti_geb_bridge::pump::DEFAULT_RETENTION_DAYS,
         };
         Env {
             world,

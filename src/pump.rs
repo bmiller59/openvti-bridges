@@ -73,7 +73,18 @@ pub struct LinkRuntime {
     pub announce: bool,
     /// Wording of retraction and update notices.
     pub notices: Notices,
+    /// Days a confirmed outbox row, a journal row and an expiring xref key are
+    /// kept before they are pruned. At least 1.
+    pub retention_days: u32,
 }
+
+/// The default retention: it matches Geb's relay retention (seven days), so
+/// nothing is forgotten that the foreign relay could still replay.
+pub const DEFAULT_RETENTION_DAYS: u32 = 7;
+/// The pump prunes at most this often.
+const PRUNE_EVERY_SECS: u64 = 3_600;
+/// Cursor: Unix seconds of the last successful prune.
+pub const LAST_PRUNE: &str = "last_prune";
 
 impl LinkRuntime {
     /// A link with no display name, no announcement and default notices.
@@ -87,6 +98,7 @@ impl LinkRuntime {
             display_name: None,
             announce: false,
             notices: Notices::default(),
+            retention_days: DEFAULT_RETENTION_DAYS,
         }
     }
 
@@ -277,7 +289,41 @@ impl Pump {
         }
         let r = self.run_directions(&mut report).await;
         self.guard(r).await?;
+        self.maybe_prune().await;
         Ok(report)
+    }
+
+    /// Prune what is past retention, at most once an hour. Housekeeping: a
+    /// failure is logged and tried again later, never a tick error.
+    async fn maybe_prune(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = match self.store.cursor(LAST_PRUNE).await {
+            Ok(c) => c
+                .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+                .map(u64::from_be_bytes),
+            Err(_) => return,
+        };
+        if last.is_some_and(|l| now.saturating_sub(l) < PRUNE_EVERY_SECS) {
+            return;
+        }
+        let keep = u64::from(self.link.retention_days.max(1)) * 86_400;
+        match self.store.prune(now, keep).await {
+            Ok(st) => {
+                if st.journal + st.outbox + st.xref > 0 {
+                    tracing::info!(link = %self.link.id, journal = st.journal,
+                        outbox = st.outbox, xref = st.xref, "pruned past retention");
+                }
+                if let Err(e) = self.store.set_cursor(LAST_PRUNE, &now.to_be_bytes()).await {
+                    tracing::warn!(link = %self.link.id, error = %e, "could not record the prune");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(link = %self.link.id, error = %e, "pruning failed; will retry")
+            }
+        }
     }
 
     /// Run both directions, each with its own cursor, even when one fails: a
@@ -362,8 +408,9 @@ impl Pump {
     /// is not retried every tick; the browse cursor is already past it.
     async fn fail_permanently(&self, key: &str, why: &str, r: &mut TickReport) -> Result<()> {
         self.store
-            .xref_set(&format!("{FAILED_PREFIX}{key}"), why)
+            .xref_set_expiring(&format!("{FAILED_PREFIX}{key}"), why)
             .await?;
+        self.store.outbox_retire(key).await?;
         let n = self
             .store
             .cursor(OVERSIZE_FAILED)
@@ -394,7 +441,9 @@ impl Pump {
         if self.store.xref_has(xref_key).await? {
             return Ok(());
         }
-        self.store.xref_set(xref_key, &err.to_string()).await?;
+        self.store
+            .xref_set_expiring(xref_key, &err.to_string())
+            .await?;
         let n = self
             .store
             .cursor(DEAD_LETTERED)
@@ -431,6 +480,9 @@ impl Pump {
             .xref_has(&format!("{FAILED_PREFIX}{key}"))
             .await?
         {
+            // Journalled as failed before (possibly by an earlier version,
+            // which did not retire it): make sure it leaves the pending set.
+            self.store.outbox_retire(key).await?;
             return Ok(Step::Failed);
         }
         let limit = self.foreign.capabilities().max_message_units;
@@ -451,6 +503,7 @@ impl Pump {
             Err(e) if is_permanent(&e) => {
                 self.dead_letter(&format!("{FAILED_PREFIX}{key}"), key, &e, r)
                     .await?;
+                self.store.outbox_retire(key).await?;
                 return Ok(Step::Failed);
             }
             Err(e) => return Err(e),
@@ -620,7 +673,7 @@ impl Pump {
                             PutOutcome::AlreadyExists => report.skipped += 1,
                         }
                         self.store
-                            .xref_set(&format!("foreign:{}", ev.origin_id), &write.key)
+                            .xref_set_expiring(&format!("foreign:{}", ev.origin_id), &write.key)
                             .await?;
                     }
                     // A write the room refuses for good (a collision, content
@@ -966,6 +1019,40 @@ mod tests {
         assert_eq!(posted.len(), 1);
         assert_eq!(posted[0].reply_to, None);
         assert!(!posted[0].text.contains("update to"));
+    }
+
+    #[tokio::test]
+    async fn pruning_runs_at_most_hourly_and_the_cursor_records_it() {
+        let (room, _lb, store, pump) = reply_parts();
+        pump.start().await.unwrap();
+        room.add("did:alice", None, "x", 1).unwrap();
+        pump.tick().await.unwrap();
+        let first = store
+            .cursor(LAST_PRUNE)
+            .await
+            .unwrap()
+            .expect("pruned once");
+        // Within the hour: not again (the cursor is untouched).
+        store
+            .set_cursor(LAST_PRUNE, &u64::MAX.to_be_bytes())
+            .await
+            .unwrap();
+        pump.tick().await.unwrap();
+        assert_eq!(
+            store.cursor(LAST_PRUNE).await.unwrap().unwrap(),
+            u64::MAX.to_be_bytes()
+        );
+        // An hour on: again.
+        store
+            .set_cursor(LAST_PRUNE, &1u64.to_be_bytes())
+            .await
+            .unwrap();
+        pump.tick().await.unwrap();
+        assert_ne!(
+            store.cursor(LAST_PRUNE).await.unwrap().unwrap(),
+            1u64.to_be_bytes()
+        );
+        assert_eq!(first.len(), 8);
     }
 
     #[tokio::test]

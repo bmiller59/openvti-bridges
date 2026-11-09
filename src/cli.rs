@@ -359,6 +359,7 @@ where
         display_name: n.display_name,
         announce: false,
         notices: Default::default(),
+        retention_days: crate::pump::DEFAULT_RETENTION_DAYS,
     };
     cfg.links.push(link.clone());
     cfg.validate()?;

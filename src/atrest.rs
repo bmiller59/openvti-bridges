@@ -12,17 +12,31 @@
 //!
 //! Blob layout: `0x01 || nonce(24) || ciphertext+tag`.
 //!
-//! What this does not cover: the journal, outbox and xref (bridged text, not
-//! secrets), the cursors, and the fjall files' metadata. Those stay in clear.
-//! A process that holds the store key in memory can read everything; this
+//! Bridged text is sealed too: [`EncryptedState`] seals the `text`, `title` and
+//! `author` of every journal and outbox event (purpose `state`, AAD
+//! `journal|outbox/<link>/<key>`), so a bridged message does not sit on disk in
+//! clear. What stays in clear, exactly: the events' `origin`, `origin_id`,
+//! `link`, `at`, `kind`, `reply_to`, `record_key` and `provenance` (ids, a
+//! timestamp, the foreign room and device identifiers, the message hash; no
+//! message text); the outbox's receipt rank and retired flag; the xref (the
+//! `vtc:` / `vtkey:` / `foreign:` / `failed:` keys, which hold ids, foreign
+//! line ids and a failure reason that may quote an error); the cursors; the
+//! retention index; and the fjall files' metadata. Rows written by an earlier
+//! version are plaintext and are read as they are (they leave when pruned). A
+//! sealed row is confidential, not authenticated against deletion or
+//! replacement of a whole row: nothing here is a rollback defence. `status`
+//! counts pending entries without opening any body, so it needs no key. A
+//! process that holds the store key in memory can read everything; this
 //! protects the disk at rest, not a live compromise.
 
 use crate::foreign::Receipt;
 use crate::geb::crypto::kdf::hkdf32;
 use crate::model::BridgeEvent;
-use crate::store::{BridgeStore, StateSpace};
+use crate::store::{BridgeStore, PruneStats, StateSpace};
 use crate::{Error, Result};
 use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use std::path::PathBuf;
@@ -135,6 +149,56 @@ impl EncryptedState {
     fn aad(&self, space: StateSpace, key: &str) -> String {
         format!("state/{}/{}/{key}", self.scope, space_name(space))
     }
+
+    fn event_aad(&self, kind: &str, key: &str) -> String {
+        format!("{kind}/{}/{key}", self.scope)
+    }
+
+    /// The event with its text, title and author sealed into `text`.
+    fn seal_event(&self, kind: &str, key: &str, ev: &BridgeEvent) -> Result<BridgeEvent> {
+        let body = serde_json::to_vec(&SealedBody {
+            author: ev.author.clone(),
+            title: ev.title.clone(),
+            text: ev.text.clone(),
+        })
+        .map_err(|e| Error::Store(format!("event does not encode: {e}")))?;
+        let blob = self.key.seal(&self.event_aad(kind, key), &body)?;
+        let mut sealed = ev.clone();
+        sealed.author = SEALED_AUTHOR.into();
+        sealed.title = None;
+        sealed.text = B64.encode(blob);
+        Ok(sealed)
+    }
+
+    /// The inverse of [`Self::seal_event`]; a plaintext row (an earlier
+    /// version's) passes through unchanged.
+    fn open_event(&self, kind: &str, key: &str, ev: BridgeEvent) -> Result<BridgeEvent> {
+        if ev.author != SEALED_AUTHOR {
+            return Ok(ev);
+        }
+        let aad = self.event_aad(kind, key);
+        let blob = B64
+            .decode(ev.text.as_bytes())
+            .map_err(|_| Error::Crypto(format!("record {aad} does not open (not sealed text)")))?;
+        let body = self.key.open(&aad, &blob)?;
+        let b: SealedBody = serde_json::from_slice(&body)
+            .map_err(|_| Error::Crypto(format!("record {aad} does not open (bad body)")))?;
+        let mut out = ev;
+        out.author = b.author;
+        out.title = b.title;
+        out.text = b.text;
+        Ok(out)
+    }
+}
+
+/// Marks an event whose body is sealed (a character no real author has).
+const SEALED_AUTHOR: &str = "\u{1}at-rest/v1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SealedBody {
+    author: String,
+    title: Option<String>,
+    text: String,
 }
 
 #[async_trait]
@@ -146,10 +210,12 @@ impl BridgeStore for EncryptedState {
         self.inner.set_cursor(name, value).await
     }
     async fn journal_insert(&self, key: &str, event: &BridgeEvent) -> Result<bool> {
-        self.inner.journal_insert(key, event).await
+        let sealed = self.seal_event("journal", key, event)?;
+        self.inner.journal_insert(key, &sealed).await
     }
     async fn outbox_insert(&self, key: &str, event: &BridgeEvent) -> Result<bool> {
-        self.inner.outbox_insert(key, event).await
+        let sealed = self.seal_event("outbox", key, event)?;
+        self.inner.outbox_insert(key, &sealed).await
     }
     async fn outbox_mark(&self, key: &str, receipt: Receipt) -> Result<()> {
         self.inner.outbox_mark(key, receipt).await
@@ -158,7 +224,24 @@ impl BridgeStore for EncryptedState {
         self.inner.outbox_receipt(key).await
     }
     async fn outbox_unposted(&self) -> Result<Vec<(String, BridgeEvent)>> {
-        self.inner.outbox_unposted().await
+        let mut out = Vec::new();
+        for (k, ev) in self.inner.outbox_unposted().await? {
+            let ev = self.open_event("outbox", &k, ev)?;
+            out.push((k, ev));
+        }
+        Ok(out)
+    }
+    async fn outbox_pending_keys(&self) -> Result<Vec<String>> {
+        self.inner.outbox_pending_keys().await
+    }
+    async fn outbox_retire(&self, key: &str) -> Result<()> {
+        self.inner.outbox_retire(key).await
+    }
+    async fn xref_set_expiring(&self, a: &str, b: &str) -> Result<()> {
+        self.inner.xref_set_expiring(a, b).await
+    }
+    async fn prune(&self, now_secs: u64, retention_secs: u64) -> Result<PruneStats> {
+        self.inner.prune(now_secs, retention_secs).await
     }
     async fn state_get(&self, space: StateSpace, key: &str) -> Result<Option<Vec<u8>>> {
         match self.inner.state_get(space, key).await? {

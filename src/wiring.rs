@@ -163,6 +163,7 @@ pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
     rt.display_name = i.link.display_name.clone();
     rt.announce = i.link.announce;
     rt.notices = i.link.notices.clone();
+    rt.retention_days = i.link.retention_days;
     let device_did = i.secrets.device_did.clone();
     let mut pump = Pump::new(rt, room, geb_room.clone(), store.clone());
     if let Some(p) = i.pause {

@@ -81,6 +81,15 @@ pub struct LinkConfig {
     /// Wording of the notices that stand in for edits and retractions.
     #[serde(default)]
     pub notices: crate::mapping::Notices,
+    /// Days to keep a posted outbox row, a journal row and an expiring
+    /// cross-reference before pruning them. At least 1; the default (7)
+    /// matches Geb's relay retention. Entries not posted are never pruned.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+fn default_retention_days() -> u32 {
+    crate::pump::DEFAULT_RETENTION_DAYS
 }
 
 /// Longest bridge display name (Geb's limit), in characters.
@@ -324,6 +333,13 @@ impl Config {
                     l.id, l.tier
                 )));
             }
+            if l.retention_days < 1 {
+                return Err(Error::Config(format!(
+                    "link {}: retention_days must be at least 1 (default {})",
+                    l.id,
+                    crate::pump::DEFAULT_RETENTION_DAYS
+                )));
+            }
             if let Some(n) = &l.display_name {
                 let c = n.chars().count();
                 if c == 0 || c > MAX_DISPLAY_NAME_CHARS {
@@ -381,6 +397,16 @@ directions = "both"
 tier = "open"
 tier_optin = true
 "#;
+
+    #[test]
+    fn retention_days_defaults_to_seven_and_must_be_at_least_one() {
+        assert_eq!(Config::from_toml(BASE).unwrap().links[0].retention_days, 7);
+        let one = format!("{BASE}\nretention_days = 1\n");
+        assert_eq!(Config::from_toml(&one).unwrap().links[0].retention_days, 1);
+        let zero = format!("{BASE}\nretention_days = 0\n");
+        let e = Config::from_toml(&zero).unwrap_err().to_string();
+        assert!(e.contains("retention_days"), "{e}");
+    }
 
     #[test]
     fn directions_must_be_stated_and_the_error_names_the_key_and_the_values() {
