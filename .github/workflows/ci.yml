@@ -26,6 +26,8 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  # `Cargo.lock` is not committed yet (README, "Cargo.lock"), so each job that builds
+  # generates it first. Nothing here has run yet: see README, "What CI runs today".
   clippy:
     runs-on: ubuntu-latest
     steps:
@@ -33,24 +35,62 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
+      - run: cargo generate-lockfile
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --features "cli geb-live geb-mls" -- -D warnings
+      - run: cargo clippy --all-targets --features "cli harness geb-live geb-mls" -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
+      - run: cargo generate-lockfile
       - run: cargo test
       - run: cargo test --features "cli geb-live geb-mls"
+      # Adds tests/custody.rs and tests/cli.rs (they need `vta-sdk/test-loopback`, not a room host).
+      - run: cargo test --features "cli harness geb-live geb-mls"
 
-  # The `harness` feature needs `room-host`, which is not published and is taken by git
-  # from the VTI repository (a placeholder URL in Cargo.toml until the real one is set).
-  # Until that URL resolves this job cannot pass, so it is manual-only.
-  harness:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: cargo generate-lockfile
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # CONTRIBUTING.md requires a Signed-off-by trailer on every commit. Cryptographic signatures
+  # are not checked here (CI has no key to check them against).
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every commit in the PR carries Signed-off-by
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          bad=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if ! git show -s --format=%B "$c" | grep -qE '^Signed-off-by: .+ <.+>$'; then
+              echo "missing Signed-off-by: $(git log -1 --format='%h %s' "$c")"
+              bad=1
+            fi
+          done
+          exit $bad
+
+  # The room-host harness (`harness/`, a separate package) needs `room-host`, which is not
+  # published and sits under a placeholder git URL in harness/Cargo.toml. Until that URL is
+  # real it cannot resolve, so this job is manual-only and is expected to fail if run.
+  room-host-harness:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
-      - run: cargo test --features "cli harness geb-live geb-mls"
+      - run: cd harness && cargo test
