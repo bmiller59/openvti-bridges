@@ -25,13 +25,16 @@
 //!
 //! # UNVERIFIED (Geb's MLS source was not available; each is a choice)
 //!
-//! - Framing of what travels in `m` / `w` / `kps`: we send `m` and commits as
-//!   an MLSMessage (version + wire format + PrivateMessage), the Welcome as an
-//!   MLSMessage, and each KeyPackage as a bare `KeyPackage`; we accept bare or
-//!   wrapped forms on receive. The commit hash that orders candidates is
-//!   SHA-256 over the bytes as they arrive, so it depends on the framing.
-//! - Whether Geb's group uses the OpenMLS default wire format policy
-//!   (everything a PrivateMessage); we read PublicMessage commits as well.
+//! - Framing (SETTLED by answers round 2, section 2, no longer a choice): `m`
+//!   of `mc` / `ml` is an `MLSMessage` whose body is a PrivateMessage; …
+//!   … Welcome; each KeyPackage is a
+//!   bare `KeyPackage` in standard padded base64. We READ only those forms: a
+//!   PublicMessage, a bare PrivateMessage / Welcome, trailing bytes, and a
+//!   base64url KeyPackage are refused (`commit::parse_message`,
+//!   `parse_welcome`, `parse_key_package`). The commit hash that orders
+//!   candidates is SHA-256 over the `MLSMessage` bytes (round 2 section 6).
+//! - (settled: Geb never sets a wire-format policy, so the OpenMLS default,
+//!   everything a PrivateMessage, applies; a PublicMessage is refused.)
 //! - The OpenMLS 0.9 defaults for the capability lists other than extensions
 //!   (answer 7 says to check them against our stack).
 //! - The `{k:"g", op:"rs"}` body (we send `room:{id}`) and its reply.
@@ -69,5 +72,5 @@ mod tests;
 pub use client::{
     DEFAULT_STOCK, GroupStateStore, LABEL_AEAD, LABEL_NOSTR, MAX_STOCK, MlsConfig, MlsGroupClient,
 };
-pub use commit::{BindingStatus, binding_status, group_policy};
+pub use commit::{BindingStatus, binding_status, group_policy, parse_key_package};
 pub use identity::{MemoryVault, MlsIdentity, SUITE, SignatureKeyVault, leaf_capabilities};

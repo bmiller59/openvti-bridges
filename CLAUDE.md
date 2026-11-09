@@ -49,6 +49,16 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   `Error::UndecidableCommit` (epoch and commit hash in the text) and the link
   halts, persisted, `HaltReason::UndecidableCommit` (see "Halts"). To turn ALL commit merging off,
   leave `geb-mls` off.
+- **MLS wire strictness** (answers round 2, sections 1-2; `geb/mls/commit.rs`):
+  every MLS object we read is a full RFC 9420 `MLSMessage`. `mc` / `ml` `m` must
+  be an `MLSMessage` whose body is a PrivateMessage (a PublicMessage, a bare
+  PrivateMessage and trailing bytes are refused; a refused commit is recorded
+  `failed`, a refused line is dropped). A Welcome `w` must be an `MLSMessage`
+  whose body is a Welcome ("not a Welcome" otherwise). A KeyPackage is the bare
+  TLS `KeyPackage` (`KeyPackageIn::tls_deserialize_exact`, trailing bytes and a
+  wrapper fail) in standard base64 matching `^[A-Za-z0-9+/=]+$`; base64url
+  strings are dropped, in our `kp` / `kp-stock` frames (`Frame::validate`) and
+  in `geb::mls::parse_key_package`.
 - **No new message kinds.** Geb has no edit, delete or retract on the wire. A
   retraction (or a supersede, since edit is unsupported) is an ordinary signed
   `{t:"l"}` line whose `re` is the original line's *derived* id

@@ -254,23 +254,44 @@ impl GroupJudge<'_> {
     }
 }
 
-/// Parse MLS message bytes into a protocol message. Accepts an MLSMessage
-/// wrapper, else a bare PrivateMessage or PublicMessage.
+/// Parse the bytes of an `mc` or `ml` envelope: a full RFC 9420 `MLSMessage`
+/// whose body is a **PrivateMessage**, and nothing else (answer 2: "Geb …
+/// … one"; the bytes
+/// are what `tls_serialize_detached` made of OpenMLS's `MlsMessageOut`).
 ///
-/// UNVERIFIED: whether Geb wraps `m` in an MLSMessage (version, wire format)
-/// or sends the bare PrivateMessage the guide names. We send the wrapper and
-/// read either.
+/// Refused, each with its own reason: a bare PrivateMessage or PublicMessage
+/// (not an `MLSMessage`), trailing bytes, an `MLSMessage` whose body is a
+/// PublicMessage, a Welcome, a GroupInfo or a KeyPackage.
 pub fn parse_message(bytes: &[u8]) -> Result<ProtocolMessage, String> {
-    if let Ok(m) = MlsMessageIn::tls_deserialize_exact(bytes)
-        && let Ok(p) = m.try_into_protocol_message()
-    {
-        return Ok(p);
+    let m = MlsMessageIn::tls_deserialize_exact(bytes)
+        .map_err(|_| "not an MLSMessage (bare and trailing-byte forms are refused)".to_string())?;
+    match m.extract() {
+        MlsMessageBodyIn::PrivateMessage(p) => Ok(ProtocolMessage::from(p)),
+        MlsMessageBodyIn::PublicMessage(_) => Err("a PublicMessage is refused".into()),
+        _ => Err("an MLSMessage that is not a PrivateMessage".into()),
     }
-    if let Ok(p) = PrivateMessageIn::tls_deserialize_exact(bytes) {
-        return Ok(ProtocolMessage::from(p));
+}
+
+/// Parse a Welcome frame's `w`: an `MLSMessage` whose body is a Welcome
+/// (answer 2; Geb answers anything else "not a Welcome", `mls.rs:490-493`).
+pub fn parse_welcome(bytes: &[u8]) -> Result<Welcome, String> {
+    match MlsMessageIn::tls_deserialize_exact(bytes).map(MlsMessageIn::extract) {
+        Ok(MlsMessageBodyIn::Welcome(w)) => Ok(w),
+        _ => Err("not a Welcome".into()),
     }
-    if let Ok(p) = PublicMessageIn::tls_deserialize_exact(bytes) {
-        return Ok(ProtocolMessage::from(p));
+}
+
+/// Parse a KeyPackage string as Geb reads it (answer 1): the alphabet is
+/// checked first (`^[A-Za-z0-9+/=]+$`: a base64url string is dropped), the
+/// text is standard PADDED base64, and the bytes are the bare TLS
+/// `KeyPackage` read with `KeyPackageIn::tls_deserialize_exact` (an
+/// `MLSMessage`-wrapped KeyPackage or trailing bytes fail). The result is not
+/// yet validated (signature, lifetime): that needs a crypto provider.
+pub fn parse_key_package(b64: &str) -> Result<KeyPackageIn, String> {
+    if !crate::geb::wire::is_std_b64(b64) {
+        return Err("a KeyPackage is standard base64 (^[A-Za-z0-9+/=]+$)".into());
     }
-    Err("not an MLS protocol message".into())
+    let bytes = crate::geb::crypto::b64_decode(b64).map_err(|e| e.to_string())?;
+    KeyPackageIn::tls_deserialize_exact(&bytes)
+        .map_err(|_| "not a bare KeyPackage (an MLSMessage wrapper or trailing bytes)".to_string())
 }

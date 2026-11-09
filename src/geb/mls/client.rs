@@ -3,7 +3,7 @@
 //! No std lock is held across an await: state changes happen in short
 //! synchronous sections, and dyad I/O happens between them.
 
-use super::commit::{GroupJudge, credential_did, group_policy, parse_message};
+use super::commit::{GroupJudge, credential_did, group_policy, parse_message, parse_welcome};
 use super::identity::{MlsIdentity, SUITE, SignatureKeyVault};
 use crate::foreign::JoinState;
 use crate::geb::crypto::b64_decode;
@@ -23,7 +23,7 @@ use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tls_codec::{Deserialize as _, Serialize as _};
+use tls_codec::Serialize as _;
 
 /// Exporter label for the room's Nostr secret.
 pub const LABEL_NOSTR: &str = "geb/room/v2/nostr";
@@ -321,7 +321,8 @@ impl MlsGroupClient {
         // one from the group context below.
         let header_policy = room.policy();
         let bytes = b64_decode(w)?;
-        let welcome = parse_welcome(&bytes)?;
+        let welcome =
+            parse_welcome(&bytes).map_err(|why| Error::Wire(format!("welcome: {why}")))?;
         let cfg = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(32, 1000))
@@ -381,16 +382,6 @@ impl MlsGroupClient {
             }
         }
     }
-}
-
-fn parse_welcome(bytes: &[u8]) -> Result<Welcome> {
-    // UNVERIFIED: wrapped in an MLSMessage or bare; read either.
-    if let Ok(m) = MlsMessageIn::tls_deserialize_exact(bytes)
-        && let MlsMessageBodyIn::Welcome(w) = m.extract()
-    {
-        return Ok(w);
-    }
-    Welcome::tls_deserialize_exact(bytes).map_err(|e| Error::Wire(format!("welcome bytes: {e:?}")))
 }
 
 #[async_trait]

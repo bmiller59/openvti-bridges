@@ -43,6 +43,27 @@ pub fn is_room_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Whether `s` matches `^[A-Za-z0-9+/=]+$`, the pattern Geb applies to a
+/// KeyPackage string : standard
+/// base64 characters. A base64url string (`-`, `_`) fails it and Geb DROPS that
+/// string. (Alphabet only; padding and length are the decoder's business.)
+pub fn is_std_b64(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+/// The KeyPackage strings of a `kp-stock` that Geb keeps: those matching
+/// [`is_std_b64`], at most 16 . UNVERIFIED: whether Geb
+/// cuts the stock to the FIRST 16 or checks the count before filtering.
+pub fn stock_kept(kps: &[String]) -> Vec<&str> {
+    kps.iter()
+        .map(String::as_str)
+        .filter(|k| is_std_b64(k))
+        .take(16)
+        .collect()
+}
+
 fn is_peer_did(s: &str) -> bool {
     s.starts_with("did:peer:2.")
 }
@@ -394,6 +415,23 @@ impl Frame {
             }
             Frame::Reaction(r) => r.validate(),
             Frame::Group(GroupOp::Welcome { room, .. }) => room.validate(),
+            Frame::Group(GroupOp::KpStock { kps, .. }) => {
+                if kps.len() > 16 || kps.iter().any(|k| !is_std_b64(k)) {
+                    return Err(Error::Wire(
+                        "kp-stock: at most 16 KeyPackages, standard base64 (^[A-Za-z0-9+/=]+$)"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
+            Frame::Group(GroupOp::Kp { kp, .. }) => {
+                if !is_std_b64(kp) {
+                    return Err(Error::Wire(
+                        "kp: a KeyPackage is standard base64 (^[A-Za-z0-9+/=]+$)".into(),
+                    ));
+                }
+                Ok(())
+            }
             Frame::Group(_) | Frame::Cap { .. } => Ok(()),
         }
     }
@@ -618,6 +656,33 @@ mod tests {
             json!({"k":"g","op":"rs","room":{"id":"geb-room-0001"}})
         );
         assert!(serde_json::from_value::<RoomPlaintext>(json!({"t":"ag","at":1,"d":{}})).is_err());
+    }
+
+    #[test]
+    fn key_package_strings_are_standard_base64_only() {
+        assert!(is_std_b64("AbZ09+/=="));
+        for bad in ["", "ab-c", "ab_c", "ab c", "ab.c", "ab\n"] {
+            assert!(!is_std_b64(bad), "{bad:?}");
+        }
+        let kps: Vec<String> = ["AAA=", "ab-c", "BBB="].map(String::from).to_vec();
+        assert_eq!(stock_kept(&kps), ["AAA=", "BBB="]);
+        let many: Vec<String> = (0..20).map(|_| "AAAA".to_string()).collect();
+        assert_eq!(stock_kept(&many).len(), 16);
+        let stock = |kps: Vec<String>| Frame::Group(GroupOp::KpStock { generation: 1, kps });
+        assert!(stock(vec!["AAAA".into()]).validate().is_ok());
+        assert!(stock(vec!["AA-A".into()]).validate().is_err());
+        assert!(stock(many).validate().is_err());
+        let kp = |s: &str| {
+            Frame::Group(GroupOp::Kp {
+                room: RoomRef {
+                    id: "r".into(),
+                    name: None,
+                },
+                kp: s.into(),
+            })
+        };
+        assert!(kp("AAAA").validate().is_ok());
+        assert!(kp("AA_A").validate().is_err());
     }
 
     #[test]

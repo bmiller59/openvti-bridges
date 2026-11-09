@@ -97,6 +97,9 @@ pub struct Sim {
     pub forge_binding: bool,
     /// Make this member's KeyPackage declare no capabilities beyond default.
     pub plain_capabilities: bool,
+    /// Found the group with the mixed wire-format policy, so this member's
+    /// commits go out as PublicMessage (which Geb never sends and refuses).
+    pub plaintext_handshake: bool,
 }
 
 impl Sim {
@@ -119,6 +122,7 @@ impl Sim {
             group: None,
             forge_binding: false,
             plain_capabilities: false,
+            plaintext_handshake: false,
         }
     }
 
@@ -166,8 +170,14 @@ impl Sim {
             )),
         ])
         .unwrap();
+        let policy = if self.plaintext_handshake {
+            MIXED_PLAINTEXT_WIRE_FORMAT_POLICY
+        } else {
+            PURE_CIPHERTEXT_WIRE_FORMAT_POLICY
+        };
         let cfg = MlsGroupCreateConfig::builder()
             .ciphersuite(SUITE)
+            .wire_format_policy(policy)
             .use_ratchet_tree_extension(true)
             .with_group_context_extensions(exts)
             .capabilities(leaf_capabilities())

@@ -19,7 +19,6 @@ use ed25519_dalek::SigningKey;
 use openmls::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tls_codec::Deserialize as _;
 
 const ROOM: &str = "geb-room-0001";
 
@@ -174,11 +173,7 @@ impl World {
 }
 
 fn parse_kp(b64: &str) -> KeyPackage {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .unwrap();
-    KeyPackageIn::tls_deserialize_exact(&bytes)
+    super::parse_key_package(b64)
         .unwrap()
         .validate(
             openmls_traits::OpenMlsProvider::crypto(
@@ -224,6 +219,155 @@ fn staged_pair(
         b.drop_pending();
     }
     panic!("could not get the wanted hash order");
+}
+
+// ---- parsing strictness (P0-a, answers round 2 sections 1 and 2) ---------------
+
+/// The body of an MLSMessage (version 2 bytes + wire format 2 bytes dropped).
+fn bare(m: &[u8]) -> Vec<u8> {
+    m[4..].to_vec()
+}
+
+#[test]
+fn only_a_private_message_mlsmessage_is_read_from_mc_and_ml() {
+    use super::commit::parse_message;
+    let mut a = Sim::new(1);
+    let mut b = Sim::new(2);
+    a.create_room(ROOM, &policy(&a.did, ""));
+    let (commit, welcome) = a.stage_add(b.key_package());
+    // Good: the MLSMessage(PrivateMessage) OpenMLS made.
+    assert!(parse_message(&commit).is_ok());
+    // Bare PrivateMessage (the MLSMessage header stripped): refused.
+    let why = parse_message(&bare(&commit)).err().unwrap();
+    assert!(why.contains("not an MLSMessage"), "{why}");
+    // Trailing bytes: refused.
+    let mut padded = commit.clone();
+    padded.push(0);
+    assert!(parse_message(&padded).is_err());
+    // An MLSMessage that is a Welcome, a KeyPackage: refused.
+    let why = parse_message(&welcome).err().unwrap();
+    assert!(why.contains("not a PrivateMessage"), "{why}");
+    let kp = MlsMessageOut::from(b.key_package());
+    assert!(parse_message(&tls_codec::Serialize::tls_serialize_detached(&kp).unwrap()).is_err());
+    assert!(parse_message(&[]).is_err());
+    a.merge_pending();
+    b.join(&welcome);
+    // A PublicMessage commit (a group on the mixed policy): refused by name,
+    // both wrapped and bare.
+    let mut p = Sim::new(3);
+    p.plaintext_handshake = true;
+    p.create_room("geb-room-plain", &policy(&p.did, ""));
+    let public = p.stage_self_update();
+    let why = parse_message(&public).err().unwrap();
+    assert!(why.contains("PublicMessage"), "{why}");
+    assert!(parse_message(&bare(&public)).is_err());
+}
+
+#[tokio::test]
+async fn a_public_or_bare_commit_is_recorded_failed_and_a_bare_line_is_not_opened() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    // A bare line is not opened.
+    let line = w.a.seal_line(ROOM, 5, "hi", true);
+    assert!(w.client.open(&bare(&line)).is_err());
+    assert!(w.client.open(&line).is_ok());
+    // A bare commit is held, then recorded failed (it cannot be processed).
+    let c = w.a.stage_self_update();
+    w.a.drop_pending();
+    w.post_mc(&w.a, &bare(&c)).await;
+    let t = w.now();
+    w.poll().await.unwrap();
+    w.at(t + 3000);
+    w.poll().await.unwrap();
+    assert_eq!(w.client.failed_commits().len(), 1);
+    assert_eq!(w.client.epoch(), Some(w.a.epoch()), "nothing merged");
+}
+
+#[test]
+fn a_welcome_must_be_an_mlsmessage_whose_body_is_a_welcome() {
+    use super::commit::parse_welcome;
+    let mut a = Sim::new(1);
+    let b = Sim::new(2);
+    a.create_room(ROOM, &policy(&a.did, ""));
+    let (commit, welcome) = a.stage_add(b.key_package());
+    assert!(parse_welcome(&welcome).is_ok());
+    for bad in [bare(&welcome), commit.clone(), vec![], b"garbage".to_vec()] {
+        assert_eq!(parse_welcome(&bad).err().as_deref(), Some("not a Welcome"));
+    }
+    let mut padded = welcome.clone();
+    padded.push(1);
+    assert_eq!(
+        parse_welcome(&padded).err().as_deref(),
+        Some("not a Welcome")
+    );
+}
+
+#[tokio::test]
+async fn a_bare_welcome_does_not_seat_us() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    assert_eq!(w.room.join().await.unwrap(), JoinState::Pending);
+    let Some(Frame::Group(GroupOp::KpStock { kps, .. })) =
+        w.bus.take(&w.our_did, &w.a.did).first().cloned()
+    else {
+        panic!()
+    };
+    let (_c, welcome) = w.a.stage_add(parse_kp(&kps[0]));
+    w.a.merge_pending();
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        welcome_frame(ROOM, &w.a.did, &w.policy, &bare(&welcome)),
+    );
+    assert_eq!(w.room.join().await.unwrap(), JoinState::Pending);
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        welcome_frame(ROOM, &w.a.did, &w.policy, &welcome),
+    );
+    assert_eq!(w.room.join().await.unwrap(), JoinState::Seated);
+}
+
+#[test]
+fn a_keypackage_is_a_bare_tls_keypackage_in_standard_base64() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use tls_codec::Serialize as _;
+    let s = Sim::new(4);
+    let kp = s.key_package();
+    let raw = kp.tls_serialize_detached().unwrap();
+    let ok = STANDARD.encode(&raw);
+    assert!(super::parse_key_package(&ok).is_ok());
+    // MLSMessage-wrapped: refused.
+    let wrapped = MlsMessageOut::from(kp.clone())
+        .tls_serialize_detached()
+        .unwrap();
+    assert!(super::parse_key_package(&STANDARD.encode(wrapped)).is_err());
+    // Trailing bytes: refused.
+    let mut t = raw.clone();
+    t.push(0);
+    assert!(super::parse_key_package(&STANDARD.encode(t)).is_err());
+    // base64url alphabet: dropped. Force a url-only character in.
+    let url = format!("{ok}-_");
+    assert!(
+        super::parse_key_package(&url)
+            .err()
+            .unwrap()
+            .contains("standard base64")
+    );
+    let url_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
+    if url_form.contains(['-', '_']) {
+        assert!(super::parse_key_package(&url_form).is_err());
+    }
+    assert!(super::parse_key_package("").is_err());
+    // Our own stock and `kp` frames pass the same gate.
+    let f = Frame::Group(GroupOp::Kp {
+        room: crate::geb::wire::RoomRef {
+            id: ROOM.into(),
+            name: None,
+        },
+        kp: ok.clone(),
+    });
+    assert!(f.validate().is_ok());
 }
 
 // ---- identity and KeyPackages ---------------------------------------------
