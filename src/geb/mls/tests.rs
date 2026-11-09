@@ -1231,7 +1231,7 @@ async fn a_welcome_with_a_forged_leaf_or_a_duplicate_unbound_did_is_refused() {
 // ---- partial local knowledge ---------------------------------------------------
 
 #[tokio::test]
-async fn without_local_knowledge_adds_merge_and_removes_and_policy_changes_stop_the_bridge() {
+async fn without_local_knowledge_root_removes_and_policy_changes_merge_and_only_card_cases_halt() {
     let mut w = World::build(Arc::new(NoLocalKnowledge), "");
     w.seat().await;
     // An Add-only commit is merged.
@@ -1240,21 +1240,49 @@ async fn without_local_knowledge_adds_merge_and_removes_and_policy_changes_stop_
     w.post_mc(&w.a, &c).await;
     w.a.merge_pending();
     w.b.apply(&c).unwrap();
-    let t = w.now();
-    w.poll().await.unwrap();
-    w.at(t + 3000);
-    w.poll().await.unwrap();
+    settle_posted(&w).await.unwrap();
     assert!(w.client.members().contains(&newbie.did));
     assert!(w.our_keys_match(&w.a));
-    let epoch = w.client.epoch().unwrap();
-    let keys_before = w.client.relay_keys().unwrap().pubkey_hex().unwrap();
-
-    // A Remove (even by root) is neither merged nor skipped: the poll errors.
     w.at(w.now() + 10_000);
+
+    // P0-d: root's Remove of B is decided (exact DID, bound sender) and merged.
     let b_did = w.b.did.clone();
     let c = w.a.stage_remove(&b_did);
     w.post_mc(&w.a, &c).await;
-    w.a.drop_pending();
+    w.a.merge_pending();
+    settle_posted(&w).await.unwrap();
+    assert!(!w.client.members().contains(&b_did));
+    assert!(w.our_keys_match(&w.a));
+    w.at(w.now() + 10_000);
+
+    // ...and so is root's policy change.
+    let c = w.a.stage_policy(&policy(&w.a.did, r#","edit":"all""#));
+    w.post_mc(&w.a, &c).await;
+    w.a.merge_pending();
+    settle_posted(&w).await.unwrap();
+    assert!(w.our_keys_match(&w.a));
+    assert_eq!(w.client.epoch(), Some(w.a.epoch()));
+
+    // A non-root's policy change is refused, not a halt: the epoch stays.
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    let e = w.client.epoch();
+    let c = w.b.stage_policy(&policy(&w.a.did, r#","edit":"all""#));
+    w.post_mc(&w.b, &c).await;
+    w.b.drop_pending();
+    settle_posted(&w).await.unwrap();
+    assert_eq!(w.client.epoch(), e);
+    assert!(w.client.failed_commits().is_empty());
+
+    // The residual halt: a non-root, non-admin removes a DIFFERENT DID.
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    let epoch = w.client.epoch().unwrap();
+    let keys_before = w.client.relay_keys().unwrap().pubkey_hex().unwrap();
+    let a_did = w.a.did.clone();
+    let c = w.b.stage_remove(&a_did);
+    w.post_mc(&w.b, &c).await;
+    w.b.drop_pending();
     let t = w.now();
     w.poll().await.unwrap(); // held
     w.at(t + 3000);
@@ -1272,33 +1300,24 @@ async fn without_local_knowledge_adds_merge_and_removes_and_policy_changes_stop_
     // It keeps stopping: the commit is still held, never silently dropped.
     assert!(matches!(w.poll().await, Err(Error::UndecidableCommit(_))));
     assert_eq!(w.client.held_commits(), 1);
-
-    // Same for a policy change, in a fresh world.
-    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
-    w.seat().await;
-    let c = w.a.stage_policy(&policy(&w.a.did, r#","edit":"all""#));
-    w.post_mc(&w.a, &c).await;
-    w.a.drop_pending();
-    let t = w.now();
-    w.poll().await.unwrap();
-    w.at(t + 3000);
-    assert!(matches!(w.poll().await, Err(Error::UndecidableCommit(_))));
 }
 
 #[tokio::test]
 async fn a_lower_hash_undecidable_commit_blocks_even_when_a_higher_one_is_fine() {
     let mut w = World::build(Arc::new(NoLocalKnowledge), "");
     w.seat().await;
-    let b_did = w.b.did.clone();
-    let (cr, cu) = staged_pair(
-        &mut w.a,
+    let a_did = w.a.did.clone();
+    // B (not root, not admin) removes A: undecidable. A's ordinary commit has
+    // the higher hash.
+    let (cu, cr) = staged_pair(
         &mut w.b,
+        &mut w.a,
         true,
-        &|s| s.stage_remove(&b_did),
+        &|s| s.stage_remove(&a_did),
         &|s| s.stage_self_update(),
     );
-    w.post_mc(&w.a, &cr).await;
     w.post_mc(&w.b, &cu).await;
+    w.post_mc(&w.a, &cr).await;
     let t = w.now();
     w.poll().await.unwrap();
     w.at(t + 3000);

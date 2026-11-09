@@ -11,10 +11,12 @@
 //! 1. it processes under OpenMLS at our epoch (signature, membership tag,
 //!    confirmation tag, required capabilities: the same checks every member
 //!    makes);
-//! 2. every proposal in it is an `Add`: no Remove, no GroupContextExtensions,
-//!    and no Update / PreSharedKey / ReInit / ExternalInit / SelfRemove /
-//!    custom proposal, which Geb's check is not described for;
-//! 3. the room is not direct (an Add to a direct room needs "same person");
+//! 2. no proposal is a kind Geb's check is not described for (Update,
+//!    PreSharedKey, ReInit, ExternalInit, SelfRemove, custom);
+//! 3. it is decidable without persona cards: since P0-d that is every commit
+//!    except a Remove of a different DID by a sender who is neither root nor
+//!    admin and a direct-room Add of a DID that is not exactly a pair member
+//!    (`geb::policy::valid_commit` has the table);
 //! 4. no added leaf carries a **forged** binding (a binding that is present
 //!    and does not verify). A missing binding passes: "seated, unverified".
 //!
@@ -36,22 +38,21 @@
 //! all (replay, other branch, unparsable bytes): recorded failed, the walk
 //! STOPS, `rs` is sent once. Everything above is a refusal.
 //!
-//! Why that is safe: answer 9 states `validCommit` as a list of failure
-//! conditions, and "Adds always pass". For a commit meeting 1-4 none of the
-//! listed conditions can apply (they concern Removes, policy changes and
-//! direct rooms), and the one other refusal Geb makes, a forged binding, is
-//! checked here from the DID alone. So every Geb device reaches the verdict
-//! "valid" and merges it, and so do we: no fork. Any commit that is not in
-//! that class is neither merged nor skipped (skipping a commit another device
-//! merges also forks): the walk stops and the bridge alerts.
+//! Why that is safe: answer 9 and round 2 section 7 state `validCommit` as a
+//! list of conditions, and name the three places where persona cards matter
+//! (a leave by Remove, a signed leave, a direct room). Everything outside
+//! them is decided from the policy, the tree and the leaf bindings alone, so
+//! every Geb device reaches the same verdict and so do we: no fork. A commit
+//! in those three places is neither merged nor skipped (skipping a commit
+//! another device merges also forks): the walk stops and the bridge alerts.
 //!
 //! What this does NOT rule out, UNVERIFIED because Geb's source is not
 //! available: a rule in `validCommit` or the settle path beyond the answers'
 //! list (the answers say the list is what fails a commit); a difference in how
 //! Geb decodes a DID for the binding check (we refuse a present binding whose
-//! DID we cannot decode); a Geb-side check on an `Update` path leaf's binding
-//! (we do not check it); and the framing of commit bytes, which decides the
-//! hash that orders candidates (see `geb::mls` docs). If any of these is
+//! DID we cannot decode); and the framing of commit bytes, which decides the hash that
+//! orders candidates (settled by round 2 section 6, but never run against a
+//! live Geb). If any of these is
 //! wrong, the failure mode is a fork that Geb's fork repair (`rs`) is meant to
 //! mend. Keeping ALL merging off is `SettleMode::Off`-equivalent: build the
 //! group with inputs whose `can_evaluate` is false AND do not call `settle`,

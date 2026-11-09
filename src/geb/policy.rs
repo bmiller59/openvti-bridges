@@ -48,9 +48,10 @@
 //! … **forks the epoch**. So it never merges (nor skips) such
 //! a commit; with the default group `GebRoom::poll` still stops on any `mc`
 //! envelope; [`valid_commit`] is the check, and [`CommitCheckInputs::can_evaluate`]
-//! is the gate. Production has only [`NoLocalKnowledge`], so commits that
-//! remove or change policy are refused a merge (the bridge stops and alerts);
-//! see `geb::mls` for what may still be merged.
+//! is the gate. Production has only [`NoLocalKnowledge`]; since round 2 only a
+//! Remove of a different DID by a non-root, non-admin sender and a direct-room
+//! Add of a non-exact DID need them, and those stop the bridge and alert; see
+//! `geb::mls` for what is merged.
 
 use serde_json::Value;
 
@@ -263,12 +264,16 @@ fn is_root_or_admin(policy: &RoomPolicy, who: &str, inputs: &dyn CommitCheckInpu
 /// Geb's `validCommit` (answer 9), pure over the facts, the
 /// policy read from the **group context** and the local-knowledge inputs.
 ///
-/// Without local knowledge ([`CommitCheckInputs::can_evaluate`] false) the
-/// only commits answered `Valid` are those with no Remove, no policy change
-/// and (in a direct room) no Add: "Adds always pass". Everything else is
-/// [`CommitVerdict::Undecidable`], including the policy-change and Remove
-/// rules that could be decided from the policy alone: whether a sender is
-/// `root` may depend on "same person", and a wrong answer forks the epoch.
+/// Without local knowledge ([`CommitCheckInputs::can_evaluate`] false) every
+/// commit Geb decides without persona cards or signed leaves is decided here
+/// (round 2 section 7): ordinary adds, exact-DID root or admin removes, a
+/// sender removing or re-seating its own DID, other re-seats, root policy
+/// changes, an exact member of a direct pair added, and every 0.5.15 bound-leaf
+/// refusal. Only a Remove of a different DID by a sender who is neither root
+/// nor admin, and a direct-room Add of a DID that is not exactly one of the
+/// pair, are [`CommitVerdict::Undecidable`] (a card or signed leave could
+/// rescue them, and a wrong answer forks the epoch); a card-free refusal
+/// elsewhere in the same commit still wins.
 ///
 /// UNVERIFIED: the answers state the rules, not these details. Sender and
 /// removed leaves are compared as device DIDs (exactly, else `same_person`);
@@ -318,24 +323,29 @@ pub fn valid_commit(
             );
         }
     }
-    if !inputs.can_evaluate() {
-        if !facts.removes.is_empty() {
-            return Undecidable("a Remove needs persona cards and signed leaves".into());
+    // From here, a rule that fails is `Invalid` when the inputs are real. When
+    // they are not (`!can_evaluate`) a rule fails only if no persona card or
+    // signed leave could rescue the commit; one that a card could rescue is
+    // recorded in `undecided` and the answer is `Undecidable` unless another,
+    // card-free rule refuses it first (a refusal is decisive).
+    let cards = inputs.can_evaluate();
+    let mut undecided: Option<String> = None;
+    let mut needs_cards = |why: &str| -> Option<CommitVerdict> {
+        if cards {
+            Some(Invalid(why.into()))
+        } else {
+            undecided.get_or_insert_with(|| format!("{why}; needs persona cards or signed leaves"));
+            None
         }
-        if facts.policy_change.is_some() {
-            return Undecidable("a policy change needs persona cards (is the sender root)".into());
-        }
-        if policy.direct.is_some() && !facts.adds.is_empty() {
-            return Undecidable("an Add to a direct room needs persona cards".into());
-        }
-        return Valid;
-    }
-    // Direct rooms: only devices of the two persons, and `direct` is fixed.
+    };
+    // Direct rooms: only devices of the two persons (an exact DID needs no
+    // card, a sibling device does), and `direct` is fixed.
     if let Some(pair) = &policy.direct {
         for add in &facts.adds {
             let ok = pair.iter().any(|p| add == p || inputs.same_person(add, p));
-            if !ok {
-                return Invalid("a direct room seats only its two persons' devices".into());
+            if !ok && let Some(v) = needs_cards("a direct room seats only its two persons' devices")
+            {
+                return v;
             }
         }
         if let Some(new) = &facts.policy_change
@@ -345,6 +355,9 @@ pub fn valid_commit(
         }
     }
     if !facts.removes.is_empty() && !is_root_or_admin(policy, &facts.sender, inputs) {
+        // Not (exactly) root or an admin: valid only as …
+        // … person: with no cards, the sender's own
+        // DID), a signed-out remove, or a re-seat.
         let leave = facts
             .removes
             .iter()
@@ -360,11 +373,20 @@ pub fn valid_commit(
             r.dedup();
             !r.is_empty() && a == r && facts.policy_change.is_none()
         };
-        if !(leave || signed_out || reseat) {
-            return Invalid("a Remove from someone who is neither root, admin, leaving, signed out nor re-seating".into());
+        if !(leave || signed_out || reseat)
+            && let Some(v) = needs_cards(
+                "a Remove of a different DID from someone who is neither root, admin, leaving, signed out nor re-seating",
+            )
+        {
+            return v;
         }
     }
     if let Some(new) = &facts.policy_change {
+        // UNVERIFIED: without cards the root test is an exact DID compare
+        // (round 2 section 7: "removes by root or an admin ... …
+        // … cards"). If Geb's test also
+        // accepts a root's sibling device through `same`, a commit from one
+        // is refused here and merged by Geb: a fork (open question 2).
         let root = policy
             .root
             .as_ref()
@@ -379,7 +401,10 @@ pub fn valid_commit(
             return Invalid("a policy change must keep committer and settleWindowMs".into());
         }
     }
-    Valid
+    match undecided {
+        Some(why) => Undecidable(why),
+        None => Valid,
+    }
 }
 
 #[cfg(test)]
@@ -699,22 +724,69 @@ mod tests {
     }
 
     #[test]
-    fn without_local_knowledge_removes_policy_changes_and_direct_adds_are_undecidable() {
+    fn without_local_knowledge_only_card_dependent_commits_are_undecidable() {
         let none = NoLocalKnowledge;
         assert!(!none.can_evaluate());
         let und = |p: &RoomPolicy, f: &CommitFacts| {
             matches!(valid_commit(p, f, &none), CommitVerdict::Undecidable(_))
         };
-        // Even a remove by exact root is undecidable: be conservative.
-        let mut r = facts("did:root");
-        r.removes = s(&["did:x"]);
-        assert!(und(&pol(""), &r));
-        let mut c = facts("did:root");
-        c.policy_change = Some(pol(""));
-        assert!(und(&pol(""), &c));
+        let ok =
+            |p: &RoomPolicy, f: &CommitFacts| valid_commit(p, f, &none) == CommitVerdict::Valid;
+        let inv = |p: &RoomPolicy, f: &CommitFacts| {
+            matches!(valid_commit(p, f, &none), CommitVerdict::Invalid(_))
+        };
+        // Decided WITHOUT cards: an exact-DID root or admin remove.
+        for who in ["did:root", "did:adm"] {
+            let mut r = facts(who);
+            r.removes = s(&["did:x"]);
+            assert!(ok(&pol(""), &r), "{who}");
+        }
+        // A bound self-remove (a leave of the sender's own DID).
+        let mut l = facts("did:m");
+        l.removes = s(&["did:m"]);
+        assert!(ok(&pol(""), &l));
+        // A re-seat, an ordinary add, a root policy change.
+        let mut rs = facts("did:m");
+        rs.removes = s(&["did:a", "did:b"]);
+        rs.adds = s(&["did:b", "did:a"]);
+        assert!(ok(&pol(""), &rs));
         let mut a = facts("did:m");
         a.adds = s(&["did:n"]);
-        assert!(und(&pol(r#","direct":["did:a","did:b"]"#), &a));
+        assert!(ok(&pol(""), &a));
+        let mut c = facts("did:root");
+        c.policy_change = Some(pol(""));
+        assert!(ok(&pol(""), &c));
+        // A non-root policy change and a bad root one are refused, not halted.
+        c.sender = "did:adm".into();
+        assert!(inv(&pol(""), &c));
+        c.sender = "did:root".into();
+        let mut bad = pol("");
+        bad.settle_window_ms = 1;
+        c.policy_change = Some(bad);
+        assert!(inv(&pol(""), &c));
+        // Still undecidable: a Remove of a DIFFERENT DID by a sender who is
+        // neither root nor admin (a sibling device or a signed leave could
+        // rescue it), a mixed own/other remove, and a direct-room add of a
+        // DID that is not exactly one of the pair.
+        let mut r = facts("did:m");
+        r.removes = s(&["did:x"]);
+        assert!(und(&pol(""), &r));
+        r.removes = s(&["did:m", "did:x"]);
+        assert!(und(&pol(""), &r));
+        let direct = pol(r#","direct":["did:a","did:b"]"#);
+        let mut d = facts("did:m");
+        d.adds = s(&["did:n"]);
+        assert!(und(&direct, &d));
+        d.adds = s(&["did:a"]);
+        assert!(ok(&direct, &d), "an exact member of the pair needs no card");
+        // A card-free refusal beats an undecidable rule.
+        let mut both = facts("did:m");
+        both.removes = s(&["did:x"]);
+        both.policy_change = Some(pol(""));
+        assert!(
+            inv(&pol(""), &both),
+            "non-root policy change: refused first"
+        );
         let mut u = facts("did:m");
         u.unclassified = true;
         assert!(und(&pol(""), &u));
@@ -722,5 +794,18 @@ mod tests {
             valid_commit(&pol(""), &u, &Fake::default()),
             CommitVerdict::Undecidable(_)
         ));
+        // With real inputs the same commits are Invalid, not Undecidable.
+        let mut r = facts("did:m");
+        r.removes = s(&["did:x"]);
+        assert!(matches!(
+            valid_commit(&pol(""), &r, &Fake::default()),
+            CommitVerdict::Invalid(_)
+        ));
+        // And the own-DID re-seat exception holds without cards.
+        let mut own = facts("did:m");
+        own.sender_bound = false;
+        own.removes = s(&["did:m"]);
+        own.adds = s(&["did:m"]);
+        assert!(ok(&pol(""), &own));
     }
 }

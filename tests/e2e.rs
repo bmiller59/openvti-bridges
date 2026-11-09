@@ -637,8 +637,8 @@ async fn a_remove_us_commit_halts_the_link_and_stays_halted() {
 }
 
 /// Production inputs (no persona cards, no signed leaves) cannot evaluate a
-/// commit that removes a member: merging or skipping could fork the epoch, so
-/// the link halts, persisted and distinct from a refusal (`UndecidableCommit`,
+/// commit that removes a different member from a sender who is neither root
+/// nor admin: merging or skipping could fork the epoch, so the link halts, persisted and distinct from a refusal (`UndecidableCommit`,
 /// epoch and commit hash recorded), alerts once, and stays halted across a
 /// restart until an operator clears it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -661,8 +661,16 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
             _ => None,
         })
         .unwrap();
-    let (_c, welcome) = env.a.sim.stage_add(parse_kp(&kps[0]));
+    // A second, ordinary member joins first: root's own removes are decided
+    // without persona cards, so the halt needs a non-root sender removing a
+    // DIFFERENT DID (here B removing the bridge).
+    let mut b = Sim::new(2);
+    let (_cb, welcome_b) = env.a.sim.stage_add(b.key_package());
     env.a.sim.merge_pending();
+    b.join(&welcome_b);
+    let (commit_in, welcome) = env.a.sim.stage_add(parse_kp(&kps[0]));
+    env.a.sim.merge_pending();
+    b.apply(&commit_in).unwrap();
     env.a
         .dyad
         .send(
@@ -673,15 +681,14 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
         .unwrap();
     env.tick();
     p.parts.pump.start().await.unwrap();
-    let commit = env.a.sim.stage_remove(&p.parts.device_did);
+    let commit = b.stage_remove(&p.parts.device_did);
     post(
         &env.a.relay,
-        &env.a.sim.keys(ROOM),
-        &mc(env.a.sim.epoch(), &commit),
+        &b.keys(ROOM),
+        &mc(b.epoch(), &commit),
         env.secs(),
     )
     .await;
-    env.a.sim.merge_pending();
     env.tick();
     let _ = p.parts.pump.tick().await;
     for _ in 0..5 {

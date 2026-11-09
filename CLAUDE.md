@@ -39,15 +39,23 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   unreadable mailbox event is dropped and logged, never acted on. Without the
   `geb-mls` group a Geb commit (`mc`) stops the poll (the default
   `GebGroup::hold_commit` refuses): skipping a commit forks the epoch
-  silently. Geb's `validCommit` needs local knowledge (persona cards from
-  persona code, signed leaves `{t:"lv", at, ls}` from leave code) that we do
-  not have; the only production inputs are `geb::policy::NoLocalKnowledge`
-  (`can_evaluate() == false`). With them the `geb-mls` group merges a commit
-  only if it is Add-only, not in a direct room, and has no forged binding
-  (reasoning in `geb/mls/commit.rs`); a commit that removes a member or changes
-  the policy is neither merged nor skipped: the poll errors with
+  silently. Geb's `validCommit` needs local knowledge in exactly two cases (persona cards
+  from persona code, signed leaves `{t:"lv", at, ls}` from leave code), which
+  we do not have; the only production inputs are `geb::policy::NoLocalKnowledge`
+  (`can_evaluate() == false`). Everything else is decided without them
+  (round 2 section 7): ordinary adds, exact-DID root or admin removes, a bound
+  sender removing or re-seating its own DID, other re-seats, root policy
+  changes, a direct-room add of an exact pair member, and every 0.5.15 bound-leaf
+  refusal. Only (1) a Remove of a DIFFERENT DID by a sender who is neither root
+  nor admin and (2) a direct-room Add of a DID that is not exactly one of the
+  pair are neither merged nor skipped: the poll errors with
   `Error::UndecidableCommit` (epoch and commit hash in the text) and the link
-  halts, persisted, `HaltReason::UndecidableCommit` (see "Halts"). To turn ALL commit merging off,
+  halts, persisted, `HaltReason::UndecidableCommit` (see "Halts"). A card-free
+  refusal in the same commit wins over the undecidable part. UNVERIFIED (open
+  question 2): the root / admin test is an exact DID compare; if Geb's test also
+  accepts a root's sibling device through persona cards, a commit from one is
+  refused here and merged by Geb (a fork), and a non-root policy change is
+  refused rather than halted. To turn ALL commit merging off,
   leave `geb-mls` off.
 - **MLS wire strictness** (answers round 2, sections 1-2; `geb/mls/commit.rs`):
   every MLS object we read is a full RFC 9420 `MLSMessage`. `mc` / `ml` `m` must
@@ -246,9 +254,10 @@ The supervisor ends `End::Halted` for both kinds and never retries.
 - `HaltReason::Refused`: seating refused or our leaf removed by a merged
   commit (`Error::Refused`). Permanent.
 - `HaltReason::UndecidableCommit`: with production inputs
-  (`NoLocalKnowledge`) a commit that removes a member or changes policy cannot
-  be decided without persona cards or signed leaves, and neither merging nor
-  skipping is safe. The record names the commit's epoch and hash. Clearing
+  (`NoLocalKnowledge`) a Remove of a different DID by a sender who is neither
+  root nor admin, or a direct-room Add of a non-exact DID, cannot be decided
+  without persona cards or signed leaves, and neither merging nor skipping is
+  safe. The record names the commit's epoch and hash. Clearing
   makes the link read the commit again, so it halts again at once unless
   something changed.
 - `status` shows the halt and its reason. `link clear-halt <link>` prints what
@@ -267,8 +276,8 @@ The supervisor ends `End::Halted` for both kinds and never retries.
 ## Not built (blocked or later)
 
 M3 remainder: persona cards and signed leaves (`geb::policy::CommitCheckInputs`
-has only the `NoLocalKnowledge` production implementation), so removes and
-policy changes cannot be merged; leaving a room (a signed `{t:"lv"}`); a
+has only the `NoLocalKnowledge` production implementation), so the two
+card-dependent commit kinds halt the link; leaving a room (a signed `{t:"lv"}`); a
 re-seat after a fork (`rs` is sent, a replacement Welcome is not processed);
 a peer index (the dyad is driven per peer DID, peers are listed per link in
 `geb_peers`); `fc` fragments. Also not
