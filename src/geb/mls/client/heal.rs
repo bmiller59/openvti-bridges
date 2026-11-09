@@ -50,6 +50,23 @@ pub const ASK_BACKOFF_MS: u64 = 600_000;
 pub const REREAD_MIN_MS: u64 = 30_000;
 /// The same answer to the same status is repeated at most this often.
 const ANSWER_REPEAT_MS: u64 = 60_000;
+/// At most one `rc` burst (our stored Commits from the peer's epoch up) to one
+/// peer per this long, WHATEVER status it claims: the repeat guard above is
+/// keyed on the claimed `(e, a)`, which a member chooses, so it alone lets a
+/// member draw a burst of up to [`COMMIT_KEEP`] frames from every `rs`.
+/// UNVERIFIED (bridge-side, Geb states no limit): 60 s, the same as the
+/// answer repeat.
+pub const RC_BURST_MIN_INTERVAL_MS: u64 = 60_000;
+/// Across ALL peers, at most this many `rc` frames per
+/// [`RC_GLOBAL_WINDOW_MS`]. UNVERIFIED (bridge-side): two full bursts.
+pub const RC_GLOBAL_MAX_FRAMES: usize = 2 * COMMIT_KEEP;
+/// The window [`RC_GLOBAL_MAX_FRAMES`] is counted in.
+pub const RC_GLOBAL_WINDOW_MS: u64 = 60_000;
+/// A peer's claim to be ahead of us forces a re-read at most this often, per
+/// peer, on top of the global [`REREAD_MIN_MS`]. UNVERIFIED (bridge-side):
+/// five minutes; an honest peer that is really ahead is read from the relay by
+/// the first re-read, and our own settle loop keeps catching up after it.
+pub const REREAD_PEER_MIN_MS: u64 = 300_000;
 /// Start-up statuses, after the first settle pass (round 2 section 5).
 const START_SENDS_MS: [u64; 2] = [1_500, 8_000];
 /// Commit bytes kept for `rc`, and `rc` held for later epochs.
@@ -141,6 +158,12 @@ pub(super) struct HealState {
     pub announced: HashSet<String>,
     pub reread: bool,
     last_reread_ms: u64,
+    /// Per peer: when its claim last forced a re-read (see [`REREAD_PEER_MIN_MS`]).
+    last_reread_peer: HashMap<String, u64>,
+    /// Per peer: when it was last sent an `rc` burst ([`RC_BURST_MIN_INTERVAL_MS`]).
+    last_rc_burst: HashMap<String, u64>,
+    /// The global `rc` budget: window start (ms) and frames sent in it.
+    rc_window: (u64, usize),
     quiet_until_ms: u64,
     last_ask_ms: Option<u64>,
     last_kp_ask_ms: Option<u64>,
@@ -427,26 +450,57 @@ impl MlsGroupClient {
                     heal.pair.remove(peer);
                     // They lag: each Commit we hold from their epoch on, then
                     // our status again.
-                    for (e, bytes) in heal.commit_bytes.range(theirs.e..) {
-                        plan.rc.push(Frame::Group(GroupOp::Rc {
-                            room: RoomRef {
-                                id: self.cfg.room_id.clone(),
-                                name: None,
-                            },
-                            e: *e,
-                            c: STANDARD.encode(bytes),
-                        }));
+                    // Rate-limited per peer and globally, independent of the
+                    // claimed (e, a) (P1-8): a member cannot draw a burst from
+                    // every status it makes up.
+                    let peer_ok = heal
+                        .last_rc_burst
+                        .get(peer)
+                        .is_none_or(|at| now.saturating_sub(*at) >= RC_BURST_MIN_INTERVAL_MS);
+                    if now.saturating_sub(heal.rc_window.0) >= RC_GLOBAL_WINDOW_MS {
+                        heal.rc_window = (now, 0);
+                    }
+                    let budget = RC_GLOBAL_MAX_FRAMES.saturating_sub(heal.rc_window.1);
+                    if peer_ok && budget > 0 {
+                        for (e, bytes) in heal.commit_bytes.range(theirs.e..).take(budget) {
+                            plan.rc.push(Frame::Group(GroupOp::Rc {
+                                room: RoomRef {
+                                    id: self.cfg.room_id.clone(),
+                                    name: None,
+                                },
+                                e: *e,
+                                c: STANDARD.encode(bytes),
+                            }));
+                        }
+                        if !plan.rc.is_empty() {
+                            heal.last_rc_burst.insert(peer.to_string(), now);
+                            heal.rc_window.1 += plan.rc.len();
+                        }
+                    } else {
+                        tracing::debug!(
+                            peer_ok,
+                            budget,
+                            "rc burst withheld (rate limit); our status is still answered"
+                        );
                     }
                     plan.answer = true;
                 }
                 Comparison::Behind => {
                     // Re-read the room from its founding (paged and bounded by
                     // the relay's own manners), then answer.
-                    if heal.last_reread_ms == 0
-                        || now.saturating_sub(heal.last_reread_ms) >= REREAD_MIN_MS
+                    // Bounded globally and per peer (P1-8): a claim to be ahead
+                    // costs the peer nothing, so it must not buy a relay read
+                    // every 30 s.
+                    if (heal.last_reread_ms == 0
+                        || now.saturating_sub(heal.last_reread_ms) >= REREAD_MIN_MS)
+                        && heal
+                            .last_reread_peer
+                            .get(peer)
+                            .is_none_or(|at| now.saturating_sub(*at) >= REREAD_PEER_MIN_MS)
                     {
                         heal.reread = true;
                         heal.last_reread_ms = now;
+                        heal.last_reread_peer.insert(peer.to_string(), now);
                     }
                     let window = u64::from(group_policy(grp).settle_window_ms);
                     match heal.pair.get(peer) {

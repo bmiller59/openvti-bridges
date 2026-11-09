@@ -242,6 +242,86 @@ async fn a_lagging_peer_gets_each_missing_commit_as_rc_then_our_status() {
     assert_eq!(s.e, w.a.epoch());
 }
 
+fn rc_count(frames: &[Frame]) -> usize {
+    frames
+        .iter()
+        .filter(|f| matches!(f, Frame::Group(GroupOp::Rc { .. })))
+        .count()
+}
+
+/// P1-8: a member that varies the claimed `(e, a)` of its `rs` cannot defeat
+/// the repeat guard: `rc` bursts are limited per peer, whatever it claims.
+#[tokio::test]
+async fn an_rs_flood_with_varying_status_gets_one_rc_burst_per_peer_per_minute() {
+    let mut w = World::build(Arc::new(AllKnown), "");
+    w.seat().await;
+    let old_epoch = w.a.epoch();
+    a_commits_and_we_settle(&mut w).await;
+    sent(&w);
+    let mut rcs = 0;
+    for i in 0..40u64 {
+        w.bus.put(
+            &w.a.did,
+            &w.our_did,
+            Frame::Group(GroupOp::Rs {
+                room: Some(room_ref()),
+                // A different claimed authenticator each time, at an epoch
+                // below ours where we hold no chain entry: "we are ahead".
+                s: Some(st(old_epoch, &format!("{i:016x}"), vec![])),
+                via: None,
+            }),
+        );
+        // Within one minute (40 x 1 s).
+        w.at(w.now() + 1_000);
+        w.poll().await.unwrap();
+        rcs += rc_count(&sent(&w));
+    }
+    assert_eq!(rcs, 1, "one burst (one stored Commit) per peer per minute");
+    // A minute later the same peer may be answered again, once.
+    w.at(w.now() + 61_000);
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        Frame::Group(GroupOp::Rs {
+            room: Some(room_ref()),
+            s: Some(st(old_epoch, "ffffffffffffffff", vec![])),
+            via: None,
+        }),
+    );
+    w.poll().await.unwrap();
+    assert_eq!(rc_count(&sent(&w)), 1);
+}
+
+/// P1-8: a claim of "I am ahead" cannot force a re-read more than once per
+/// peer per `REREAD_PEER_MIN_MS`, whatever the claimed values.
+#[tokio::test]
+async fn a_member_claiming_to_be_ahead_cannot_force_a_reread_every_30_s() {
+    let mut w = World::build(Arc::new(AllKnown), "");
+    w.seat().await;
+    let e = w.client.epoch().unwrap();
+    let mut rereads = 0;
+    for i in 0..40u64 {
+        w.client
+            .on_rs(
+                &w.a.did,
+                Some(room_ref()),
+                Some(st(e + 1 + i, &format!("{i:016x}"), vec![])),
+            )
+            .await;
+        // 31 s apart: past the global 30 s floor each time.
+        w.at(w.now() + 31_000);
+        let r = w.client.settle(w.now()).await.unwrap();
+        if r.reread {
+            rereads += 1;
+        }
+    }
+    // 40 x 31 s = 20 minutes: one per 5 minutes at most (plus the first).
+    assert!(
+        rereads <= 5 && rereads >= 1,
+        "{rereads} re-reads in 20 minutes"
+    );
+}
+
 #[tokio::test]
 async fn rc_is_judged_at_once_for_our_epoch_held_for_later_and_dropped_below() {
     let mut w = World::build(Arc::new(AllKnown), "");
