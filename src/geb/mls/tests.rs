@@ -172,6 +172,68 @@ impl World {
     }
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// What every KeyPackage we hand out must be (round 3 section 5 and 3): a
+/// lifetime valid now (`not_before` at least an hour back, `not_after` 84 days
+/// ahead), and the `0xF002` leaf binding, which verifies against OUR device
+/// key for OUR DID and the leaf's own signature key.
+fn assert_outgoing_kp(kp: &KeyPackage, dev: &SigningKey, did: &str) {
+    let now = now_secs();
+    let life = kp.life_time();
+    assert!(
+        life.not_before() <= now.saturating_sub(3600) + 2 && life.not_before() + 3600 + 5 >= now,
+        "not_before is now minus one hour"
+    );
+    assert!(
+        life.not_after().abs_diff(now + 84 * 24 * 3600) <= 5,
+        "not_after is now plus 84 days"
+    );
+    life.validate().expect("the lifetime is valid now");
+    assert_eq!(binding_status(kp.leaf_node()), BindingStatus::Verified);
+    let ext = kp.leaf_node().extensions().unknown(0xF002).unwrap();
+    let key = <[u8; 32]>::try_from(kp.leaf_node().signature_key().as_slice()).unwrap();
+    leaf::verify(
+        &dev.verifying_key(),
+        did,
+        &key,
+        std::str::from_utf8(&ext.0).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn there_is_exactly_one_way_to_mint_a_keypackage_and_it_is_bound() {
+    // `MlsIdentity::key_package` is the only builder call outside the test
+    // simulator: an unbound outgoing package cannot be made by accident.
+    let mut n = 0;
+    for (name, src) in [
+        ("client.rs", include_str!("client.rs")),
+        ("commit.rs", include_str!("commit.rs")),
+        ("identity.rs", include_str!("identity.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+    ] {
+        let live = src.split("#[cfg(test)]").next().unwrap();
+        let c = live.matches("KeyPackage::builder()").count();
+        if name == "identity.rs" {
+            assert_eq!(c, 1);
+        } else {
+            assert_eq!(c, 0, "{name} mints a KeyPackage on its own");
+        }
+        n += c;
+    }
+    assert_eq!(n, 1);
+    // The one builder sets the binding and the lifetime.
+    let id = include_str!("identity.rs");
+    assert!(id.contains(".leaf_node_extensions(leaf_exts)"));
+    assert!(id.contains(".key_package_lifetime(key_package_lifetime(now_secs))"));
+}
+
 fn parse_kp(b64: &str) -> KeyPackage {
     super::parse_key_package(b64)
         .unwrap()
@@ -392,8 +454,9 @@ fn the_mls_key_is_random_and_not_the_device_key() {
     assert_eq!(b.len(), leaf::BINDING_LEN);
     leaf::verify(&dev.verifying_key(), &did, &id.leaf_key().unwrap(), &b).unwrap();
     // The KeyPackage carries it and declares exactly the two extensions.
-    let kp = id.key_package(&p, &signer).unwrap();
+    let kp = id.key_package(&p, &signer, now_secs()).unwrap();
     assert_eq!(kp.ciphersuite(), SUITE);
+    assert_outgoing_kp(&kp, &dev, &did);
     assert_eq!(binding_status(kp.leaf_node()), BindingStatus::Verified);
     let exts = kp.leaf_node().capabilities().extensions();
     assert!(exts.contains(&ExtensionType::Unknown(0xF001)));
@@ -451,6 +514,7 @@ async fn we_are_seated_over_the_dyad_from_a_stock() {
         assert!(caps.contains(&ExtensionType::Unknown(0xF001)));
         assert!(caps.contains(&ExtensionType::Unknown(0xF002)));
         assert_eq!(binding_status(kp.leaf_node()), BindingStatus::Verified);
+        assert_outgoing_kp(&kp, &w.our_dev, &w.our_did);
         // The binding verifies against OUR device DID's key.
         let ext = kp.leaf_node().extensions().unknown(0xF002).unwrap();
         let key = <[u8; 32]>::try_from(kp.leaf_node().signature_key().as_slice()).unwrap();
@@ -536,6 +600,7 @@ async fn a_kp_req_is_answered_with_a_kp_and_other_rooms_are_ignored() {
         .collect();
     assert_eq!(kps.len(), 1, "one kp, for our room only");
     assert_eq!(kps[0].0, ROOM);
+    assert_outgoing_kp(&parse_kp(&kps[0].1), &w.our_dev, &w.our_did);
     // A adds us with that KeyPackage and the welcome seats us.
     let (commit, welcome) = w.a.stage_add(parse_kp(&kps[0].1));
     w.a.merge_pending();

@@ -76,6 +76,25 @@ pub fn leaf_capabilities() -> Capabilities {
     Capabilities::new(None, None, Some(&declared_extensions()), None, None)
 }
 
+/// How far back a KeyPackage's `not_before` is set, seconds (round 3 section
+/// 5: at least an hour, so a receiver whose clock is behind ours does not
+/// refuse a package minted a moment ago).
+pub const LIFETIME_BACKDATE_SECS: u64 = 60 * 60;
+/// How long a KeyPackage is valid after minting, seconds: 84 days, the
+/// OpenMLS 0.8.2 default Geb's packages carry (Geb sets none).
+pub const LIFETIME_SECS: u64 = 84 * 24 * 60 * 60;
+
+/// The lifetime every outgoing KeyPackage carries: `not_before = now - 1 h`,
+/// `not_after = now + 84 days`. Set explicitly, so it does not move with an
+/// OpenMLS default; a package with no lifetime is refused by Geb's adder
+/// (`MissingLifetime`).
+pub fn key_package_lifetime(now_secs: u64) -> Lifetime {
+    Lifetime::init(
+        now_secs.saturating_sub(LIFETIME_BACKDATE_SECS),
+        now_secs.saturating_add(LIFETIME_SECS),
+    )
+}
+
 /// A device's MLS identity: signature key and BasicCredential (the device DID
 /// as UTF-8).
 pub struct MlsIdentity {
@@ -145,13 +164,17 @@ impl MlsIdentity {
         signer.sign_json(&leaf::binding_doc(&self.did, &self.leaf_key()?))
     }
 
-    /// A fresh single-use KeyPackage carrying the `0xF002` binding. The private
-    /// halves are written to the provider's storage, where the Welcome that
-    /// consumes it will find them.
+    /// A fresh single-use KeyPackage carrying the `0xF002` binding and an
+    /// explicit lifetime valid at `now_secs` ([`key_package_lifetime`]). This is
+    /// the ONLY way this crate mints a KeyPackage to hand out: there is no
+    /// unbound variant (round 3 section 3: an unbound package can never be
+    /// re-seated). The private halves are written to the provider's storage,
+    /// where the Welcome that consumes it will find them.
     pub fn key_package(
         &self,
         provider: &OpenMlsRustCrypto,
         device: &dyn GebSigner,
+        now_secs: u64,
     ) -> Result<KeyPackage> {
         let binding = self.binding(device)?;
         let ext = Extension::Unknown(
@@ -163,6 +186,7 @@ impl MlsIdentity {
         let bundle = KeyPackage::builder()
             .leaf_node_capabilities(leaf_capabilities())
             .leaf_node_extensions(leaf_exts)
+            .key_package_lifetime(key_package_lifetime(now_secs))
             .build(SUITE, provider, &self.signer, self.credential.clone())
             .map_err(|e| mls("key package", e))?;
         Ok(bundle.key_package().clone())

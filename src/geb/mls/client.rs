@@ -306,7 +306,13 @@ impl MlsGroupClient {
     }
 
     fn make_kp(&self, g: &Inner) -> Result<Vec<u8>> {
-        let kp = g.ident.key_package(&g.provider, self.device.as_ref())?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let kp = g
+            .ident
+            .key_package(&g.provider, self.device.as_ref(), now_secs)?;
         kp.tls_serialize_detached()
             .map_err(|e| mls("serialise key package", e))
     }
