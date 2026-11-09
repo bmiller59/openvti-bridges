@@ -699,6 +699,24 @@ impl MlsGroupClient {
         }
     }
 
+    /// Second half of the dyad hand-off: persist our own state, and only then
+    /// tell the dyad these frames are consumed. If the persist fails the frames
+    /// stay queued and come again (a missed commit is a redelivery, never a
+    /// loss).
+    async fn commit_consumed(&self, peer: &str, consumed: &[u32]) {
+        if consumed.is_empty() {
+            return;
+        }
+        let persisted = self.lock().and_then(|g| self.persist_state(&g));
+        if let Err(e) = persisted {
+            tracing::warn!(error = %e, "could not persist; the dyad frames stay queued");
+            return;
+        }
+        if let Err(e) = self.dyad.commit_recv(peer, consumed).await {
+            tracing::warn!(error = %e, "could not commit consumed dyad frames; they will come again");
+        }
+    }
+
     /// While seated: read each peer's dyad for `kp-low` and `seat-check`
     /// (at most every [`SERVICE_EVERY_MS`]); everything else is dropped.
     async fn service_dyads(&self, now_ms: u64) {
@@ -711,7 +729,7 @@ impl MlsGroupClient {
             g.last_service_ms = now_ms;
         }
         for peer in &self.cfg.peers {
-            let frames = match self.dyad.recv(peer).await {
+            let frames = match self.dyad.recv_counted(peer).await {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::debug!(error = %e, "dyad read failed while seated");
@@ -737,7 +755,8 @@ impl MlsGroupClient {
             if first {
                 self.send_rs_to(peer, false).await;
             }
-            for frame in frames {
+            let consumed: Vec<u32> = frames.iter().map(|(n, _)| *n).collect();
+            for (_, frame) in frames {
                 match frame {
                     Frame::Group(GroupOp::KpLow { generation, .. }) => {
                         self.answer_kp_low(peer, generation).await;
@@ -766,6 +785,7 @@ impl MlsGroupClient {
                     other => tracing::debug!(?other, "ignoring a dyad frame while seated"),
                 }
             }
+            self.commit_consumed(peer, &consumed).await;
         }
         let now = (self.clock)();
         if let Ok(mut g) = self.lock()
@@ -1042,7 +1062,7 @@ impl GebGroup for MlsGroupClient {
         }
         // 2. Answer kp-req, accept a welcome.
         for peer in &self.cfg.peers {
-            let frames = match self.dyad.recv(peer).await {
+            let frames = match self.dyad.recv_counted(peer).await {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::warn!(error = %e, "dyad read failed while seating");
@@ -1052,7 +1072,14 @@ impl GebGroup for MlsGroupClient {
             if let Err(e) = self.dyad.retransmit_due(peer).await {
                 tracing::debug!(error = %e, "could not repost unacked dyad frames");
             }
-            for frame in frames {
+            // Two-phase hand-off: a frame leaves the dyad's durable queue only
+            // after our state is persisted (`commit_consumed`). A crash before
+            // that redelivers it; every arm below is idempotent (a Welcome
+            // once seated is "stray", a kp-req / kp-low / seat-check answer is
+            // a repost, a leave and an `rc` are deduplicated by their content).
+            let mut consumed: Vec<u32> = Vec::new();
+            for (n, frame) in frames {
+                consumed.push(n);
                 match frame {
                     Frame::Group(GroupOp::KpReq { room }) if room.id == self.cfg.room_id => {
                         self.answer_kp_req(peer).await;
@@ -1072,18 +1099,27 @@ impl GebGroup for MlsGroupClient {
                             let replace = matches!(g.state, State::Reseating(_)).then_some(&**peer);
                             let r = self.join_from_welcome(&mut g, &room, &w, replace, false);
                             if r.is_ok() {
+                                g.heal.p.last_welcome =
+                                    Some(crate::geb::crypto::frame_id::frame_id(&w));
                                 self.persist_state(&g)?;
                             }
                             r
                         };
                         match outcome {
                             Ok(()) => {
+                                // The group is persisted (above): this Welcome
+                                // and the frames before it are consumed. Later
+                                // frames of the batch stay queued.
+                                self.commit_consumed(peer, &consumed).await;
                                 self.sync_fork_marker().await;
                                 self.send_rs_all(true, &[]).await;
                                 return Ok(JoinState::Seated);
                             }
                             // A refusal of the room itself stops the link.
-                            Err(e @ Error::Refused(_)) => return Err(e),
+                            Err(e @ Error::Refused(_)) => {
+                                self.commit_consumed(peer, &consumed).await;
+                                return Err(e);
+                            }
                             // Added from a package whose private keys we no
                             // longer hold: ask for a re-seat from a fresh,
                             // BOUND one (round 3 section 5, round 2 section 8).
@@ -1099,6 +1135,7 @@ impl GebGroup for MlsGroupClient {
                     }
                 }
             }
+            self.commit_consumed(peer, &consumed).await;
         }
         self.heal_unseated_tick().await;
         Ok(JoinState::Pending)

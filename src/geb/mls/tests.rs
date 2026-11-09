@@ -97,7 +97,7 @@ impl World {
             our_did.clone(),
             our_dev.clone(),
         ));
-        let dyad = MemDyad::new(&our_did, &bus);
+        let dyad = MemDyad::two_phase(&our_did, &bus);
         let mut mc = MlsConfig::new(ROOM, vec![a.did.clone()]);
         mc.allow_direct_for_test = allow_direct;
         // The client follows the world's clock (so a test steps both with
@@ -425,6 +425,46 @@ async fn a_bare_welcome_does_not_seat_us() {
         welcome_frame(ROOM, &w.a.did, &w.policy, &welcome),
     );
     assert_eq!(w.room.join().await.unwrap(), JoinState::Seated);
+}
+
+/// P1-3: a Welcome whose commit to the dyad was lost (a crash after the group
+/// was persisted, before the frame was dropped from the queue) comes again and
+/// is not applied twice; the queue empties once the commit lands.
+#[tokio::test]
+async fn a_redelivered_welcome_is_not_applied_twice_and_the_queue_drains() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    assert_eq!(w.room.join().await.unwrap(), JoinState::Pending);
+    let Some(Frame::Group(GroupOp::KpStock { kps, .. })) =
+        w.bus.take(&w.our_did, &w.a.did).first().cloned()
+    else {
+        panic!()
+    };
+    let (_c, welcome) = w.a.stage_add(parse_kp(&kps[0]));
+    w.a.merge_pending();
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        welcome_frame(ROOM, &w.a.did, &w.policy, &welcome),
+    );
+    // The commit to the dyad is lost: the Welcome seats us but stays queued.
+    w.dyad.drop_commits.store(true, SeqCst);
+    assert_eq!(w.room.join().await.unwrap(), JoinState::Seated);
+    let epoch = w.client.epoch();
+    assert_eq!(
+        w.bus.peek_held(&w.a.did, &w.our_did).len(),
+        1,
+        "the Welcome was not dropped before the commit"
+    );
+    // Redelivered while seated, with a re-seat even "expected": skipped.
+    let now = now_secs() * 1000 + 60_000;
+    w.client.settle(now).await.unwrap();
+    assert_eq!(w.client.epoch(), epoch, "not applied a second time");
+    assert!(w.room.join().await.is_ok());
+    // The commit lands: the queue drains.
+    w.dyad.drop_commits.store(false, SeqCst);
+    w.client.settle(now + 120_000).await.unwrap();
+    assert!(w.bus.peek_held(&w.a.did, &w.our_did).is_empty());
 }
 
 #[test]

@@ -210,13 +210,12 @@ async fn connect_when_apart_and_acked_messages_over_a_real_socket() {
         n.a.send(n.b.did(), &msg(t)).await.unwrap();
     }
     tick(&n);
-    let got: Vec<_> =
-        n.b.recv(n.a.did())
-            .await
-            .unwrap()
-            .iter()
-            .map(text)
-            .collect();
+    let got: Vec<_> = take(&n.b, n.a.did())
+        .await
+        .unwrap()
+        .iter()
+        .map(text)
+        .collect();
     assert_eq!(got, ["one", "two", "three"]);
     tick(&n);
     let r = n.a.sync(n.b.did()).await.unwrap();
@@ -243,13 +242,12 @@ async fn connect_when_apart_and_acked_messages_over_a_real_socket() {
     n.a.send(n.b.did(), &msg("after reconnect")).await.unwrap();
     assert!(n.a_relay.is_connected(), "and back up");
     tick(&n);
-    let got: Vec<_> =
-        n.b.recv(n.a.did())
-            .await
-            .unwrap()
-            .iter()
-            .map(text)
-            .collect();
+    let got: Vec<_> = take(&n.b, n.a.did())
+        .await
+        .unwrap()
+        .iter()
+        .map(text)
+        .collect();
     assert_eq!(got, ["across the drop", "after reconnect"]);
 
     // Our own `d` is dropped; an expired event is dropped.
@@ -258,7 +256,19 @@ async fn connect_when_apart_and_acked_messages_over_a_real_socket() {
     assert_eq!(r.frames, 0);
     n.a.send(n.b.did(), &msg("never read")).await.unwrap();
     n.now.fetch_add(8 * 86_400, Ordering::SeqCst);
-    assert!(n.b.recv(n.a.did()).await.unwrap().is_empty());
+    assert!(take(&n.b, n.a.did()).await.unwrap().is_empty());
+}
+
+/// Read and consume, as a consumer that has persisted its own state does.
+async fn take(
+    d: &vti_geb_bridge::geb::dyad::StatefulDyad,
+    peer: &str,
+) -> vti_geb_bridge::Result<Vec<vti_geb_bridge::geb::wire::Frame>> {
+    use vti_geb_bridge::geb::traits::GebDyad;
+    let got = d.recv_counted(peer).await?;
+    let counters: Vec<u32> = got.iter().map(|(n, _)| *n).collect();
+    d.commit_recv(peer, &counters).await?;
+    Ok(got.into_iter().map(|(_, f)| f).collect())
 }
 
 // ---- relay manners (round 3 section 7 and 6) --------------------------------

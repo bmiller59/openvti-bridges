@@ -114,6 +114,12 @@ pub(super) struct Persist {
     pub joined_ms: Option<u64>,
     pub was_seated: bool,
     pub reseating: bool,
+    /// Frame id of the last Welcome applied (first join or re-seat). A dyad
+    /// frame is redelivered after a crash between its read and our persist
+    /// (the two-phase hand-off); a Welcome already applied is then skipped,
+    /// never applied twice.
+    #[serde(default)]
+    pub last_welcome: Option<String>,
 }
 
 struct SentRs {
@@ -640,6 +646,11 @@ impl MlsGroupClient {
             if !matches!(g.state, State::Seated(_) | State::Reseating(_)) {
                 return;
             }
+            let wid = crate::geb::crypto::frame_id::frame_id(w);
+            if g.heal.p.last_welcome.as_deref() == Some(wid.as_str()) {
+                tracing::debug!("a Welcome already applied came again (redelivery); skipped");
+                return;
+            }
             let Some((why, lower_ok)) = Self::reseat_expected(&g, now) else {
                 tracing::warn!(
                     security_alert = true,
@@ -650,13 +661,16 @@ impl MlsGroupClient {
             };
             tracing::info!(why, "a replacing Welcome is expected; checking it");
             match self.join_from_welcome(&mut g, room, w, Some(peer), lower_ok) {
-                Ok(()) => match self.persist_state(&g) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::error!(error = %e, "could not persist after a re-seat");
-                        true
+                Ok(()) => {
+                    g.heal.p.last_welcome = Some(wid);
+                    match self.persist_state(&g) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::error!(error = %e, "could not persist after a re-seat");
+                            true
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "ignoring a welcome while seated (not a re-seat of us)");
                     false

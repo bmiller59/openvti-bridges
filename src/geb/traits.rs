@@ -44,8 +44,31 @@ pub trait GebRelay: Send + Sync {
 pub trait GebDyad: Send + Sync {
     /// Send a frame to a peer.
     async fn send(&self, peer_did: &str, frame: &super::wire::Frame) -> Result<()>;
-    /// Frames received from a peer.
-    async fn recv(&self, peer_did: &str) -> Result<Vec<super::wire::Frame>>;
+    /// Frames received from a peer, each with its receive counter, in counter
+    /// order. **Two-phase hand-off:** reading does not consume. Frames stay
+    /// queued (durably, for a real dyad) and are handed over again, by this
+    /// call and after a restart, until the consumer has acted on them, made
+    /// its own state durable, and then called [`GebDyad::commit_recv`] with
+    /// their counters. A crash in between therefore redelivers an acked
+    /// frame instead of losing it, so consumers must be idempotent.
+    async fn recv_counted(&self, peer_did: &str) -> Result<Vec<(u32, super::wire::Frame)>>;
+    /// The consumer has acted on (and persisted the effect of) the frames
+    /// with these counters: drop them from the queue, durably. Counters not
+    /// in the queue are ignored. Default: nothing to drop (a channel that
+    /// consumes on read).
+    async fn commit_recv(&self, _peer_did: &str, _counters: &[u32]) -> Result<()> {
+        Ok(())
+    }
+    /// The frames of [`GebDyad::recv_counted`] without their counters. Does not
+    /// consume: the caller that needs the hand-off uses `recv_counted`.
+    async fn recv(&self, peer_did: &str) -> Result<Vec<super::wire::Frame>> {
+        Ok(self
+            .recv_counted(peer_did)
+            .await?
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect())
+    }
     /// Repost the frames to `peer_did` that are due for it, in send order, and
     /// return how many. Called on a bounded schedule by the service loop.
     /// Default: nothing to repost.

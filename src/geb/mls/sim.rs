@@ -28,6 +28,10 @@ use tls_codec::{Deserialize as _, Serialize as _};
 #[derive(Default)]
 pub struct Bus {
     q: Mutex<HashMap<(String, String), VecDeque<Frame>>>,
+    /// Frames read through a two-phase [`MemDyad`], kept (with a counter)
+    /// until the reader commits them.
+    held: Mutex<HashMap<(String, String), Vec<(u32, Frame)>>>,
+    seq: std::sync::atomic::AtomicU32,
 }
 
 impl Bus {
@@ -44,6 +48,26 @@ impl Bus {
             })
             .unwrap_or_default()
     }
+    /// Everything not yet committed, new frames first assigned a counter.
+    pub fn peek_held(&self, from: &str, to: &str) -> Vec<(u32, Frame)> {
+        let fresh = self.take(from, to);
+        let Ok(mut h) = self.held.lock() else {
+            return Vec::new();
+        };
+        let list = h.entry((from.to_string(), to.to_string())).or_default();
+        for f in fresh {
+            let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            list.push((n, f));
+        }
+        list.clone()
+    }
+    pub fn commit_held(&self, from: &str, to: &str, counters: &[u32]) {
+        if let Ok(mut h) = self.held.lock()
+            && let Some(l) = h.get_mut(&(from.to_string(), to.to_string()))
+        {
+            l.retain(|(n, _)| !counters.contains(n));
+        }
+    }
     pub fn put(&self, from: &str, to: &str, f: Frame) {
         if let Ok(mut q) = self.q.lock() {
             q.entry((from.to_string(), to.to_string()))
@@ -58,14 +82,30 @@ pub struct MemDyad {
     me: String,
     bus: Arc<Bus>,
     pub sent: Mutex<Vec<(String, Frame)>>,
+    /// Keep frames until `commit_recv` (the real dyad's two-phase hand-off).
+    two_phase: bool,
+    /// Ignore `commit_recv`: a crash between the read and the commit.
+    pub drop_commits: std::sync::atomic::AtomicBool,
 }
 
 impl MemDyad {
+    /// A dyad that redelivers until committed, like `StatefulDyad`.
+    pub fn two_phase(me: &str, bus: &Arc<Bus>) -> Arc<Self> {
+        Arc::new(Self {
+            me: me.into(),
+            bus: bus.clone(),
+            sent: Mutex::new(Vec::new()),
+            two_phase: true,
+            drop_commits: Default::default(),
+        })
+    }
     pub fn new(me: &str, bus: &Arc<Bus>) -> Arc<Self> {
         Arc::new(Self {
             me: me.into(),
             bus: bus.clone(),
             sent: Mutex::new(Vec::new()),
+            two_phase: false,
+            drop_commits: Default::default(),
         })
     }
 }
@@ -80,8 +120,23 @@ impl GebDyad for MemDyad {
         self.bus.put(&self.me, peer_did, frame.clone());
         Ok(())
     }
-    async fn recv(&self, peer_did: &str) -> Result<Vec<Frame>> {
-        Ok(self.bus.take(peer_did, &self.me))
+    async fn recv_counted(&self, peer_did: &str) -> Result<Vec<(u32, Frame)>> {
+        if self.two_phase {
+            return Ok(self.bus.peek_held(peer_did, &self.me));
+        }
+        // The in-memory bus consumes on read; `commit_recv` has nothing to do.
+        Ok(self
+            .bus
+            .take(peer_did, &self.me)
+            .into_iter()
+            .map(|f| (0, f))
+            .collect())
+    }
+    async fn commit_recv(&self, peer_did: &str, counters: &[u32]) -> Result<()> {
+        if self.two_phase && !self.drop_commits.load(std::sync::atomic::Ordering::SeqCst) {
+            self.bus.commit_held(peer_did, &self.me, counters);
+        }
+        Ok(())
     }
 }
 

@@ -1199,29 +1199,51 @@ impl GebDyad for StatefulDyad {
         self.send_inner(p, peer_did, frame).await
     }
 
-    /// Sync, then hand over (and durably clear) the opened frames. The caller
-    /// must journal what it receives before it asks again.
-    async fn recv(&self, peer_did: &str) -> Result<Vec<Frame>> {
+    /// Sync, then hand over the opened frames in counter order **without
+    /// clearing them** (the first half of a two-phase hand-off). They stay in
+    /// the durable inbound queue, and are handed over again, until
+    /// [`GebDyad::commit_recv`] names their counters, which the consumer does
+    /// after its own state is persisted. A frame is acked once it is durably
+    /// queued, so a crash before the commit would otherwise lose a frame the
+    /// sender believes delivered (a Welcome, a leave, an `rc`).
+    async fn recv_counted(&self, peer_did: &str) -> Result<Vec<(u32, Frame)>> {
         let mut lease = self.lease()?;
         let core = lease.core.get_or_insert_with(HashMap::new);
         self.sync_inner(core, peer_did).await?;
         let Some(p) = core.get_mut(peer_did) else {
             return Ok(Vec::new());
         };
-        let Some(r) = p.ratchet.as_mut() else {
+        let Some(r) = p.ratchet.as_ref() else {
             return Ok(Vec::new());
         };
-        if r.inbound.is_empty() {
-            return Ok(Vec::new());
-        }
-        let held = std::mem::take(&mut r.inbound);
-        let mut sorted = held.clone();
+        let mut sorted = r.inbound.clone();
         sorted.sort_by_key(|(n, _)| *n);
+        Ok(sorted)
+    }
+
+    /// The second half: drop the named frames from the durable queue. Saved
+    /// before returning; on a failed save the queue is restored, so the frames
+    /// are handed over again rather than lost.
+    async fn commit_recv(&self, peer_did: &str, counters: &[u32]) -> Result<()> {
+        if counters.is_empty() {
+            return Ok(());
+        }
+        let mut lease = self.lease()?;
+        let core = lease.core.get_or_insert_with(HashMap::new);
+        self.load(core, peer_did).await?;
+        let Some(r) = core.get_mut(peer_did).and_then(|p| p.ratchet.as_mut()) else {
+            return Ok(());
+        };
+        let before = r.inbound.clone();
+        r.inbound.retain(|(n, _)| !counters.contains(n));
+        if r.inbound.len() == before.len() {
+            return Ok(());
+        }
         if let Err(e) = self.save_ratchet(peer_did, r).await {
-            r.inbound = held;
+            r.inbound = before;
             return Err(e);
         }
-        Ok(sorted.into_iter().map(|(_, f)| f).collect())
+        Ok(())
     }
 }
 
@@ -1307,6 +1329,14 @@ mod tests {
         assert_eq!(r.phase, Some(Phase::Connected));
     }
 
+    /// Read and consume, as a consumer that has persisted does.
+    async fn take(d: &StatefulDyad, peer: &str) -> Result<Vec<Frame>> {
+        let got = d.recv_counted(peer).await?;
+        let counters: Vec<u32> = got.iter().map(|(n, _)| *n).collect();
+        d.commit_recv(peer, &counters).await?;
+        Ok(got.into_iter().map(|(_, f)| f).collect())
+    }
+
     fn envelopes(w: &World) -> Vec<Envelope> {
         let keys = pair_keys(&w.a.id.e_secret, &e_pub_of(w.b.did()).unwrap()).unwrap();
         w.relay
@@ -1335,16 +1365,15 @@ mod tests {
         }
         assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), 3, "cap was acked");
         w.now.fetch_add(1, Ordering::SeqCst);
-        let got: Vec<_> =
-            w.b.recv(w.a.did())
-                .await
-                .unwrap()
-                .iter()
-                .map(text)
-                .collect();
+        let got: Vec<_> = take(&w.b, w.a.did())
+            .await
+            .unwrap()
+            .iter()
+            .map(text)
+            .collect();
         assert_eq!(got, ["one", "two", "three"]);
         assert!(
-            w.b.recv(w.a.did()).await.unwrap().is_empty(),
+            take(&w.b, w.a.did()).await.unwrap().is_empty(),
             "drained once"
         );
         w.b.send(w.a.did(), &msg("back")).await.unwrap();
@@ -1373,7 +1402,7 @@ mod tests {
     async fn unknown_group_ops_are_acked_and_ignored_and_unknown_kinds_fail_closed() {
         let w = world();
         connect(&w).await;
-        w.b.recv(w.a.did()).await.unwrap();
+        take(&w.b, w.a.did()).await.unwrap();
         let ignored = [
             r#"{"k":"g","op":"rq","room":{"id":"geb-room-0001"},"after":{}}"#,
             r#"{"k":"g","op":"fc","room":{"id":"geb-room-0001"},"e":3,"c":"AAAA"}"#,
@@ -1394,7 +1423,7 @@ mod tests {
         }
         w.a.send(w.b.did(), &msg("after")).await.unwrap();
         w.now.fetch_add(1, Ordering::SeqCst);
-        let got = w.b.recv(w.a.did()).await.unwrap();
+        let got = take(&w.b, w.a.did()).await.unwrap();
         assert_eq!(
             got.iter().map(text).collect::<Vec<_>>(),
             ["after"],
@@ -1415,11 +1444,11 @@ mod tests {
     async fn a_well_formed_leave_is_handed_to_the_consumer_and_acked() {
         let w = world();
         connect(&w).await;
-        w.b.recv(w.a.did()).await.unwrap();
+        take(&w.b, w.a.did()).await.unwrap();
         let j = r#"{"k":"g","op":"leave","room":{"id":"geb-room-0001"},"by":"did:peer:2.x","at":5,"sig":"s"}"#;
         w.a.send_raw(w.b.did(), j.as_bytes()).await.unwrap();
         w.now.fetch_add(1, Ordering::SeqCst);
-        let got = w.b.recv(w.a.did()).await.unwrap();
+        let got = take(&w.b, w.a.did()).await.unwrap();
         assert!(
             matches!(got.as_slice(), [Frame::Group(GroupOp::Leave { at: 5, .. })]),
             "{got:?}"
@@ -1434,7 +1463,7 @@ mod tests {
     async fn out_of_order_duplicate_and_reposted_events_open_each_frame_once() {
         let w = world();
         connect(&w).await;
-        w.b.recv(w.a.did()).await.unwrap();
+        take(&w.b, w.a.did()).await.unwrap();
         // Later frames carry earlier created_at: the relay order and the
         // ratchet order disagree, so skipped keys are used.
         for (i, t) in [(10u64, "m0"), (5, "m1"), (0, "m2")] {
@@ -1445,19 +1474,18 @@ mod tests {
         let dup = w.relay.all().last().unwrap().clone();
         w.relay.inject(dup);
         w.now.store(T0 + 200, Ordering::SeqCst);
-        let mut got: Vec<_> =
-            w.b.recv(w.a.did())
-                .await
-                .unwrap()
-                .iter()
-                .map(text)
-                .collect();
+        let mut got: Vec<_> = take(&w.b, w.a.did())
+            .await
+            .unwrap()
+            .iter()
+            .map(text)
+            .collect();
         got.sort();
         assert_eq!(got, ["m0", "m1", "m2"]);
         // A retransmission is a new event with the same frame: re-acked, not re-delivered.
         assert_eq!(w.a.retransmit(w.b.did()).await.unwrap(), 4);
         w.now.store(T0 + 201, Ordering::SeqCst);
-        assert!(w.b.recv(w.a.did()).await.unwrap().is_empty());
+        assert!(take(&w.b, w.a.did()).await.unwrap().is_empty());
         w.now.store(T0 + 202, Ordering::SeqCst);
         w.a.sync(w.b.did()).await.unwrap();
         assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), 0);
@@ -1467,7 +1495,7 @@ mod tests {
     async fn our_own_echo_a_forged_event_and_an_expired_event_are_dropped() {
         let w = world();
         connect(&w).await;
-        w.b.recv(w.a.did()).await.unwrap();
+        take(&w.b, w.a.did()).await.unwrap();
         w.a.send(w.b.did(), &msg("hello")).await.unwrap();
         // A reads the mailbox it just wrote: its own `d` side, dropped, no frame.
         w.now.fetch_add(1, Ordering::SeqCst);
@@ -1478,12 +1506,12 @@ mod tests {
         let mut forged = w.relay.all().last().unwrap().clone();
         forged.sig = "11".repeat(64);
         w.relay.inject(forged);
-        let got = w.b.recv(w.a.did()).await.unwrap();
+        let got = take(&w.b, w.a.did()).await.unwrap();
         assert_eq!(got.iter().map(text).collect::<Vec<_>>(), ["hello"]);
         // An event that expired before B read it.
         w.a.send(w.b.did(), &msg("late")).await.unwrap();
         w.now.fetch_add(8 * 86_400, Ordering::SeqCst);
-        assert!(w.b.recv(w.a.did()).await.unwrap().is_empty());
+        assert!(take(&w.b, w.a.did()).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1494,15 +1522,63 @@ mod tests {
         w.now.fetch_add(1, Ordering::SeqCst);
         // B restarts over the same store halfway.
         let b2 = dyad(ident(2), w.relay.clone(), w.b_store.clone(), &w.now);
-        let got = b2.recv(w.a.did()).await.unwrap();
+        let got = take(&b2, w.a.did()).await.unwrap();
         assert_eq!(got.iter().map(text).collect::<Vec<_>>(), ["before"]);
         let a2 = dyad(ident(1), w.relay.clone(), w.a_store.clone(), &w.now);
         a2.send(w.b.did(), &msg("after")).await.unwrap();
         w.now.fetch_add(1, Ordering::SeqCst);
         let b3 = dyad(ident(2), w.relay.clone(), w.b_store.clone(), &w.now);
-        let got = b3.recv(w.a.did()).await.unwrap();
+        let got = take(&b3, w.a.did()).await.unwrap();
         assert_eq!(got.iter().map(text).collect::<Vec<_>>(), ["after"]);
         assert_eq!(a2.phase(w.b.did()).await.unwrap(), Some(Phase::Connected));
+    }
+
+    /// P1-3: a crash between `recv` and the consumer persisting its own state
+    /// must not lose an already-acked frame.
+    #[tokio::test]
+    async fn a_crash_between_recv_and_the_consumers_persist_redelivers_the_frame() {
+        let w = world();
+        connect(&w).await;
+        w.a.send(w.b.did(), &msg("welcome-ish")).await.unwrap();
+        w.now.fetch_add(1, Ordering::SeqCst);
+        // B reads it (and acks it), then dies before acting on it.
+        let got = w.b.recv(w.a.did()).await.unwrap();
+        assert_eq!(got.iter().map(text).collect::<Vec<_>>(), ["welcome-ish"]);
+        let b2 = dyad(ident(2), w.relay.clone(), w.b_store.clone(), &w.now);
+        let again = b2.recv(w.a.did()).await.unwrap();
+        assert_eq!(
+            again.iter().map(text).collect::<Vec<_>>(),
+            ["welcome-ish"],
+            "unconsumed frames are handed over again after a restart"
+        );
+    }
+
+    /// P1-3: reading twice without a commit hands over the same frame once
+    /// each time (no duplicate queued), a commit drops exactly the named
+    /// counters durably, and the frame is never re-opened from the relay.
+    #[tokio::test]
+    async fn uncommitted_frames_repeat_without_duplicating_and_a_commit_is_durable() {
+        let w = world();
+        connect(&w).await;
+        w.a.send(w.b.did(), &msg("one")).await.unwrap();
+        w.a.send(w.b.did(), &msg("two")).await.unwrap();
+        w.now.fetch_add(1, Ordering::SeqCst);
+        let first = w.b.recv_counted(w.a.did()).await.unwrap();
+        let second = w.b.recv_counted(w.a.did()).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            first.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            second.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            "a second read repeats, it does not duplicate"
+        );
+        // Commit only the first; a restart still holds the second.
+        w.b.commit_recv(w.a.did(), &[first[0].0]).await.unwrap();
+        let b2 = dyad(ident(2), w.relay.clone(), w.b_store.clone(), &w.now);
+        let left = b2.recv(w.a.did()).await.unwrap();
+        assert_eq!(left.iter().map(text).collect::<Vec<_>>(), ["two"]);
+        b2.commit_recv(w.a.did(), &[first[1].0]).await.unwrap();
+        let b3 = dyad(ident(2), w.relay.clone(), w.b_store.clone(), &w.now);
+        assert!(b3.recv(w.a.did()).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1809,7 +1885,7 @@ mod tests {
             b,
         };
         connect(&w).await;
-        w.b.recv(w.a.did()).await.unwrap();
+        take(&w.b, w.a.did()).await.unwrap();
         w.a.send(w.b.did(), &msg("durable?")).await.unwrap();
         let acks = |w: &World| {
             envelopes(w)
@@ -1820,13 +1896,13 @@ mod tests {
         let before = acks(&w);
         bs.fail.store(true, Ordering::SeqCst);
         now.fetch_add(1, Ordering::SeqCst);
-        assert!(w.b.recv(w.a.did()).await.is_err());
+        assert!(take(&w.b, w.a.did()).await.is_err());
         assert_eq!(acks(&w), before, "no ack when the state could not be saved");
         // The failure is recoverable: the lease came back, and a retry works.
         bs.fail.store(false, Ordering::SeqCst);
         let b2 = dyad(ident(2), relay.clone(), bs.clone(), &now);
         assert_eq!(
-            b2.recv(w.a.did())
+            take(&b2, w.a.did())
                 .await
                 .unwrap()
                 .iter()
@@ -1860,7 +1936,7 @@ mod tests {
     /// Ack everything sent so far: B reads, A syncs.
     async fn settle_acks(w: &World) {
         w.now.fetch_add(1, Ordering::SeqCst);
-        w.b.recv(w.a.did()).await.unwrap();
+        take(&w.b, w.a.did()).await.unwrap();
         w.now.fetch_add(1, Ordering::SeqCst);
         w.a.sync(w.b.did()).await.unwrap();
     }
@@ -1896,13 +1972,12 @@ mod tests {
         assert_ne!(hashes, order, "the ids are not already in sorted order");
         // The peer gets all five, in order, and the sender's pending drains.
         w.now.fetch_add(1, Ordering::SeqCst);
-        let got: Vec<_> =
-            w.b.recv(w.a.did())
-                .await
-                .unwrap()
-                .iter()
-                .map(text)
-                .collect();
+        let got: Vec<_> = take(&w.b, w.a.did())
+            .await
+            .unwrap()
+            .iter()
+            .map(text)
+            .collect();
         assert_eq!(got, ["m0", "m1", "m2", "m3", "m4"]);
         w.now.fetch_add(1, Ordering::SeqCst);
         w.a.sync(w.b.did()).await.unwrap();
@@ -1931,7 +2006,7 @@ mod tests {
         assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), MAX_UNACKED);
         // The peer comes back: every frame opens, in order, none lost.
         w.now.fetch_add(1, Ordering::SeqCst);
-        let got = w.b.recv(w.a.did()).await.unwrap();
+        let got = take(&w.b, w.a.did()).await.unwrap();
         assert_eq!(got.len(), MAX_UNACKED);
         assert_eq!(text(&got[0]), "m0");
         assert_eq!(text(&got[MAX_UNACKED - 1]), format!("m{}", MAX_UNACKED - 1));
@@ -1976,13 +2051,12 @@ mod tests {
         w.now.fetch_add(REPOST_AFTER_SECS, Ordering::SeqCst);
         assert_eq!(w.a.retransmit_due(w.b.did()).await.unwrap(), 1);
         w.now.fetch_add(1, Ordering::SeqCst);
-        let got: Vec<_> =
-            w.b.recv(w.a.did())
-                .await
-                .unwrap()
-                .iter()
-                .map(text)
-                .collect();
+        let got: Vec<_> = take(&w.b, w.a.did())
+            .await
+            .unwrap()
+            .iter()
+            .map(text)
+            .collect();
         assert!(got.contains(&"lost".to_string()), "{got:?}");
     }
 }
