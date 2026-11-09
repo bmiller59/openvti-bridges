@@ -54,6 +54,7 @@ pub mod nostr;
 pub mod policy;
 pub mod room;
 pub mod settle;
+pub mod status;
 #[cfg(feature = "geb-live")]
 pub mod test_relay;
 pub mod traits;

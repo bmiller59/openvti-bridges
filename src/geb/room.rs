@@ -100,6 +100,12 @@ impl GebRoom {
 
     /// One pass under the current epoch's relay keys.
     async fn poll_epoch(&self, after: Option<&Cursor>) -> Result<(Vec<Polled>, SettleReport)> {
+        // A merged commit re-seated us: no group until its Welcome comes over
+        // the dyad, which the settle pass reads. Nothing to read meanwhile.
+        if self.group.awaiting_reseat() {
+            let report = self.group.settle((self.clock)()).await?;
+            return Ok((Vec::new(), report));
+        }
         let keys = self.group.relay_keys()?;
         let mailbox = keys.pubkey_hex()?;
         // Never an unbounded read: from the cursor minus 300 s, or on the first
@@ -214,6 +220,27 @@ impl GebRoom {
                     continue;
                 }
             };
+            // A dead-branch re-post (`fk:1`, answers round 4 Q10) carries the
+            // original line's id: skip it when we already bridged that line.
+            // Every line also records its derived id, so a later re-post of it
+            // is recognised.
+            let derived = line_id(&self.room_id, &opened.sender_did, line.at, &line.text).ok();
+            let line_key = if line.is_repost() {
+                line.id.clone().or(derived.clone())
+            } else {
+                derived
+            };
+            if let Some(k) = line_key {
+                let fresh = self
+                    .seen
+                    .lock()
+                    .map_err(|_| Error::Foreign("poisoned".into()))?
+                    .check_and_insert(&format!("line:{k}"), now);
+                if !fresh && line.is_repost() {
+                    tracing::debug!("dropping a re-posted line we already hold");
+                    continue;
+                }
+            }
             let check = self.check_author(&opened.sender_did, &line);
             out.push(Polled {
                 event: BridgeEvent {
@@ -272,10 +299,16 @@ impl ForeignRoom for GebRoom {
 
     async fn poll(&self, after: Option<&Cursor>) -> Result<Vec<Polled>> {
         let mut out = Vec::new();
+        let mut after = after;
         // A merged commit changes the relay keys: read again under the new
-        // ones (bounded, so a flood of commits cannot spin us).
+        // ones (bounded, so a flood of commits cannot spin us). A status that
+        // says we are behind, or a re-seat, asks for a re-read from the start
+        // of the relay's retention instead of from the cursor.
         for _ in 0..MAX_EPOCH_HOPS {
             let (mut got, report) = self.poll_epoch(after).await?;
+            if report.reread {
+                after = None;
+            }
             // The read cursor stays before a held or failed commit.
             if let Some(barrier) = report.cursor_barrier_secs {
                 for p in &mut got {
@@ -288,10 +321,11 @@ impl ForeignRoom for GebRoom {
                 }
             }
             out.extend(got);
-            if !report.epoch_changed {
+            if !(report.epoch_changed || report.reread) {
                 break;
             }
         }
+        self.flush_reposts().await;
         Ok(out)
     }
 
@@ -316,10 +350,60 @@ impl ForeignRoom for GebRoom {
         // A retraction (or a supersede, where edit is unsupported) is an
         // ordinary signed line whose `re` is the original line's derived id:
         // never a new message kind (answer 11).
-        let mut line = match &event.reply_to {
+        let line = match &event.reply_to {
             Some(re) => LineBody::reply(event.at, event.text.clone(), re.clone()),
             None => LineBody::new(event.at, event.text.clone()),
         };
+        self.publish_line(line).await
+    }
+
+    fn identity(&self) -> ForeignIdentity {
+        ForeignIdentity {
+            id: self.signer.did().to_string(),
+        }
+    }
+
+    fn capabilities(&self) -> RoomCapabilities {
+        self.capabilities_inner()
+    }
+}
+
+impl GebRoom {
+    /// After a re-seat: re-post OUR OWN lines from the dead branch (answers
+    /// round 4 Q10), at most 100, text lines only, each with its original
+    /// `at` and its original id, as `{t:"l", ..., fk:1, id}`, signed afresh.
+    /// They go straight out through the group and bypass the pump, so the
+    /// bridge never sees them as new foreign lines (our own leaf is skipped on
+    /// read, and the derived-id check above skips the re-post of anything
+    /// already bridged).
+    async fn flush_reposts(&self) {
+        let pending = self.group.pending_reposts();
+        if pending.is_empty() {
+            return;
+        }
+        let mut done = 0;
+        for mut line in pending {
+            let Ok(id) = line_id(&self.room_id, self.signer.did(), line.at, &line.text) else {
+                done += 1; // never postable; do not retry forever
+                continue;
+            };
+            line.fk = Some(serde_json::json!(1));
+            line.id = Some(id);
+            match self.publish_line(line).await {
+                Ok(_) => done += 1,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not re-post a dead-branch line; will retry");
+                    break;
+                }
+            }
+        }
+        if let Err(e) = self.group.reposts_done(done) {
+            tracing::warn!(error = %e, "could not record the re-posted lines");
+        }
+    }
+
+    /// Sign, seal, publish and read back one line (the tail of `post`).
+    async fn publish_line(&self, mut line: LineBody) -> Result<Posted> {
         let foreign_ref = line_id(&self.room_id, self.signer.did(), line.at, &line.text)?;
         let doc = signing_doc(&self.room_id, self.signer.did(), &line)?;
         line.sg = Some(self.signer.sign_json(&doc)?);
@@ -363,13 +447,7 @@ impl ForeignRoom for GebRoom {
         })
     }
 
-    fn identity(&self) -> ForeignIdentity {
-        ForeignIdentity {
-            id: self.signer.did().to_string(),
-        }
-    }
-
-    fn capabilities(&self) -> RoomCapabilities {
+    fn capabilities_inner(&self) -> RoomCapabilities {
         RoomCapabilities {
             // Geb caps a line at 20,000 UTF-16 code units; a byte cap of
             // 20,000 satisfies that for any UTF-8 text (a unit is at least

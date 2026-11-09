@@ -298,6 +298,68 @@ impl Sim {
         b.into_commit().tls_serialize_detached().unwrap()
     }
 
+    /// As [`Sim::stage_reseat`], also returning the Welcome for the re-added
+    /// member: (commit, welcome).
+    pub fn stage_reseat_full(&mut self, did: &str, kp: KeyPackage) -> (Vec<u8>, Vec<u8>) {
+        let idx = self
+            .group
+            .as_ref()
+            .unwrap()
+            .members()
+            .find(|m| m.credential.serialized_content() == did.as_bytes())
+            .unwrap()
+            .index;
+        let (p, s) = (&self.provider, &self.signer);
+        let g = self.group.as_mut().unwrap();
+        let b = g
+            .commit_builder()
+            .propose_removals([idx])
+            .propose_adds([kp])
+            .load_psks(p.storage())
+            .unwrap()
+            .build(p.rand(), p.crypto(), s, |_| true)
+            .unwrap()
+            .stage_commit(p)
+            .unwrap();
+        let (c, w, _) = b.into_contents();
+        (
+            c.tls_serialize_detached().unwrap(),
+            MlsMessageOut::from_welcome(w.unwrap(), ProtocolVersion::Mls10)
+                .tls_serialize_detached()
+                .unwrap(),
+        )
+    }
+
+    /// The first 16 hex of this member's epoch authenticator.
+    pub fn auth16(&self) -> String {
+        hex::encode(
+            self.group
+                .as_ref()
+                .unwrap()
+                .epoch_authenticator()
+                .as_slice(),
+        )[..16]
+            .into()
+    }
+
+    /// A signed re-post line `{t:"l", at, text, fk:1, id}`.
+    pub fn seal_repost(&mut self, room: &str, at: u64, text: &str, id: &str) -> Vec<u8> {
+        let mut line = LineBody::new(at, text.into());
+        line.fk = Some(serde_json::json!(1));
+        line.id = Some(id.into());
+        let doc = signing_doc(room, &self.did, &line).unwrap();
+        line.sg = Some(sign::sign_json(&self.dev, &doc).unwrap());
+        let pt = GuideCodec.encode_line(&line).unwrap();
+        let (p, s) = (&self.provider, &self.signer);
+        self.group
+            .as_mut()
+            .unwrap()
+            .create_message(p, s, &pt)
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap()
+    }
+
     pub fn stage_remove(&mut self, did: &str) -> Vec<u8> {
         let idx = self
             .group

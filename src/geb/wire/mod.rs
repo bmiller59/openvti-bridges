@@ -298,16 +298,35 @@ pub enum GroupOp {
     /// A request for a KeyPackage.
     #[serde(rename = "kp-req")]
     KpReq { room: RoomRef },
-    /// A device's room status request `{k:"g", op:"rs"}`, sent when a commit
-    /// cannot be processed; with a valid status body `s` it starts Geb's fork
-    /// repair (answer 9). OURS HAS NO BODY, and Geb DROPS an `rs` with no valid
-    /// `s` (confirmed, round 4 Q8: `cleanStatus`), so it
-    /// has no effect; the proper body is the next task. (`room:{id}` is sent,
+    /// `{k:"g", op:"rs", room:{id}, s:{e, a, chain, lines?, ls?, cps?}, via?}`:
+    /// a member's room status (round 2 section 5, `geb::status`). Geb DROPS an
+    /// `rs` with no valid `s` (round 4 Q8), so `s` is `None` only for a frame we
+    /// read and could not clean; we always send one. (`room:{id}` is sent,
     /// tolerated absent.)
     #[serde(rename = "rs")]
     Rs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         room: Option<RoomRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        s: Option<super::status::RoomStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<Vec<String>>,
+    },
+    /// `{k:"g", op:"rc", room:{id}, e, c}`: one Commit the receiver lacks. …
+    /// … (round 4 Q9), `c` the standard
+    /// base64 `MLSMessage` bytes.
+    #[serde(rename = "rc")]
+    Rc { room: RoomRef, e: u64, c: String },
+    /// `{k:"g", op:"seat-ask", room:{id}, kp?, via?}`: a member that cannot
+    /// reach the room asks to be re-seated; `kp` is a fresh BOUND KeyPackage
+    /// (standard base64), absent when the ask is only for attention.
+    #[serde(rename = "seat-ask")]
+    SeatAsk {
+        room: RoomRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kp: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<Vec<String>>,
     },
     /// The answer to `kp-req`.
     #[serde(rename = "kp")]
@@ -358,10 +377,12 @@ pub enum GroupOp {
 }
 
 /// The `op` values [`GroupOp`] has typed variants for.
-const KNOWN_GROUP_OPS: [&str; 8] = [
+const KNOWN_GROUP_OPS: [&str; 10] = [
     "kp-stock",
     "kp-req",
     "rs",
+    "rc",
+    "seat-ask",
     "kp",
     "welcome",
     "kp-low",
@@ -385,6 +406,27 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame> {
     {
         return Ok(serde_json::from_value(v)
             .unwrap_or_else(|_| Frame::Group(GroupOp::Ignored("leave".into()))));
+    }
+    // `rs`, `rc` and `seat-ask`: cleaned the way Geb cleans them. …
+    // … (round 4 Q8): it parses with `s: None` and is acked.
+    if v.get("k").and_then(Value::as_str) == Some("g") {
+        match v.get("op").and_then(Value::as_str) {
+            Some("rs") => {
+                let room = v
+                    .get("room")
+                    .and_then(|r| serde_json::from_value::<RoomRef>(r.clone()).ok());
+                return Ok(Frame::Group(GroupOp::Rs {
+                    room,
+                    s: v.get("s").and_then(super::status::clean_status),
+                    via: v.get("via").map(super::status::clean_via),
+                }));
+            }
+            Some("rc" | "seat-ask") => {
+                let op = v["op"].as_str().unwrap_or_default().to_string();
+                return Ok(serde_json::from_value(v).unwrap_or(Frame::Group(GroupOp::Ignored(op))));
+            }
+            _ => {}
+        }
     }
     if v.get("k").and_then(Value::as_str) == Some("g")
         && let Some(op) = v.get("op").and_then(Value::as_str)
@@ -536,6 +578,18 @@ impl Frame {
                 }
                 Ok(())
             }
+            Frame::Group(GroupOp::Rc { room, c, .. }) => {
+                if !is_room_id(&room.id) || !is_std_b64(c) {
+                    return Err(Error::Wire("rc: bad room id or Commit encoding".into()));
+                }
+                Ok(())
+            }
+            Frame::Group(GroupOp::SeatAsk { room, kp, .. }) => {
+                if !is_room_id(&room.id) || kp.as_deref().is_some_and(|k| !is_std_b64(k)) {
+                    return Err(Error::Wire("seat-ask: bad room id or KeyPackage".into()));
+                }
+                Ok(())
+            }
             Frame::Group(_) | Frame::Cap { .. } => Ok(()),
         }
     }
@@ -626,6 +680,15 @@ pub struct LineBody {
     /// [`LineBody::needs_reply`]. The bridge never sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nr: Option<Value>,
+    /// A re-post from a dead branch (answers round 4 Q10): `fk:1` with the
+    /// original line's `id` . Read only when exactly `1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fk: Option<Value>,
+    /// The original line's id, carried only with `fk`. UNVERIFIED: whether it is
+    /// the derived 32-hex id ([`crate::geb::crypto::line_id::line_id`]) or the
+    /// 16-hex of a dyad line; a room line's id is the derived one, so we send that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// The author's `sign_json` over [`signing_doc`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sg: Option<String>,
@@ -641,8 +704,18 @@ impl LineBody {
             m: None,
             o: None,
             nr: None,
+            fk: None,
+            id: None,
             sg: None,
         }
+    }
+
+    /// Whether this is a dead-branch re-post (only `fk === 1` counts).
+    pub fn is_repost(&self) -> bool {
+        self.fk
+            .as_ref()
+            .is_some_and(|v| v.as_u64() == Some(1) && v.is_number())
+            && self.id.is_some()
     }
 
     /// A plain line answering the line with derived id `re`.
@@ -757,12 +830,21 @@ mod tests {
         assert!(serde_json::from_value::<Frame>(json!({"k":"fc","i":1})).is_err());
         assert!(serde_json::from_value::<Frame>(json!({"k":"g","op":"mystery"})).is_err());
         let rs: Frame = serde_json::from_value(json!({"k":"g","op":"rs"})).unwrap();
-        assert_eq!(rs, Frame::Group(GroupOp::Rs { room: None }));
+        assert_eq!(
+            rs,
+            Frame::Group(GroupOp::Rs {
+                room: None,
+                s: None,
+                via: None
+            })
+        );
         let rs = Frame::Group(GroupOp::Rs {
             room: Some(RoomRef {
                 id: "geb-room-0001".into(),
                 name: None,
             }),
+            s: None,
+            via: None,
         });
         assert_eq!(
             serde_json::to_value(&rs).unwrap(),
@@ -773,7 +855,7 @@ mod tests {
 
     #[test]
     fn unknown_group_ops_parse_as_ignored_but_unknown_kinds_and_bad_known_ops_fail() {
-        for op in ["rc", "seat-ask", "brand-new"] {
+        for op in ["rq", "hb", "brand-new"] {
             let j = json!({"k":"g","op":op,"room":{"id":"r"},"e":1,"c":"AA"}).to_string();
             assert_eq!(
                 parse_frame(j.as_bytes()).unwrap(),

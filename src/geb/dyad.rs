@@ -1213,8 +1213,8 @@ mod tests {
         connect(&w).await;
         w.b.recv(w.a.did()).await.unwrap();
         let ignored = [
-            r#"{"k":"g","op":"rc","room":{"id":"geb-room-0001"},"e":3,"c":"AAAA"}"#,
-            r#"{"k":"g","op":"seat-ask","room":{"id":"geb-room-0001"},"kp":"AAAA"}"#,
+            r#"{"k":"g","op":"rq","room":{"id":"geb-room-0001"},"after":{}}"#,
+            r#"{"k":"g","op":"fc","room":{"id":"geb-room-0001"},"e":3,"c":"AAAA"}"#,
             r#"{"k":"g","op":"leave","room":{"id":"geb-room-0001"}}"#, // malformed: acked, ignored
             r#"{"k":"g","op":"something-new","x":1}"#,
             // An `rl` batch (which may carry `{t:"wp"}` lines, section "what

@@ -65,6 +65,10 @@ pub struct SettleReport {
     /// Commits are still held (or one is recorded failed): the read cursor
     /// must not pass this relay `created_at` (seconds).
     pub cursor_barrier_secs: Option<u64>,
+    /// Read the room again from the start of the relay's retention (a status
+    /// said we are behind, or a re-seat replaced the group): events already
+    /// handled are skipped by the 7-day dedup.
+    pub reread: bool,
 }
 
 /// The MLS room membership. Hides OpenMLS and the settle rule. The real
@@ -104,6 +108,20 @@ pub trait GebGroup: Send + Sync {
         Err(crate::Error::Unsupported(
             "a Geb commit needs the settle rule (feature geb-mls); stopping instead of forking the epoch",
         ))
+    }
+    /// A merged commit removed us and added us back: we hold no usable group
+    /// until its Welcome arrives over the dyad. The poll then reads nothing.
+    fn awaiting_reseat(&self) -> bool {
+        false
+    }
+    /// Our own lines from the dead branch, waiting to be re-posted after a
+    /// re-seat (at most 100, oldest first; answers round 4 Q10).
+    fn pending_reposts(&self) -> Vec<super::wire::LineBody> {
+        Vec::new()
+    }
+    /// The first `n` of [`GebGroup::pending_reposts`] were re-posted.
+    fn reposts_done(&self, _n: usize) -> Result<()> {
+        Ok(())
     }
     /// Run the settle rule for the current epoch at `now_ms`.
     async fn settle(&self, _now_ms: u64) -> Result<SettleReport> {

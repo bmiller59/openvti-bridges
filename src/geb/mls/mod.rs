@@ -76,6 +76,7 @@ mod tests;
 
 pub use client::{
     DEFAULT_STOCK, GroupStateStore, LABEL_AEAD, LABEL_NOSTR, MAX_STOCK, MlsConfig, MlsGroupClient,
+    Split,
 };
 pub use commit::{BindingStatus, binding_status, group_policy, parse_key_package};
 pub use identity::{MemoryVault, MlsIdentity, SUITE, SignatureKeyVault, leaf_capabilities};

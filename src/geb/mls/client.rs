@@ -3,6 +3,9 @@
 //! No std lock is held across an await: state changes happen in short
 //! synchronous sections, and dyad I/O happens between them.
 
+mod heal;
+pub use heal::Split;
+
 use super::commit::{GroupJudge, credential_did, group_policy, parse_message, parse_welcome};
 use super::identity::{MlsIdentity, SUITE, SignatureKeyVault};
 use crate::foreign::JoinState;
@@ -53,7 +56,7 @@ pub const STOCK_GENS_KEPT: usize = 2;
 pub const KP_LOW_MIN_INTERVAL_MS: u64 = 60_000;
 /// While seated the dyads are read for `kp-low` / `seat-check` at most this
 /// often (each read is a relay fetch per peer).
-pub const SERVICE_EVERY_MS: u64 = 30_000;
+pub const SERVICE_EVERY_MS: u64 = 5_000;
 
 /// Clock in milliseconds.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -144,6 +147,9 @@ struct Snapshot {
     /// The newest verified signed leave per signer (round 4 Q7).
     #[serde(default)]
     leaves: LeaveBook,
+    /// Settled-commit chain, own lines, split record (rs and re-seat).
+    #[serde(default)]
+    heal: heal::Persist,
     /// Set once a merged commit removed us; the link is over.
     removed: Option<String>,
     /// OpenMLS storage entries, base64.
@@ -155,6 +161,9 @@ const SNAPSHOT_V: u32 = 1;
 enum State {
     Unseated,
     Seated(Box<MlsGroup>),
+    /// A merged commit removed our leaf AND added our DID back (a re-seat): the
+    /// old, inactive group is kept only until the Welcome replaces it.
+    Reseating(Box<MlsGroup>),
     Removed(String),
 }
 
@@ -168,6 +177,7 @@ struct Inner {
     /// Signed leaves held; they feed `validCommit` rule 2.
     leaves: LeaveBook,
     last_service_ms: u64,
+    heal: heal::HealState,
 }
 
 /// The configured inputs plus the signed leaves this client holds: a leave
@@ -238,6 +248,7 @@ impl MlsGroupClient {
                 contacts: Default::default(),
                 leaves: LeaveBook::default(),
                 last_service_ms: 0,
+                heal: heal::HealState::default(),
             }),
             persist: None,
             clock: Arc::new(system_now_ms),
@@ -294,6 +305,7 @@ impl MlsGroupClient {
             }
             g.contacts = snap.contacts;
             g.leaves = snap.leaves;
+            g.heal.p = snap.heal;
             if g.contacts.is_empty() && snap.stocked && snap.stock_gen > 0 {
                 // A snapshot from before stock state was per contact: one
                 // stock of this generation went to every peer. Their keys are
@@ -318,8 +330,16 @@ impl MlsGroupClient {
                 )
                 .map_err(|e| mls("load group", e))?
                 {
+                    Some(group) if !group.is_active() && g.heal.p.reseating => {
+                        State::Reseating(Box::new(group))
+                    }
                     Some(group) => State::Seated(Box::new(group)),
-                    None => State::Unseated,
+                    // A snapshot that once held the group and no longer does:
+                    // our local copy is missing (answers round 2 section 8).
+                    None => {
+                        g.heal.lost_copy = g.heal.p.was_seated;
+                        State::Unseated
+                    }
                 },
             };
         }
@@ -352,6 +372,7 @@ impl MlsGroupClient {
             stock_gen: 0,
             contacts: g.contacts.clone(),
             leaves: g.leaves.clone(),
+            heal: g.heal.p.clone(),
             removed,
             values,
         };
@@ -646,15 +667,9 @@ impl MlsGroupClient {
         }
     }
 
-    /// Answer `seat-check {room, e}`: with `rs` when we hold the room.
-    // The `rs` we send is the minimal `{k:"g", op:"rs", room:{id}}`. Geb's
-    // `cleanStatus` (round 2 section 5) requires a status body `s:{e, a,
-    // chain, ...}` that we do not build (P1), so Geb DROPS it (confirmed, round
-    // 4 Q8:): it has no effect, never counts as "seen",
-    // and does NOT satisfy a seat-check. Nothing worse follows (silence never
-    // commits). The proper `rs` is the next task. When
-    // we do not hold the room Geb expects a `seat-ask` carrying a fresh
-    // package, which is not built either, so we send nothing.
+    /// Answer `seat-check {room, e}` (round 3 section 3, round 4 Q8): with a
+    /// body-bearing `rs` when we hold the room. When we do not, Geb expects a
+    /// `seat-ask` with a fresh bound package: we send that (backed off).
     async fn answer_seat_check(&self, peer: &str, room: &RoomRef) {
         if room.id != self.cfg.room_id {
             return;
@@ -663,11 +678,11 @@ impl MlsGroupClient {
             .lock()
             .map(|g| matches!(g.state, State::Seated(_)))
             .unwrap_or(false);
-        if !seated {
-            tracing::debug!("seat-check while not seated; seat-ask is not built, no answer");
-            return;
+        if seated {
+            self.send_rs_to(peer, true).await;
+        } else {
+            self.seat_ask_with_kp(peer).await;
         }
-        self.send_rs_to(peer).await;
     }
 
     /// While seated: read each peer's dyad for `kp-low` and `seat-check`
@@ -686,9 +701,21 @@ impl MlsGroupClient {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::debug!(error = %e, "dyad read failed while seated");
+                    // The dyad is down: it announces itself again when it is up.
+                    if let Ok(mut g) = self.lock() {
+                        g.heal.announced.remove(peer);
+                    }
                     continue;
                 }
             };
+            // The dyad answered: a link that comes up is told our status.
+            let first = self
+                .lock()
+                .map(|mut g| g.heal.announced.insert(peer.clone()))
+                .unwrap_or(false);
+            if first {
+                self.send_rs_to(peer, false).await;
+            }
             for frame in frames {
                 match frame {
                     Frame::Group(GroupOp::KpLow { generation, .. }) => {
@@ -699,6 +726,21 @@ impl MlsGroupClient {
                     }
                     Frame::Group(GroupOp::Leave { room, by, at, sig }) => {
                         self.take_leave_frame(&room, &by, at, &sig);
+                    }
+                    Frame::Group(GroupOp::Rs { room, s, .. }) => {
+                        self.on_rs(peer, room, s).await;
+                    }
+                    Frame::Group(GroupOp::Rc { room, e, c }) => {
+                        self.on_rc(peer, &room, e, &c);
+                    }
+                    // A re-seat Welcome while we hold the room (round 2 section
+                    // 8), replacing the group; or a stray one, ignored.
+                    Frame::Group(GroupOp::Welcome { room, w, .. }) => {
+                        self.on_reseat_welcome(peer, &room, &w).await;
+                    }
+                    // Nothing for us to do: we are never the healer.
+                    Frame::Group(GroupOp::SeatAsk { .. }) => {
+                        tracing::debug!("seat-ask from a peer: acked, no action (never healer)");
                     }
                     other => tracing::debug!(?other, "ignoring a dyad frame while seated"),
                 }
@@ -714,7 +756,68 @@ impl MlsGroupClient {
     }
 
     /// Validate a Welcome frame the way answer 8 says and join from it.
-    fn join_from_welcome(&self, g: &mut Inner, room: &RoomInfo, w: &str) -> Result<()> {
+    ///
+    /// `replace` is `Some(welcomer)` for a Welcome that arrives while we hold the
+    /// room (a re-seat, answers round 2 section 8): the old group is deleted
+    /// from storage first, after every refusal check, and only when the new
+    /// group is consistent with a re-seat of OUR DID; any failure restores the
+    /// old state untouched. `None` is the ordinary first join.
+    fn join_from_welcome(
+        &self,
+        g: &mut Inner,
+        room: &RoomInfo,
+        w: &str,
+        replace: Option<&str>,
+    ) -> Result<()> {
+        let Some(welcomer) = replace else {
+            return self.join_inner(g, room, w, None);
+        };
+        let known = match &g.state {
+            State::Seated(old) | State::Reseating(old) => old
+                .members()
+                .filter_map(|m| credential_did(&m.credential))
+                .any(|d| d == welcomer),
+            _ => false,
+        };
+        if !known {
+            return Err(Error::Wire(
+                "re-seat welcome from a device that is not a member of our group".into(),
+            ));
+        }
+        // OpenMLS refuses a Welcome for a group id it already holds
+        // (`GroupAlreadyExists`), so the old group is deleted from storage
+        // FIRST (answers round 2 section 8: `mls.rs:498-506`). A copy of the
+        // whole store is taken before, and put back if anything after it
+        // refuses: a refused or inconsistent Welcome leaves the old state as it
+        // was.
+        let backup = g
+            .provider
+            .storage()
+            .values
+            .read()
+            .map_err(|_| Error::Foreign("mls storage poisoned".into()))?
+            .clone();
+        if let State::Seated(old) | State::Reseating(old) = &mut g.state
+            && let Err(e) = old.delete(g.provider.storage())
+        {
+            tracing::error!(error = ?e, "could not delete the old group before a re-seat");
+        }
+        let r = self.join_inner(g, room, w, replace);
+        if r.is_err()
+            && let Ok(mut v) = g.provider.storage().values.write()
+        {
+            *v = backup;
+        }
+        r
+    }
+
+    fn join_inner(
+        &self,
+        g: &mut Inner,
+        room: &RoomInfo,
+        w: &str,
+        replace: Option<&str>,
+    ) -> Result<()> {
         room.validate()?;
         if room.id != self.cfg.room_id {
             return Err(Error::Wire("welcome is for another room".into()));
@@ -729,8 +832,14 @@ impl MlsGroupClient {
             .use_ratchet_tree_extension(true)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(32, 1000))
             .build();
-        let staged = StagedWelcome::new_from_welcome(&g.provider, &cfg, welcome, None)
-            .map_err(|e| Error::Wire(format!("welcome: {e:?}")))?;
+        let staged =
+            StagedWelcome::new_from_welcome(&g.provider, &cfg, welcome, None).map_err(|e| {
+                if matches!(e, WelcomeError::NoMatchingKeyPackage) {
+                    Error::Wire(format!("{}: {e:?}", heal::NO_KP))
+                } else {
+                    Error::Wire(format!("welcome: {e:?}"))
+                }
+            })?;
         let ctx = staged.group_context();
         if ctx.group_id().as_slice() != self.cfg.room_id.as_bytes() {
             return Err(Error::Wire("welcome group id is not the room id".into()));
@@ -776,7 +885,18 @@ impl MlsGroupClient {
             }
             return Err(Error::Wire(format!("treeRefusal: {why}")));
         }
+        if replace.is_some()
+            && let Err(why) = self.reseat_consistent(g, &group)
+        {
+            return Err(Error::Wire(format!("not a re-seat of us: {why}")));
+        }
+        let now = (self.clock)();
+        let old_epoch = match &g.state {
+            State::Seated(o) | State::Reseating(o) => Some(o.epoch().as_u64()),
+            _ => None,
+        };
         g.state = State::Seated(Box::new(group));
+        self.after_join(g, old_epoch, now);
         Ok(())
     }
 
@@ -784,6 +904,9 @@ impl MlsGroupClient {
         let State::Seated(grp) = &g.state else {
             return match &g.state {
                 State::Removed(w) => Err(Error::Refused(w.clone())),
+                State::Reseating(_) => Err(Error::Foreign(
+                    "re-seat in progress: waiting for the Welcome".into(),
+                )),
                 _ => Err(Error::Foreign("not seated in the room yet".into())),
             };
         };
@@ -827,27 +950,6 @@ impl MlsGroupClient {
             .map(|g| g.leaves.signers().map(str::to_string).collect())
             .unwrap_or_default()
     }
-
-    fn rs_frame(&self) -> Frame {
-        Frame::Group(GroupOp::Rs {
-            room: Some(RoomRef {
-                id: self.cfg.room_id.clone(),
-                name: None,
-            }),
-        })
-    }
-
-    async fn send_rs_to(&self, peer: &str) {
-        if let Err(e) = self.dyad.send(peer, &self.rs_frame()).await {
-            tracing::warn!(error = %e, "could not send the room status request");
-        }
-    }
-
-    async fn send_rs(&self) {
-        for peer in &self.cfg.peers {
-            self.send_rs_to(peer).await;
-        }
-    }
 }
 
 #[async_trait]
@@ -862,7 +964,7 @@ impl GebGroup for MlsGroupClient {
             match &self.lock()?.state {
                 State::Removed(w) => return Err(Error::Refused(w.clone())),
                 State::Seated(_) => return Ok(JoinState::Seated),
-                State::Unseated => {}
+                State::Unseated | State::Reseating(_) => {}
             }
             let now = (self.clock)();
             let due: Vec<(String, u64)> = {
@@ -907,14 +1009,29 @@ impl GebGroup for MlsGroupClient {
                         self.take_leave_frame(&room, &by, at, &sig);
                     }
                     Frame::Group(GroupOp::Welcome { room, w, .. }) => {
-                        let mut g = self.lock()?;
-                        match self.join_from_welcome(&mut g, &room, &w) {
-                            Ok(()) => {
+                        let outcome = {
+                            let mut g = self.lock()?;
+                            let replace = matches!(g.state, State::Reseating(_)).then_some(&**peer);
+                            let r = self.join_from_welcome(&mut g, &room, &w, replace);
+                            if r.is_ok() {
                                 self.persist_state(&g)?;
+                            }
+                            r
+                        };
+                        match outcome {
+                            Ok(()) => {
+                                self.send_rs_all(true, &[]).await;
                                 return Ok(JoinState::Seated);
                             }
                             // A refusal of the room itself stops the link.
                             Err(e @ Error::Refused(_)) => return Err(e),
+                            // Added from a package whose private keys we no
+                            // longer hold: ask for a re-seat from a fresh,
+                            // BOUND one (round 3 section 5, round 2 section 8).
+                            Err(Error::Wire(w)) if w.starts_with(heal::NO_KP) => {
+                                tracing::warn!("a welcome for a KeyPackage we no longer hold");
+                                self.seat_ask_with_kp(peer).await;
+                            }
                             Err(e) => tracing::warn!(error = %e, "ignoring a welcome"),
                         }
                     }
@@ -924,6 +1041,7 @@ impl GebGroup for MlsGroupClient {
                 }
             }
         }
+        self.heal_unseated_tick().await;
         Ok(JoinState::Pending)
     }
 
@@ -944,6 +1062,25 @@ impl GebGroup for MlsGroupClient {
         self.take_signed_leave(by, at, sig)
     }
 
+    fn awaiting_reseat(&self) -> bool {
+        self.lock()
+            .map(|g| matches!(g.state, State::Reseating(_)))
+            .unwrap_or(false)
+    }
+
+    fn pending_reposts(&self) -> Vec<crate::geb::wire::LineBody> {
+        self.lock()
+            .map(|g| g.heal.p.pending_reposts.clone())
+            .unwrap_or_default()
+    }
+
+    fn reposts_done(&self, n: usize) -> Result<()> {
+        let mut g = self.lock()?;
+        let n = n.min(g.heal.p.pending_reposts.len());
+        g.heal.p.pending_reposts.drain(..n);
+        self.persist_state(&g)
+    }
+
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut g = self.lock()?;
         let Inner {
@@ -961,8 +1098,15 @@ impl GebGroup for MlsGroupClient {
                     .map_err(|e| mls("serialise message", e))?
             }
             State::Removed(w) => return Err(Error::Refused(w.clone())),
-            State::Unseated => return Err(Error::Foreign("not seated in the room yet".into())),
+            State::Unseated | State::Reseating(_) => {
+                return Err(Error::Foreign("not seated in the room yet".into()));
+            }
         };
+        let epoch = match &g.state {
+            State::Seated(grp) => grp.epoch().as_u64(),
+            _ => 0,
+        };
+        heal::record_own_line(&mut g.heal.p, epoch, plaintext);
         // The sender-ratchet generation just used is saved before the caller
         // can post: a restart never seals a second line at the same generation.
         self.persist_state(&g)?;
@@ -1007,7 +1151,9 @@ impl GebGroup for MlsGroupClient {
         let epoch = match &g.state {
             State::Seated(grp) => grp.epoch().as_u64(),
             State::Removed(w) => return Err(Error::Refused(w.clone())),
-            State::Unseated => return Err(Error::Foreign("not seated in the room yet".into())),
+            State::Unseated | State::Reseating(_) => {
+                return Err(Error::Foreign("not seated in the room yet".into()));
+            }
         };
         // Receivers ignore a commit made from an epoch below theirs
         // .
@@ -1024,14 +1170,17 @@ impl GebGroup for MlsGroupClient {
     }
 
     async fn settle(&self, now_ms: u64) -> Result<SettleReport> {
-        let seated = self
+        let live = self
             .lock()
-            .map(|g| matches!(g.state, State::Seated(_)))
+            .map(|g| matches!(g.state, State::Seated(_) | State::Reseating(_)))
             .unwrap_or(false);
-        if seated {
+        if live {
             self.service_dyads(now_ms).await;
+            self.heal_tick(now_ms).await;
         }
         let mut ask_status = false;
+        let mut sent_to_all = false;
+        let mut added: Vec<String> = Vec::new();
         let report = {
             let mut g = self.lock()?;
             let Inner {
@@ -1040,8 +1189,15 @@ impl GebGroup for MlsGroupClient {
                 queue,
                 judged,
                 leaves,
+                heal,
                 ..
             } = &mut *g;
+            if matches!(state, State::Reseating(_)) {
+                return Ok(SettleReport {
+                    reread: std::mem::take(&mut heal.reread),
+                    ..SettleReport::default()
+                });
+            }
             let State::Seated(grp) = state else {
                 return match state {
                     State::Removed(w) => Err(Error::Refused(w.clone())),
@@ -1051,21 +1207,31 @@ impl GebGroup for MlsGroupClient {
             let epoch = grp.epoch().as_u64();
             queue.prune_below(epoch);
             let window = group_policy(grp).settle_window_ms;
-            let outcome = {
+            let members_before: Vec<String> = grp
+                .members()
+                .filter_map(|m| credential_did(&m.credential))
+                .collect();
+            let (outcome, merged_bytes, reseats_us) = {
                 let inputs = WithLeaves {
                     base: self.inputs.as_ref(),
                     leaves,
                 };
                 let mut judge = GroupJudge::new(grp, provider, &inputs, judged);
-                queue.settle(epoch, window, now_ms, &mut judge)
+                let o = queue.settle(epoch, window, now_ms, &mut judge);
+                (o, judge.merged_bytes.take(), judge.reseats_us)
             };
             let mut epoch_changed = false;
+            let mut winner: Option<[u8; 32]> = None;
             match outcome {
                 Outcome::Idle | Outcome::Holding { .. } | Outcome::AllRefused { .. } => {}
                 Outcome::Merged {
-                    refused, failed, ..
+                    refused,
+                    failed,
+                    winner: w,
+                    ..
                 } => {
                     epoch_changed = true;
+                    winner = Some(w);
                     // Candidates of the old epoch can never be tested again.
                     judged.clear();
                     if !refused.is_empty() || !failed.is_empty() {
@@ -1106,22 +1272,57 @@ impl GebGroup for MlsGroupClient {
                 }
             }
             if epoch_changed && !grp.is_active() {
+                if reseats_us {
+                    // One Commit removed our leaf and added us back: the
+                    // Welcome that follows replaces this group.
+                    let State::Seated(old) = std::mem::replace(state, State::Unseated) else {
+                        unreachable!("the state was Seated a moment ago")
+                    };
+                    *state = State::Reseating(old);
+                    heal.p.reseating = true;
+                    heal.reseating_since_ms = now_ms;
+                    tracing::warn!(
+                        "a merged commit re-seats us; waiting for its Welcome over the dyad"
+                    );
+                    self.persist_state(&g)?;
+                    return Ok(SettleReport::default());
+                }
                 let why = "removed from the room by a merged commit".to_string();
                 *state = State::Removed(why.clone());
                 self.persist_state(&g)?;
                 return Err(Error::Refused(why));
             }
+            if epoch_changed {
+                // The settled Commit joins the chain our `rs` reports, and its
+                // bytes are kept to answer a lagging peer with `rc`.
+                let made = grp.epoch().as_u64();
+                let auth = heal::auth_hex(grp);
+                heal.note_settled(epoch, made, winner, &auth, merged_bytes);
+                added = grp
+                    .members()
+                    .filter_map(|m| credential_did(&m.credential))
+                    .filter(|d| !members_before.contains(d))
+                    .collect();
+                sent_to_all = true;
+            }
             let cursor_barrier_secs = queue.barrier_secs();
+            let reread = std::mem::take(&mut heal.reread);
             if epoch_changed {
                 self.persist_state(&g)?;
             }
             SettleReport {
                 epoch_changed,
                 cursor_barrier_secs,
+                reread,
             }
         };
+        if sent_to_all {
+            // After each settle that applied a Commit: to every member we hold
+            // a dyad with except one newly added (round 2 section 5).
+            self.send_rs_all(false, &added).await;
+        }
         if ask_status {
-            self.send_rs().await;
+            self.send_rs_all(true, &[]).await;
         }
         Ok(report)
     }

@@ -221,6 +221,12 @@ pub struct GroupJudge<'a> {
     /// processed again: its first verdict stands.
     cache: &'a mut HashMap<CommitHash, Verdict>,
     staged: Option<(crate::geb::settle::CommitHash, Box<StagedCommit>)>,
+    /// The bytes of the candidate that was merged (kept to answer a lagging
+    /// peer with `rc`).
+    pub merged_bytes: Option<Vec<u8>>,
+    /// The last `Valid` candidate removed our own leaf and added our DID back
+    /// in the same commit: a re-seat of us.
+    pub reseats_us: bool,
 }
 
 impl<'a> GroupJudge<'a> {
@@ -237,6 +243,8 @@ impl<'a> GroupJudge<'a> {
             inputs,
             cache,
             staged: None,
+            merged_bytes: None,
+            reseats_us: false,
         }
     }
 }
@@ -245,6 +253,7 @@ impl Judge for GroupJudge<'_> {
     fn judge(&mut self, c: &Candidate) -> Verdict {
         // A previous candidate's staged commit is discarded here.
         self.staged = None;
+        self.reseats_us = false;
         if let Some(v) = self.cache.get(&c.hash) {
             return v.clone();
         }
@@ -259,6 +268,9 @@ impl Judge for GroupJudge<'_> {
 
     fn merge(&mut self, c: &Candidate) -> Result<(), String> {
         let r = self.merge_staged(c);
+        if r.is_ok() {
+            self.merged_bytes = Some(c.bytes.clone());
+        }
         if let Err(why) = &r {
             self.cache
                 .insert(c.hash, Verdict::Unprocessable(why.clone()));
@@ -348,6 +360,12 @@ impl GroupJudge<'_> {
         let facts = facts_of(self.group, &sender, sender_index, &staged);
         match valid_commit(&policy, &facts, self.inputs) {
             CommitVerdict::Valid => {
+                let own = self
+                    .group
+                    .own_leaf()
+                    .and_then(|l| credential_did(l.credential()));
+                self.reseats_us =
+                    own.is_some_and(|d| facts.removes.contains(&d) && facts.adds.contains(&d));
                 self.staged = Some((c.hash, staged));
                 Verdict::Valid
             }

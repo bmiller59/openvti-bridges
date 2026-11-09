@@ -98,6 +98,10 @@ impl World {
         let dyad = MemDyad::new(&our_did, &bus);
         let mut mc = MlsConfig::new(ROOM, vec![a.did.clone()]);
         mc.allow_direct_for_test = allow_direct;
+        // The client follows the world's clock (so a test steps both with
+        // `at`), anchored at the real time its KeyPackage lifetimes need.
+        let real0 = now_secs() * 1000;
+        let c1 = clock.clone();
         let client = Arc::new(
             MlsGroupClient::new(
                 mc,
@@ -106,8 +110,10 @@ impl World {
                 inputs,
                 &MemoryVault::default(),
             )
-            .unwrap(),
+            .unwrap()
+            .with_clock(Arc::new(move || real0 + c1.load(Ordering::SeqCst) - 10_000)),
         );
+        client.set_unprompted_statuses(false);
         let c2 = clock.clone();
         let room = GebRoom::new(
             ROOM.into(),
@@ -135,6 +141,16 @@ impl World {
 
     /// A adds us from our stock; B follows; the welcome goes over the dyad.
     async fn seat(&mut self) {
+        self.seat_raw().await;
+        // The status sent on joining is its own test; the others count what
+        // follows.
+        self.dyad.sent.lock().unwrap().clear();
+        self.bus.take(&self.our_did, &self.a.did);
+    }
+
+    /// As `seat`, keeping what was sent; returns our stock's KeyPackages
+    /// (the first was spent by A's add).
+    async fn seat_raw(&mut self) -> Vec<String> {
         assert_eq!(self.room.join().await.unwrap(), JoinState::Pending);
         let stock = self.bus.take(&self.our_did, &self.a.did);
         let Some(Frame::Group(GroupOp::KpStock { kps, .. })) = stock.first().cloned() else {
@@ -150,6 +166,7 @@ impl World {
             welcome_frame(ROOM, &self.a.did, &self.policy, &welcome),
         );
         assert_eq!(self.room.join().await.unwrap(), JoinState::Seated);
+        kps
     }
 
     fn now(&self) -> u64 {
@@ -1133,7 +1150,7 @@ async fn by_reference_proposals_and_standalone_proposals_are_failed_and_skipped(
         !w.client.members().iter().any(|m| m == &Sim::new(30).did),
         "nobody was added by a proposal"
     );
-    assert_eq!(rs_count(&w.dyad), 0, "a merge means no rs, no barrier");
+    assert_eq!(rs_count(&w.dyad), 1, "a merge sends one status; no barrier");
     assert_eq!(w.client.held_commits(), 0);
     // A lone one: failed, nothing merged, so it stays held (the cursor stays
     // before it) and ONE `rs` goes out.
@@ -1487,6 +1504,7 @@ async fn a_replayed_commit_is_recorded_failed_and_asks_for_the_room_status_once(
     w.at(t + 3000);
     w.poll().await.unwrap();
     assert_eq!(w.client.epoch(), Some(old_epoch + 1));
+    let before = rs_count(&w.dyad);
 
     // Replay it with `e` set to the epoch we are in now (a lying envelope).
     w.at(w.now() + 10_000);
@@ -1520,10 +1538,14 @@ async fn a_replayed_commit_is_recorded_failed_and_asks_for_the_room_status_once(
             .filter(|(_, f)| matches!(f, Frame::Group(GroupOp::Rs { .. })))
             .count()
     };
-    assert_eq!(rs(&w.dyad), 1);
+    assert_eq!(rs(&w.dyad) - before, 1);
     w.at(w.now() + 5000);
     w.poll().await.unwrap();
-    assert_eq!(rs(&w.dyad), 1, "not asked again for the same commit");
+    assert_eq!(
+        rs(&w.dyad) - before,
+        1,
+        "not asked again for the same commit"
+    );
 
     // A commit made from an epoch below ours is ignored at the door.
     let held = w.client.held_commits();
@@ -1945,7 +1967,8 @@ async fn single_packages_are_kept_seven_days_then_pruned() {
 }
 
 #[tokio::test]
-async fn seat_check_is_answered_with_the_minimal_rs_when_seated_and_not_otherwise() {
+async fn seat_check_is_answered_with_a_body_rs_when_seated_and_a_seat_ask_with_a_bound_kp_when_not()
+{
     let mut w = World::build(Arc::new(NoLocalKnowledge), "");
     let check = |e| {
         Frame::Group(GroupOp::SeatCheck {
@@ -1956,14 +1979,26 @@ async fn seat_check_is_answered_with_the_minimal_rs_when_seated_and_not_otherwis
             e,
         })
     };
-    // Unseated: nothing is sent for it (seat-ask is not built).
+    // Unseated: no rs; a seat-ask with a fresh BOUND KeyPackage (round 3 sec 3).
     let u = StockWorld::new();
     u.deliver(check(1));
     u.room.join().await.unwrap();
+    let sent = u.sent();
     assert!(
-        u.sent()
-            .iter()
+        sent.iter()
             .all(|f| !matches!(f, Frame::Group(GroupOp::Rs { .. })))
+    );
+    let asks: Vec<_> = sent
+        .into_iter()
+        .filter_map(|f| match f {
+            Frame::Group(GroupOp::SeatAsk { kp: Some(kp), .. }) => Some(kp),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(
+        binding_status(parse_kp(&asks[0]).leaf_node()),
+        BindingStatus::Verified
     );
     w.seat().await;
     w.bus.take(&w.our_did, &w.a.did);
@@ -1971,15 +2006,16 @@ async fn seat_check_is_answered_with_the_minimal_rs_when_seated_and_not_otherwis
     w.bus.put(&w.a.did, &w.our_did, check(2));
     w.poll().await.unwrap();
     let out = w.bus.take(&w.our_did, &w.a.did);
-    assert_eq!(
-        out,
-        vec![Frame::Group(GroupOp::Rs {
-            room: Some(crate::geb::wire::RoomRef {
-                id: ROOM.into(),
-                name: None
-            })
-        })]
-    );
+    let [
+        Frame::Group(GroupOp::Rs {
+            room, s: Some(s), ..
+        }),
+    ] = out.as_slice()
+    else {
+        panic!("one rs with a body: {out:?}")
+    };
+    assert_eq!(room.as_ref().unwrap().id, ROOM);
+    assert_eq!(s.e, w.client.epoch().unwrap());
     // Another room's seat-check is not ours.
     w.at(w.now() + 60_000);
     w.bus.put(
@@ -2340,3 +2376,5 @@ async fn held_signed_leaves_survive_a_restart() {
             .unwrap()
     );
 }
+
+mod heal_tests;
