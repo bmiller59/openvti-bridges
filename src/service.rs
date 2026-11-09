@@ -227,6 +227,13 @@ pub async fn clear_halt(
         }
         Some(r) => {
             println!("{id}: HALTED ({r})");
+            if matches!(r, crate::halt::HaltReason::VtcRefused { .. }) {
+                println!(
+                    "  The VTA or the room host refused the bridge; Geb did not. Fix the bridge's \
+                     ACL grant or room membership at the VTA (the grant `link add` printed), then \
+                     clear with --yes. --i-have-been-readmitted is not needed."
+                );
+            }
             if matches!(r, crate::halt::HaltReason::UndecidableCommit { .. }) {
                 println!(
                     "  This is a Remove of another DID that the bridge cannot decide: it holds no \

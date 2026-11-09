@@ -114,7 +114,7 @@ pub fn is_version_conflict(code: &str) -> bool {
 /// A typed [`Error`] from a code, message and details.
 pub fn typed(code: &str, message: &str, retryable: bool, details: Option<Value>) -> Error {
     if is_link_ending(code) {
-        return Error::Refused(format!("{code}: {message}"));
+        return Error::VtcRefused(format!("{code}: {message}"));
     }
     Error::Room {
         code: code.to_string(),
@@ -154,7 +154,7 @@ fn host_refusal(status: u16, body: &[u8]) -> Error {
 /// string the pump has to parse.
 pub fn from_vta(e: VtaError) -> Error {
     match e {
-        VtaError::Forbidden(m) => Error::Refused(format!("the VTA refused the bridge: {m}")),
+        VtaError::Forbidden(m) => Error::VtcRefused(format!("the VTA refused the bridge: {m}")),
         VtaError::Rejected {
             code,
             message,
@@ -198,7 +198,7 @@ mod tests {
             "rooms/keys/browse:notAMember",
         ] {
             assert!(
-                matches!(typed(c, "no", false, None), Error::Refused(_)),
+                matches!(typed(c, "no", false, None), Error::VtcRefused(_)),
                 "{c}"
             );
         }
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn a_host_refusal_document_is_read_into_its_code() {
         let body = br#"{"payload":{"code":"permissionDenied","message":"no"}}"#;
-        assert!(matches!(host_refusal(403, body), Error::Refused(_)));
+        assert!(matches!(host_refusal(403, body), Error::VtcRefused(_)));
         let body = br#"{"payload":{"code":"rooms/records/put:versionConflict","message":"v","details":{"currentVersion":3}}}"#;
         match host_refusal(409, body) {
             Error::Room {
@@ -239,14 +239,14 @@ mod tests {
     fn vta_errors_keep_their_type() {
         assert!(matches!(
             from_vta(VtaError::Forbidden("acl".into())),
-            Error::Refused(_)
+            Error::VtcRefused(_)
         ));
         let e = from_vta(VtaError::Rejected {
             code: "rooms/keys/act:actionNotHeld".into(),
             message: "m".into(),
             details: None,
         });
-        assert!(matches!(e, Error::Refused(_)));
+        assert!(matches!(e, Error::VtcRefused(_)));
         let e = from_vta(VtaError::Rejected {
             code: "rooms/keys/read:hostUnreachable".into(),
             message: "m".into(),

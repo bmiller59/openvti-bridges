@@ -11,8 +11,9 @@
 //!   session that just ended was healthy for at least `min_healthy` *and* made
 //!   a successful tick; a session that dies at once keeps the backoff growing,
 //!   so a flapping relay is not hammered.
-//! - **Halted.** `Error::Refused` (seating refused, leaf removed, or a
-//!   `permissionDenied` from the room side) and `Error::UndecidableCommit` end supervision for good with
+//! - **Halted.** `Error::Refused` (Geb refused seating or removed the leaf),
+//!   `Error::VtcRefused` (the VTA's 403 or the host's `permissionDenied` on the room
+//!   side) and `Error::UndecidableCommit` end supervision for good with
 //!   [`End::Halted`]. The pump persists the halt, so a restart of the process
 //!   ends here too, on the first tick, without touching the foreign room.
 //! - **Paused.** The kill switch ([`crate::pause`]): while [`LinkTick::paused`]
@@ -222,7 +223,9 @@ async fn supervise_inner(
         let began = Instant::now();
         let mut ticked_ok = false;
         let failure = match link.start().await {
-            Err(e @ (Error::Refused(_) | Error::UndecidableCommit(_))) => return halt(&e),
+            Err(e @ (Error::Refused(_) | Error::VtcRefused(_) | Error::UndecidableCommit(_))) => {
+                return halt(&e);
+            }
             Err(e) => Some(e),
             Ok(_) => loop {
                 // Paused between ticks: end the session without a failure, so
@@ -235,7 +238,10 @@ async fn supervise_inner(
                         ticked_ok = true;
                         health.ok();
                     }
-                    Err(e @ (Error::Refused(_) | Error::UndecidableCommit(_))) => {
+                    Err(
+                        e
+                        @ (Error::Refused(_) | Error::VtcRefused(_) | Error::UndecidableCommit(_)),
+                    ) => {
                         return halt(&e);
                     }
                     Err(e) => break Some(e),

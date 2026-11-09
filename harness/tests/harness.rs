@@ -386,7 +386,7 @@ async fn an_unwritable_persona_halts_the_link_with_a_typed_refusal() {
         })
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::Refused(_)), "{err:?}");
+    assert!(matches!(err, Error::VtcRefused(_)), "{err:?}");
 }
 
 /// A process killed before or after every operation of a two-direction run,

@@ -547,7 +547,11 @@ impl RoomSide for VtcRoom {
                         };
                         self.put_sealed(&rewrite).await.map(|_| PutOutcome::Created)
                     }
-                    Err(read_err) if !matches!(read_err, Error::Refused(_)) => Err(read_err),
+                    Err(read_err)
+                        if !matches!(read_err, Error::Refused(_) | Error::VtcRefused(_)) =>
+                    {
+                        Err(read_err)
+                    }
                     Err(e) => Err(e),
                 }
             }

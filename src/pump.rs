@@ -139,7 +139,10 @@ pub struct Pump {
 
 /// A failure that stops the link (see [`HaltReason`]) rather than one tick.
 fn is_halting(e: &Error) -> bool {
-    matches!(e, Error::Refused(_) | Error::UndecidableCommit(_))
+    matches!(
+        e,
+        Error::Refused(_) | Error::VtcRefused(_) | Error::UndecidableCommit(_)
+    )
 }
 
 /// A failure no later try can pass: the room refused the write for good (a
@@ -220,7 +223,14 @@ impl Pump {
                 link = %self.link.id,
                 reason = %detail,
                 security_alert = true,
-                "foreign room refused or removed the bridge; link stopped, not retrying"
+                "the Geb room refused or removed the bridge; link stopped, not retrying"
+            ),
+            HaltReason::VtcRefused { detail } => tracing::error!(
+                link = %self.link.id,
+                reason = %detail,
+                security_alert = true,
+                "the VTA or room host refused the bridge (not Geb); link stopped, not \
+                 retrying: fix the bridge's ACL grant, then `link clear-halt --yes`"
             ),
             HaltReason::UndecidableCommit { detail } => tracing::error!(
                 link = %self.link.id,
@@ -239,6 +249,7 @@ impl Pump {
     async fn guard<T>(&self, r: Result<T>) -> Result<T> {
         match r {
             Err(Error::Refused(why)) => Err(self.halt(HaltReason::refused(why)).await),
+            Err(Error::VtcRefused(why)) => Err(self.halt(HaltReason::vtc_refused(why)).await),
             Err(Error::UndecidableCommit(why)) => {
                 Err(self.halt(HaltReason::undecidable(why)).await)
             }
@@ -1483,6 +1494,74 @@ mod tests {
             .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
             .map(u64::from_be_bytes)
             .unwrap_or(0)
+    }
+
+    /// P1-6: a refusal from the VTI side (the VTA's 403, the host's
+    /// `permissionDenied`) is not "the foreign room removed the bridge".
+    #[cfg(feature = "vtc")]
+    #[tokio::test]
+    async fn a_vtc_side_refusal_halts_with_its_own_reason_and_remediation() {
+        use crate::halt::{ClearConfirmation, Cleared, clear};
+        let room = ScriptedRoom::new();
+        *room.always.lock().unwrap() = Some(|| {
+            crate::vtc::host::from_vta(vta_sdk::error::VtaError::Forbidden("no grant".into()))
+        });
+        let (lb, store) = (
+            Arc::new(Loopback::new("bridge-id")),
+            Arc::new(MemoryStore::new()),
+        );
+        let pump = Pump::new(link(), room.clone(), lb.clone(), store.clone());
+        pump.start().await.unwrap();
+        lb.inject("did:bob", "hello", 2).unwrap();
+        assert!(pump.tick().await.is_err());
+        let why = pump.halted().await.unwrap().expect("halted");
+        let text = why.to_string();
+        assert!(
+            text.contains("VTA or room host") && !text.contains("foreign room"),
+            "{text}"
+        );
+        // Clearing needs --yes only: Geb has not removed us, so there is no
+        // re-admission to attest to; the fix is the ACL grant.
+        let e = clear(store.as_ref(), ClearConfirmation::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("ACL") && !e.contains("--i-have-been-readmitted"),
+            "{e}"
+        );
+        let yes = ClearConfirmation {
+            yes: true,
+            readmitted: false,
+        };
+        assert!(matches!(
+            clear(store.as_ref(), yes).await.unwrap(),
+            Cleared::Cleared(_)
+        ));
+    }
+
+    /// The other side of P1-6: a Geb-side removal keeps its own reason and the
+    /// re-admission flag.
+    #[tokio::test]
+    async fn a_geb_side_refusal_keeps_the_readmit_requirement() {
+        use crate::halt::{ClearConfirmation, clear};
+        let (room, lb, store) = parts();
+        let pump = Pump::new(link(), room.clone(), lb.clone(), store.clone());
+        pump.start().await.unwrap();
+        lb.refuse("leaf removed").unwrap();
+        room.add("did:alice", None, "x", 1).unwrap();
+        assert!(pump.tick().await.is_err());
+        let text = pump.halted().await.unwrap().unwrap().to_string();
+        assert!(
+            text.contains("Geb") && text.contains("leaf removed"),
+            "{text}"
+        );
+        let yes = ClearConfirmation {
+            yes: true,
+            readmitted: false,
+        };
+        let e = clear(store.as_ref(), yes).await.unwrap_err().to_string();
+        assert!(e.contains("--i-have-been-readmitted"), "{e}");
     }
 
     #[tokio::test]

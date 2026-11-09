@@ -34,6 +34,13 @@ pub enum HaltReason {
         /// What the foreign room said.
         detail: String,
     },
+    /// The VTI side refused the bridge (the VTA's 403, the room host's
+    /// `permissionDenied`, `actionNotHeld`, `notAMember`). Not Geb's doing:
+    /// the bridge's ACL grant or room membership must be fixed at the VTA.
+    VtcRefused {
+        /// What the VTA or the host said.
+        detail: String,
+    },
     /// A commit that cannot be decided without local knowledge. `detail`
     /// names its epoch and hash.
     UndecidableCommit {
@@ -50,6 +57,13 @@ impl HaltReason {
         }
     }
 
+    /// A refusal by the VTA or the room host.
+    pub fn vtc_refused(detail: impl Into<String>) -> Self {
+        Self::VtcRefused {
+            detail: detail.into(),
+        }
+    }
+
     /// An undecidable commit.
     pub fn undecidable(detail: impl Into<String>) -> Self {
         Self::UndecidableCommit {
@@ -60,7 +74,9 @@ impl HaltReason {
     /// The detail text.
     pub fn detail(&self) -> &str {
         match self {
-            Self::Refused { detail } | Self::UndecidableCommit { detail } => detail,
+            Self::Refused { detail }
+            | Self::VtcRefused { detail }
+            | Self::UndecidableCommit { detail } => detail,
         }
     }
 
@@ -82,6 +98,7 @@ impl HaltReason {
     pub fn stopped_error(&self) -> Error {
         match self {
             Self::Refused { detail } => Error::Refused(format!("link stopped: {detail}")),
+            Self::VtcRefused { detail } => Error::VtcRefused(format!("link stopped: {detail}")),
             Self::UndecidableCommit { detail } => {
                 Error::UndecidableCommit(format!("link stopped: {detail}"))
             }
@@ -92,6 +109,7 @@ impl HaltReason {
     pub fn raised_error(&self) -> Error {
         match self {
             Self::Refused { detail } => Error::Refused(detail.clone()),
+            Self::VtcRefused { detail } => Error::VtcRefused(detail.clone()),
             Self::UndecidableCommit { detail } => Error::UndecidableCommit(detail.clone()),
         }
     }
@@ -100,7 +118,12 @@ impl HaltReason {
 impl std::fmt::Display for HaltReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Refused { detail } => write!(f, "refused or removed: {detail}"),
+            Self::Refused { detail } => {
+                write!(f, "the Geb room refused or removed the bridge: {detail}")
+            }
+            Self::VtcRefused { detail } => {
+                write!(f, "refused by the VTA or room host (not Geb): {detail}")
+            }
             Self::UndecidableCommit { detail } => write!(f, "undecidable commit: {detail}"),
         }
     }
@@ -127,7 +150,8 @@ pub struct ClearConfirmation {
     /// `--yes`: the operator has read what the halt was.
     pub yes: bool,
     /// `--i-have-been-readmitted`: needed in addition for a
-    /// [`HaltReason::Refused`] halt. The bridge was refused or removed; the
+    /// [`HaltReason::Refused`] halt (a Geb-side one; a
+    /// [`HaltReason::VtcRefused`] halt needs `--yes` only). The bridge was refused or removed; the
     /// operator states it has been admitted to the room again (re-seated by
     /// the room's members), because clearing without that only repeats it.
     pub readmitted: bool,
@@ -151,9 +175,13 @@ pub async fn clear(store: &dyn BridgeStore, confirm: ClearConfirmation) -> Resul
         return Ok(Cleared::NotHalted);
     };
     if !confirm.yes {
-        return Err(Error::Config(format!(
-            "the link is halted: {reason}. Re-run with --yes to clear it"
-        )));
+        let how = if matches!(reason, HaltReason::VtcRefused { .. }) {
+            ". Geb did not remove the bridge: fix the bridge's ACL grant or room membership at \
+             the VTA (the grant `link add` printed), then re-run with --yes to clear it"
+        } else {
+            ". Re-run with --yes to clear it"
+        };
+        return Err(Error::Config(format!("the link is halted: {reason}{how}")));
     }
     if matches!(reason, HaltReason::Refused { .. }) && !confirm.readmitted {
         return Err(Error::Config(format!(

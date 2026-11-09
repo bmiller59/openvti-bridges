@@ -24,6 +24,13 @@ pub enum Error {
     /// error (see [`crate::foreign::JoinState::Pending`]).
     #[error("refused: {0}")]
     Refused(String),
+    /// The VTI side refused the bridge: the user's VTA answered 403 or the room
+    /// host answered `permissionDenied` / `actionNotHeld` / `notAMember`. The
+    /// link stops like [`Error::Refused`], but the cause is the bridge's own
+    /// ACL grant or room membership, not Geb: the fix is on the VTA, and the
+    /// halt is cleared with `--yes` alone.
+    #[error("vtc refused: {0}")]
+    VtcRefused(String),
     /// A Geb commit that can be neither merged nor skipped without a persona
     /// card this bridge cannot hold (a deliberate bridge-side halt; Geb
     /// itself refuses such a commit and goes on). The link
@@ -35,7 +42,7 @@ pub enum Error {
     /// A typed failure from the VTC room side (the user's VTA or the room
     /// host), kept as data: `code` is what a caller matches on, never the
     /// message. A refusal that must stop the link is [`Error::Refused`]
-    /// instead; this is everything else, and `retryable` says whether the
+    /// or [`Error::VtcRefused`] instead; this is everything else, and `retryable` says whether the
     /// next tick may simply try again (the bridge never loops on it itself).
     #[error("room: [{code}] {message}")]
     Room {
