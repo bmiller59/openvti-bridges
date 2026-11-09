@@ -317,7 +317,7 @@ async fn a_member_claiming_to_be_ahead_cannot_force_a_reread_every_30_s() {
     }
     // 40 x 31 s = 20 minutes: one per 5 minutes at most (plus the first).
     assert!(
-        rereads <= 5 && rereads >= 1,
+        (1..=5).contains(&rereads),
         "{rereads} re-reads in 20 minutes"
     );
 }
