@@ -183,21 +183,28 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
 
 - **default (none)**: the Geb core and the adapter-neutral core build and test
   without `vta-sdk`, the generated Trust Task crates, fjall or `room-host`
-  (about 110 tests, seconds). The pump needs none of them: it speaks the
+  (186 lib tests plus `tests/vectors.rs` 11 and `tests/vectors2.rs` 9, seconds; the other test
+  targets need a feature and run 0 tests). The pump needs none of them: it speaks the
   `room::RoomSide` and `store::BridgeStore` traits only.
 - **`vtc`**: `vtc::VtcRoom` (`RoomSide` over `VtaClient`, HTTPS delivery in
   `vtc::host`) and `fjall_store::FjallStore` (`BridgeStore` over
   `vti_common::store`, keyspaces `links cursors journal_in outbox_out xref
   geb_mls ratchets`, journal fsync after every write the crash argument leans
   on). Kept behind a feature so the Geb work (M2/M3) never waits on the
-  VTI build graph, and so nothing Geb-shaped is pulled into it. Nothing
-  else enables it.
+  VTI build graph, and so nothing Geb-shaped is pulled into it. Only the
+  features that need it enable it: `cli`, `keyring` and `harness`
+  (`geb-live` and `geb-mls` do not).
 - **`harness`** (implies `vtc`): optional dependencies on `room-host`,
   `vti-rooms-dtg` test support and `vtc-client`, for `tests/harness.rs`. They
   are optional rather than dev-dependencies so a default `cargo test` does not
   compile the room host.
 
-Run the harness: `cargo test --features harness` (needs the `room-host` git dependency, see README).
+Run the harness: it needs the local-only `.cargo/config.toml` override (git-ignored, README:
+a `[patch]` entry pointing `room-host` at a local VTI checkout, plus `[patch.crates-io]` for VTI
+crates not in the cargo cache), because `room-host` is a placeholder git dependency. Then
+`cargo test --offline --features "cli harness geb-live geb-mls" --no-fail-fast`; `tests/harness.rs` and
+`tests/e2e.rs` need `harness`, and `e2e` also `geb-live` and `geb-mls`. Full counts at the last
+run: 273 lib, `cli` 5, `custody` 5, `e2e` 3, `geb_live` 9, `harness` 8, `vectors` 11, `vectors2` 9.
 
 - **`geb-live`**: `geb::nostr::NostrRelay` (a `GebRelay` over one websocket per
   identity: wss only, `ws://` only for 127.0.0.1, capped jittered reconnect,
@@ -398,8 +405,8 @@ persona implementation; the card-dependent Remove halts the link); SENDING a
 leave, the healer election and Remove commits (we only RECEIVE signed leaves);
 a peer index (the dyad is driven per peer DID, peers are listed per link in
 `geb_peers`); `fc` fragments; healer duty (electing, committing a re-seat or Remove, we
-only follow: see "Room status, catch-up and re-seat"); the `status` command
-does not show the recorded split (it is in the sealed MLS snapshot).
+only follow: see "Room status, catch-up and re-seat"); `status` shows only the
+non-secret fork marker of a recorded split, not the split itself (sealed MLS snapshot).
 Also not built on the room side: recovery of a sealed record left at a wrong
 version by a crash mid-race (it is reported as a typed read error).
 
@@ -518,13 +525,14 @@ alignment change.
 
 - `fc` fragments (large-room joins fail; see Capabilities).
 - Healer duty (re-seating a fork loser, electing, committing): not built, the bridge
-  only follows. `status` does not show the recorded split.
+  only follows. `status` shows the non-secret fork marker.
 - Re-stocking a SEATED member every 7 days (re-seat needs it; there is no natural
   place until the dyad is driven while seated; we do read it every 30 s while
   seated for `kp-low` / `seat-check`).
 - A `link add` check for direct rooms (needs a network read).
 - An oversize outbox entry (cannot come out of the mapping layer, which cuts at
-  20,000 bytes) would be retried every tick, not dropped.
+  the room's unit limit) is a permanent journalled failure (xref `failed:<key>`,
+  `status` shows `oversize_failed`), never retried.
 - Sending a leave, healer duty, persona-card intake, fork choice.
 
 ### UNVERIFIED points that still stand

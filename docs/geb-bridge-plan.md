@@ -1,10 +1,20 @@
-> Superseded details (added 2026-11-09; see `docs/DESIGN.md` for the current state): the `src/` layout in section 3
-> is the original plan (the code has `cli.rs`, `service.rs`, `run.rs`, `wiring.rs`, `ops.rs`, `custody.rs`,
-> `atrest.rs`, `halt.rs` and a `geb/mls/` directory, and no `setup.rs`); the room tasks in sections 4 and 6 are now
-> `rooms/keys/browse/0.4`, `rooms/keys/read/0.2`, `rooms/keys/act/0.11` and `rooms/keys/seal/0.3`; section 7's "any
-> `mc` stops the poll" now holds only without `geb-mls` (with it, only the two undecidable commit kinds halt the
-> link); the event limit is 120,000 bytes, not 65,536; "gap" records (section 8) are not built; `[geb] settle_ms`
-> (section 9) is parsed but not read (the window comes from the room's policy).
+> Superseded details (added 2026-11-09, extended 2026-11-09; `docs/DESIGN.md` is the current state). Where the body
+> below disagrees with it, this note wins:
+> - File layout (section 3) is the original plan: the code has `cli.rs`, `service.rs`, `run.rs`, `wiring.rs`, `ops.rs`,
+>   `custody.rs`, `atrest.rs`, `halt.rs`, `pause.rs` and a `geb/mls/` directory, and no `setup.rs`.
+> - Task versions (sections 4 and 6) are `rooms/keys/browse/0.4`, `rooms/keys/read/0.2`, `rooms/keys/act/0.11` and
+>   `rooms/keys/seal/0.3`.
+> - Section 7's "any `mc` stops the poll" holds only without `geb-mls`; with it only the two undecidable commit kinds
+>   halt the link (and Geb itself never halts a room).
+> - "Gap" records (section 8) are not built.
+> - The event limit is 120,000 bytes to post (131,072 accepted on reading), not 65,536; a line is 20,000 UTF-16 code
+>   units, counted as such by the mapping layer (`RoomCapabilities::max_message_units`, was `max_message_bytes`).
+> - `[geb] settle_ms` (section 9) no longer exists (a config naming it is rejected); the window comes from the room's
+>   0xF001 policy.
+> - The kill switch (section 9): `link pause` / `link resume` now take effect on a running `run` (it re-reads the flag
+>   from the config; unreadable counts as paused); `status` shows PAUSED, the outbox depth, the oversize-failure
+>   count and a fork marker.
+> - The Geb pin is release 0.5.15 (`fdf804d`) and answers rounds 1 to 4, not only release 0.5.14.
 
 > Update 2026-11-08: Geb answered the open questions from its code at commit release 0.5.14, now versioned as "path B 0.1" (the pin moved to release 0.5.15, commit `fdf804d`, with round 2 on 2026-11-09)
 > (breaking changes are announced in the Geb's announcement channel first). Geb details below are pinned to it. Effects: a retraction
@@ -83,7 +93,7 @@ src/
 Top-level seam (adapter-generic): the pump, mapping and outbox/journal depend only on `ForeignRoom`:
 join/leave; an inbound poll returning `BridgeEvent`s with an opaque resumable cursor; `post(&BridgeEvent) -> Receipt`
 (`Accepted | Relayed | Delivered`; Geb only ever returns `Relayed`); the identity it presents; and
-`capabilities() -> RoomCapabilities { max_message_bytes, supports_edit, supports_delete, supports_replies,
+`capabilities() -> RoomCapabilities { max_message_units, supports_edit, supports_delete, supports_replies,
 authors_verifiable }`. The core chooses behaviour from capabilities (for example a retraction notice line when delete is
 unsupported). A later adapter for another MLS ecosystem implements this trait and nothing else in the core changes.
 Adapters stay modules of this one crate until a second real adapter shows where the boundary falls (rule of three:

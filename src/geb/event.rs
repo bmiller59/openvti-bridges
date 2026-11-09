@@ -176,7 +176,9 @@ impl RelayEvent {
         self.expiration().is_some_and(|e| e <= now_secs)
     }
 
-    /// Size of the NIP-01 JSON, the quantity the 65,536-byte rule bounds.
+    /// Size of the NIP-01 JSON, the quantity the posting limit bounds: 120,000
+    /// bytes (`wire::MAX_EVENT_BYTES`; the relay carries up to 131,072, which
+    /// is what we accept when reading, `wire::MAX_RECV_EVENT_BYTES`).
     pub fn json_len(&self) -> usize {
         self.to_json().to_string().len()
     }

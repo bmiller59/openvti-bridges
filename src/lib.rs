@@ -10,8 +10,10 @@
 //! The Geb side is a foreign-protocol interface (workspace `CLAUDE.md`,
 //! exceptions to "every remote operation is a Trust Task"). Geb path B has no
 //! versioned specification: the adapter pins to Geb's answers
-//! (`Geb's path B answers, round 1` and round 2, release 0.5.15, commit `fdf804d`, see
-//! [`geb::status_line`]) and fails closed on anything it does not recognise.
+//! (`Geb's path B answers, round 1` and round 2 to round 4: rounds 1 to 4, read
+//! at release 0.5.15, commit `fdf804d`; the fixture vectors were generated at
+//! release 0.5.14 (round 1) and the round 2 reading (round 2), see [`geb::status_line`]) and
+//! fails closed on anything it does not recognise.
 //!
 //! Status: experimental. M0, M1 (the VTC room side and the durable store, behind
 //! feature `vtc`), M2 (the stateful dyad, the Nostr client behind `geb-live`,

@@ -17,8 +17,11 @@
 //! Schema notes (records are JSON, version `v`):
 //! - `links/dyad/<peer>`: [`ConnRecord`].
 //! - `ratchets/<peer>`: [`RatchetRecord`]. It holds chain keys in clear, so the
-//!   store is trusted to protect them like key material (the fjall store here
-//!   does not encrypt at rest).
+//!   store is trusted to protect them like key material. The fjall store itself
+//!   does not encrypt; the assembled link (`wiring::assemble`) wraps it in
+//!   `atrest::EncryptedState`, which seals the `ratchets` and `links` records
+//!   (and the MLS snapshot) under keys derived from the secret store. A caller
+//!   that hands this module a bare store gets no encryption at rest.
 //!
 //! UNVERIFIED (the guide and the answers are silent; each is a choice, not
 //! Geb's behaviour):
@@ -64,8 +67,14 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
-/// Largest frame plaintext that still fits one 65,536-byte event once the
-/// ratchet frame, two base64 layers and the AEAD overhead are added.
+/// Largest frame plaintext we send. Conservative: it was sized to fit the
+/// old 65,536-byte event once the ratchet frame, two base64 layers (about
+/// 16/9 expansion) and the AEAD overhead are added. The real posting limit is
+/// 120,000 bytes of NIP-01 JSON (`wire::MAX_EVENT_BYTES`, round 3 section 6;
+/// reading accepts up to the relay's 131,072), which would allow about 66,000
+/// bytes of plaintext. The constant stays at 36,000: it never produces an
+/// over-limit event, and a larger frame needs `fc` fragments or a decision to
+/// raise it (not made).
 pub const MAX_FRAME_PLAINTEXT: usize = 36_000;
 /// Most recent frame ids remembered for duplicate suppression.
 const DONE_FRAMES: usize = 1024;

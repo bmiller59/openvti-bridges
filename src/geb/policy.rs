@@ -1,6 +1,8 @@
 //! The room policy (GroupContext extension `0xF001`) and what a commit check
-//! needs. Geb path B answers 7 and 9 (code at commit release 0.5.14) and round 2 section 7
-//! (release 0.5.15, `fdf804d`).
+//! needs. Pinned to Geb's path B answers, rounds 1 to 4, at release 0.5.15 (commit
+//! `fdf804d`): answers 7 and 9 of round 1 (first read at release 0.5.14, where the
+//! vectors were generated), round 2 section 7 (vectors from the round 2 reading) and the
+//! round 3 and 4 rules for `validCommit`.
 //!
 //! # Policy (answer 7)
 //!
