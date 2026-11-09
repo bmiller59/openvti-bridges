@@ -183,9 +183,18 @@ impl GebRoom {
             if opened.sender_did == self.signer.did() {
                 continue; // our own leaf
             }
-            let Ok(line) = self.codec.decode_line(&opened.plaintext) else {
-                tracing::warn!("dropping a non-line room message");
-                continue;
+            let line = match self.codec.decode_line(&opened.plaintext) {
+                Ok(l) => l,
+                // A kind we do not read (a reaction, `wp`, anything newer) is
+                // valid and not ours to act on: no effect, no halt, no noise.
+                Err(e) if super::codec::is_not_a_line(&e) => {
+                    tracing::debug!(error = %e, "dropping a room plaintext that is not a line");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "dropping a malformed room line");
+                    continue;
+                }
             };
             let check = self.check_author(&opened.sender_did, &line);
             out.push(Polled {
@@ -634,6 +643,79 @@ mod tests {
         let got = b.poll(None).await.unwrap();
         assert_eq!(got.len(), 1, "only the line within the limit");
         assert_eq!(got[0].event.text.chars().count(), 10_000);
+    }
+
+    /// Records the most severe level it sees.
+    struct Loudest(Arc<std::sync::atomic::AtomicUsize>);
+    impl tracing::Subscriber for Loudest {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, e: &tracing::Event<'_>) {
+            // TRACE < DEBUG < INFO < WARN < ERROR in tracing's ordering of
+            // "more verbose is greater"; count severity the other way round.
+            let sev = match *e.metadata().level() {
+                tracing::Level::ERROR => 4,
+                tracing::Level::WARN => 3,
+                tracing::Level::INFO => 2,
+                tracing::Level::DEBUG => 1,
+                _ => 0,
+            };
+            self.0.fetch_max(sev, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// R3-f: `{t:"wp"}` and any other unknown plaintext kind is dropped with no
+    /// effect, no halt and nothing above debug in the log; the lines around it
+    /// are read as usual.
+    #[tokio::test]
+    async fn unknown_room_plaintext_kinds_are_dropped_quietly() {
+        let loudest = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(Loudest(loudest.clone()));
+        let relay = Arc::new(FakeRelay::new());
+        let (b, _, _) = room_for(&relay, 2, 1_700_000_001_000);
+        let (did, _) = device(9);
+        let g = FakeGroup::new(&did);
+        let keys = g.relay_keys().unwrap();
+        let ev = |at: u64, plain: &str| {
+            let env = format!(
+                r#"{{"t":"ml","m":"{}"}}"#,
+                b64_encode(&g.seal(plain.as_bytes()).unwrap())
+            );
+            RelayEvent::sign(
+                &keys.nostr_secret,
+                KIND_MAILBOX,
+                1_700_000_000 + at,
+                vec![],
+                pair::seal(&keys, KIND_MAILBOX, env.as_bytes()).unwrap(),
+            )
+            .unwrap()
+        };
+        relay.inject(ev(1, r#"{"t":"wp","at":1,"k":"interop","d":{"x":1}}"#));
+        relay.inject(ev(2, r#"{"t":"brand-new","at":2}"#));
+        relay.inject(ev(
+            3,
+            r#"{"t":"r","at":3,"re":"0123456789abcdef","e":"x","on":true}"#,
+        ));
+        relay.inject(ev(4, r#"{"t":"l","at":4000,"text":"hello"}"#));
+        let got = b.poll(None).await.unwrap();
+        assert_eq!(got.len(), 1, "only the line");
+        assert_eq!(got[0].event.text, "hello");
+        assert!(
+            loudest.load(std::sync::atomic::Ordering::SeqCst) <= 1,
+            "nothing above debug was logged"
+        );
+        // A malformed line, by contrast, is a warning.
+        relay.inject(ev(5, r#"{"t":"l","at":5000,"text":""}"#));
+        b.poll(None).await.unwrap();
+        assert_eq!(loudest.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     /// Round 3 section 6: no event over 120,000 bytes; an error, not a cut.

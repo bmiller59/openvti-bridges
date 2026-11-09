@@ -845,7 +845,15 @@ impl StatefulDyad {
                             // reply to `rc` / `seat-ask` / `leave` is a
                             // P1/P2 matter, not an ack.
                             Ok(Frame::Group(GroupOp::Ignored(op))) => {
-                                tracing::info!(%op, "ignoring a group op this bridge does not implement");
+                                // `rq` / `rl` carry room lines (an `rl` batch may
+                                // hold kinds we drop, such as `wp`): never
+                                // opened here, so nothing in one has an effect;
+                                // quiet because they are routine.
+                                if matches!(op.as_str(), "rq" | "rl") {
+                                    tracing::debug!(%op, "ignoring a line-sharing op this bridge does not implement");
+                                } else {
+                                    tracing::info!(%op, "ignoring a group op this bridge does not implement");
+                                }
                                 r.done.push_back(id.clone());
                                 to_ack.push(id);
                             }
@@ -1207,6 +1215,9 @@ mod tests {
             r#"{"k":"g","op":"seat-ask","room":{"id":"geb-room-0001"},"kp":"AAAA"}"#,
             r#"{"k":"g","op":"leave","room":{"id":"geb-room-0001"},"by":"did:x","at":1,"sig":"s"}"#,
             r#"{"k":"g","op":"something-new","x":1}"#,
+            // An `rl` batch (which may carry `{t:"wp"}` lines, section "what
+            // changes" of round 3) is never opened here: no effect.
+            r#"{"k":"g","op":"rl","room":{"id":"geb-room-0001"},"lines":[{"from":"did:x","id":"0123456789abcdef","at":1,"pl":"AAAA"}]}"#,
         ];
         let refused = [
             r#"{"k":"zz","op":"rc"}"#,
@@ -1225,12 +1236,12 @@ mod tests {
             ["after"],
             "an ignored op is not queued for the consumer"
         );
-        // The ratchet was not stalled by any of them, and the four ignored ops
+        // The ratchet was not stalled by any of them, and the five ignored ops
         // (plus the message and our connect-time `cap`) were acked; the four
         // refused ones were not.
         w.now.fetch_add(1, Ordering::SeqCst);
         let r = w.a.sync(w.b.did()).await.unwrap();
-        assert_eq!(r.acked, 6, "{r:?}");
+        assert_eq!(r.acked, 7, "{r:?}");
         assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), refused.len());
     }
 
