@@ -319,3 +319,64 @@ async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
     assert!(!ok);
     assert!(err.contains("in use by another process"), "{err}");
 }
+
+/// P1-1: `geb connect` and `geb stock-kps` post to Geb, so they obey the kill
+/// switch and the persisted halt exactly as `run` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn geb_connect_and_stock_kps_refuse_a_paused_or_halted_link() {
+    use vti_geb_bridge::fjall_store::FjallStore;
+    use vti_geb_bridge::halt::{self, HaltReason};
+    use vti_geb_bridge::wiring::link_dir;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let cfg = SetupInputs::from_toml_str(SETUP).unwrap().config().unwrap();
+    cfg.save(&path).unwrap();
+    let c = path.to_str().unwrap().to_string();
+    let run = |args: &[&str]| {
+        let mut full = vec!["-c", c.as_str()];
+        full.extend_from_slice(args);
+        // Bounded: a command that does not refuse would go on to the network.
+        let out = Command::new("timeout")
+            .arg("20")
+            .arg(env!("CARGO_BIN_EXE_vti-geb-bridge"))
+            .args(full)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let cmds: [&[&str]; 2] = [
+        &["geb", "connect", "--link", "l1", "did:peer:2.peer"],
+        &["geb", "stock-kps", "--link", "l1"],
+    ];
+    // Paused (the SETUP default is enabled = false).
+    for args in cmds {
+        let (ok, err) = run(args);
+        assert!(!ok, "{args:?} must refuse a paused link");
+        assert!(
+            err.contains("paused") && err.contains("link resume"),
+            "{args:?}: {err}"
+        );
+    }
+    // Running but halted.
+    cli::link_set_enabled(&path, "l1", true).unwrap();
+    let store_dir = link_dir(&cfg.data_dir_from(&path), "l1").join("store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    {
+        let s = FjallStore::open(&store_dir).unwrap();
+        halt::write(&s, &HaltReason::refused("removed from the room"))
+            .await
+            .unwrap();
+    }
+    for args in cmds {
+        let (ok, err) = run(args);
+        assert!(!ok, "{args:?} must refuse a halted link");
+        assert!(
+            err.contains("halted") && err.contains("clear-halt"),
+            "{args:?}: {err}"
+        );
+    }
+}

@@ -98,6 +98,34 @@ fn link_of<'a>(cfg: &'a Config, id: &str) -> Result<&'a LinkConfig> {
         .ok_or_else(|| Error::Config(format!("no link {id}")))
 }
 
+/// The kill switch and the persisted halt, for the commands that post to Geb
+/// outside `run` (`geb connect`, `geb stock-kps`). The pause check is the one
+/// `run` uses ([`ConfigFilePause`]: an unreadable config counts as PAUSED), and
+/// it runs before anything else, so a paused link needs no keys and touches no
+/// network. The halt is read from the link's store when one exists.
+async fn refuse_if_paused_or_halted(config_path: &Path, id: &str, what: &str) -> Result<()> {
+    if ConfigFilePause::new(config_path, id).is_paused() {
+        return Err(Error::Config(format!(
+            "link {id} is paused (or its config cannot be read, which counts as paused), so \
+             `{what}` will not post to Geb. Fix the config if it is unreadable, then run \
+             `link resume {id}`"
+        )));
+    }
+    let cfg = Config::load(config_path)?;
+    let dir = link_dir(&cfg.data_dir_from(config_path), id).join("store");
+    if dir.exists() {
+        let store = FjallStore::open(&dir)?;
+        if let Some(why) = crate::halt::read(&store as &dyn BridgeStore).await? {
+            return Err(Error::Config(format!(
+                "link {id} is halted ({why}), so `{what}` will not post to Geb. See `status`, \
+                 fix the cause, then run `link clear-halt {id} --yes` (add \
+                 `--i-have-been-readmitted` only if Geb removed the bridge)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Parts for the commands that never touch the room side: the VTA client is
 /// the unauthenticated constructor and is never used.
 async fn offline_parts(config_path: &Path, id: &str) -> Result<(LinkParts, Arc<FjallStore>)> {
@@ -111,8 +139,9 @@ async fn offline_parts(config_path: &Path, id: &str) -> Result<(LinkParts, Arc<F
     Ok((assemble(inputs)?, fjall))
 }
 
-/// `geb connect`: contacts the Geb relay only.
+/// `geb connect`: contacts the Geb relay only; refuses a paused or halted link.
 pub async fn geb_connect(config_path: &Path, id: &str, peer: &str) -> Result<()> {
+    refuse_if_paused_or_halted(config_path, id, "geb connect").await?;
     let (parts, _keep) = offline_parts(config_path, id).await?;
     let cfg = Config::load(config_path)?;
     let name = link_of(&cfg, id)?.display_name.clone();
@@ -128,8 +157,9 @@ pub async fn geb_connect(config_path: &Path, id: &str, peer: &str) -> Result<()>
     crate::cli::add_peer(config_path, id, peer)
 }
 
-/// `geb stock-kps`: contacts the Geb relay only.
+/// `geb stock-kps`: contacts the Geb relay only; refuses a paused or halted link.
 pub async fn geb_stock_kps(config_path: &Path, id: &str) -> Result<()> {
+    refuse_if_paused_or_halted(config_path, id, "geb stock-kps").await?;
     let (parts, _keep) = offline_parts(config_path, id).await?;
     let state = crate::ops::stock_kps(&parts).await?;
     println!("{id}: {state:?}");
