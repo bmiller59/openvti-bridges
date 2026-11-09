@@ -345,9 +345,18 @@ impl MlsGroupClient {
                 "welcome header policy differs from the group context; using the context"
             );
         }
-        let group = staged
+        let mut group = staged
             .into_group(&g.provider)
             .map_err(|e| Error::Wire(format!("join: {e:?}")))?;
+        // treeRefusal (0.5.15). OpenMLS exposes the tree only once the group
+        // exists, so a refusal deletes what `into_group` just stored: nothing
+        // of a refused Welcome is kept or persisted.
+        if let Err(why) = super::commit::tree_refusal(&group) {
+            if let Err(e) = group.delete(g.provider.storage()) {
+                tracing::error!(error = ?e, "could not delete the group of a refused welcome");
+            }
+            return Err(Error::Wire(format!("treeRefusal: {why}")));
+        }
         g.state = State::Seated(Box::new(group));
         Ok(())
     }

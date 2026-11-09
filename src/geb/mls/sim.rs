@@ -100,6 +100,8 @@ pub struct Sim {
     /// Found the group with the mixed wire-format policy, so this member's
     /// commits go out as PublicMessage (which Geb never sends and refuses).
     pub plaintext_handshake: bool,
+    /// Make this member's leaf carry no binding at all (a bare `unbound` leaf).
+    pub unbound: bool,
 }
 
 impl Sim {
@@ -123,10 +125,11 @@ impl Sim {
             forge_binding: false,
             plain_capabilities: false,
             plaintext_handshake: false,
+            unbound: false,
         }
     }
 
-    fn binding_ext(&self) -> Extensions<LeafNode> {
+    pub fn binding_ext(&self) -> Extensions<LeafNode> {
         let leaf_key = <[u8; 32]>::try_from(self.signer.public()).unwrap();
         let b = if self.forge_binding {
             // Signed by a different device key.
@@ -145,9 +148,10 @@ impl Sim {
     pub fn key_package(&self) -> KeyPackage {
         let mut b = KeyPackage::builder();
         if !self.plain_capabilities {
-            b = b
-                .leaf_node_capabilities(leaf_capabilities())
-                .leaf_node_extensions(self.binding_ext());
+            b = b.leaf_node_capabilities(leaf_capabilities());
+            if !self.unbound {
+                b = b.leaf_node_extensions(self.binding_ext());
+            }
         }
         b.build(SUITE, &self.provider, &self.signer, self.cred.clone())
             .unwrap()
@@ -175,13 +179,18 @@ impl Sim {
         } else {
             PURE_CIPHERTEXT_WIRE_FORMAT_POLICY
         };
+        let leaf_exts = if self.unbound {
+            Extensions::empty()
+        } else {
+            self.binding_ext()
+        };
         let cfg = MlsGroupCreateConfig::builder()
             .ciphersuite(SUITE)
             .wire_format_policy(policy)
             .use_ratchet_tree_extension(true)
             .with_group_context_extensions(exts)
             .capabilities(leaf_capabilities())
-            .with_leaf_node_extensions(self.binding_ext())
+            .with_leaf_node_extensions(leaf_exts)
             .unwrap()
             .build();
         self.group = Some(
@@ -222,6 +231,69 @@ impl Sim {
             .as_mut()
             .unwrap()
             .self_update(p, s, LeafNodeParameters::default())
+            .unwrap();
+        b.into_commit().tls_serialize_detached().unwrap()
+    }
+
+    /// A path-only self-update that replaces this member's leaf parameters
+    /// (credential, extensions): the shape of a `heal` when `params` carry the
+    /// binding, a `leafAuth` violation when they carry another DID.
+    pub fn stage_update_with(&mut self, params: LeafNodeParameters) -> Vec<u8> {
+        let (p, s) = (&self.provider, &self.signer);
+        let b = self
+            .group
+            .as_mut()
+            .unwrap()
+            .self_update(p, s, params)
+            .unwrap();
+        b.into_commit().tls_serialize_detached().unwrap()
+    }
+
+    /// A standalone Proposal (Add), the bytes Geb would refuse. Returns
+    /// (proposal message, a commit by reference to it).
+    pub fn stage_by_ref_add(&mut self, kp: KeyPackage) -> (Vec<u8>, Vec<u8>) {
+        let (p, s) = (&self.provider, &self.signer);
+        let g = self.group.as_mut().unwrap();
+        g.clear_pending_proposals(p.storage()).unwrap();
+        let (prop, _) = g.propose_add_member(p, s, &kp).unwrap();
+        let (c, _, _) = g.commit_to_pending_proposals(p, s).unwrap();
+        (
+            prop.tls_serialize_detached().unwrap(),
+            c.tls_serialize_detached().unwrap(),
+        )
+    }
+
+    /// A standalone Proposal (Add), alone, not committed.
+    pub fn stage_proposal(&mut self, kp: KeyPackage) -> Vec<u8> {
+        let (p, s) = (&self.provider, &self.signer);
+        let g = self.group.as_mut().unwrap();
+        g.clear_pending_proposals(p.storage()).unwrap();
+        let (prop, _) = g.propose_add_member(p, s, &kp).unwrap();
+        prop.tls_serialize_detached().unwrap()
+    }
+
+    /// One commit that removes the leaf of `did` and adds `kp`, both inline
+    /// (the shape of a re-seat).
+    pub fn stage_reseat(&mut self, did: &str, kp: KeyPackage) -> Vec<u8> {
+        let idx = self
+            .group
+            .as_ref()
+            .unwrap()
+            .members()
+            .find(|m| m.credential.serialized_content() == did.as_bytes())
+            .unwrap()
+            .index;
+        let (p, s) = (&self.provider, &self.signer);
+        let g = self.group.as_mut().unwrap();
+        let b = g
+            .commit_builder()
+            .propose_removals([idx])
+            .propose_adds([kp])
+            .load_psks(p.storage())
+            .unwrap()
+            .build(p.rand(), p.crypto(), s, |_| true)
+            .unwrap()
+            .stage_commit(p)
             .unwrap();
         b.into_commit().tls_serialize_detached().unwrap()
     }

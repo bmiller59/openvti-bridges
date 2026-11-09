@@ -70,6 +70,31 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   skipped-key window heals gaps), but without an ack the sender would repost
   the frame for ever, so ack is the safe choice either way. Geb's expected
   reply to `rc` / `seat-ask` / `leave` (P1/P2) is not built.
+- **0.5.15 commit and tree rules** (answers round 2 sections 2, 7, 8;
+  `geb/mls/commit.rs`, `geb::policy::valid_commit`). Refusals, never failures:
+  a commit with any proposal by reference, a standalone Proposal in an `mc`
+  (never stored), an update-path leaf naming another DID than its sender
+  (`leafAuth`) or carrying a forged binding, an unbound added leaf naming the
+  root, an admin or a seated DID (`unboundClaim`), and a remove, re-seat or
+  policy change from a sender whose leaf is not bound (exception: …
+  … leaf). A `heal` (path-only self-update
+  whose new leaf carries the sender's binding) is valid. At join a Welcome whose
+  … with one unbound, is
+  refused (`treeRefusal`: the group `into_group` stored is deleted, we stay
+  pending). Leaf verdicts: bound = binding verifies (`BindingStatus::Verified`),
+  unbound = no `0xF002` (`Missing`), forged = present and wrong (`Forged`); `k`
+  is derived from the leaf's own signature key, so a bad-`k` binding is simply a
+  signature that does not verify. Refused vs failed in the walk: refused = drop
+  and try the next hash; failed (`Unprocessable`: replay, wrong branch,
+  unparsable) = stop, keep the cursor, send `rs` once.
+  UNVERIFIED (Geb's walk label for the MLS-layer refusals is "refused", which
+  we read as the same as a `validCommit` failure, matching the forged-binding
+  precedent in round 1; the answers do not say it outright, and the reading
+  "failed" would stop the walk instead; open question 3): standalone Proposal,
+  by-reference, `leafAuth`. UNVERIFIED: the "bound sender" is the sender's leaf
+  before the commit; the unboundClaim "seated" set includes a DID the same
+  commit removes (a re-seat onto an unbound leaf is refused); a heal need not
+  keep the same signature key.
 - **No new message kinds.** Geb has no edit, delete or retract on the wire. A
   retraction (or a supersede, since edit is unsupported) is an ordinary signed
   `{t:"l"}` line whose `re` is the original line's *derived* id

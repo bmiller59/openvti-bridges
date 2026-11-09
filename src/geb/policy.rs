@@ -233,6 +233,15 @@ pub struct CommitFacts {
     /// (Update, PreSharedKey, ReInit, ExternalInit, custom). Such a commit is
     /// neither merged nor skipped.
     pub unclassified: bool,
+    /// The sender's current leaf (in the tree the commit is made from) is
+    /// **bound** (0.5.15, answers round 2 section 7). Default `false`: fail
+    /// closed.
+    pub sender_bound: bool,
+    /// Device DIDs seated now, before the commit.
+    pub seated: Vec<String>,
+    /// Added leaves that carry NO binding (`unbound`), by DID. A forged binding
+    /// never reaches here: the judge refuses it first.
+    pub unbound_adds: Vec<String>,
 }
 
 /// The answer of [`valid_commit`].
@@ -274,6 +283,40 @@ pub fn valid_commit(
     use CommitVerdict::{Invalid, Undecidable, Valid};
     if facts.unclassified {
         return Undecidable("commit carries a proposal type the check is not described for".into());
+    }
+    // 0.5.15 (answers round 2 sections 1 and 7), neither rule needs persona
+    // cards, so both hold whether or not `can_evaluate`.
+    //
+    // unboundClaim: an unbound leaf that names the root, an admin or a DID
+    // already seated is never seated. (A re-seat's added leaf names a DID that
+    // is still seated when the commit is made, so an unbound re-seat leaf is
+    // refused too. UNVERIFIED: whether Geb counts the DID being removed in the
+    // same commit as seated.)
+    for d in &facts.unbound_adds {
+        if policy.root.as_deref() == Some(d.as_str())
+            || policy.admins.contains(d)
+            || facts.seated.contains(d)
+        {
+            return Invalid(format!(
+                "unboundClaim: an unbound leaf names {d}, the root, an admin or a seated DID"
+            ));
+        }
+    }
+    // …
+    // … bound; …
+    // … leaf.
+    if (!facts.removes.is_empty() || facts.policy_change.is_some()) && !facts.sender_bound {
+        let own_reseat = facts.policy_change.is_none()
+            && !facts.removes.is_empty()
+            && facts.unbound_adds.is_empty()
+            && facts.removes.iter().all(|d| d == &facts.sender)
+            && !facts.adds.is_empty()
+            && facts.adds.iter().all(|d| d == &facts.sender);
+        if !own_reseat {
+            return Invalid(
+                "a remove, re-seat or policy change needs a sender whose leaf is bound".into(),
+            );
+        }
     }
     if !inputs.can_evaluate() {
         if !facts.removes.is_empty() {
@@ -451,6 +494,7 @@ mod tests {
     fn facts(sender: &str) -> CommitFacts {
         CommitFacts {
             sender: sender.into(),
+            sender_bound: true,
             ..CommitFacts::default()
         }
     }
@@ -582,6 +626,76 @@ mod tests {
         ));
         g.policy_change = Some(pol(r#","direct":["did:lo","did:hi"]"#));
         assert_eq!(valid_commit(&d, &g, &fake), CommitVerdict::Valid);
+    }
+
+    #[test]
+    fn removes_re_seats_and_policy_changes_need_a_bound_sender() {
+        let none = NoLocalKnowledge;
+        let fake = Fake::default();
+        let inv = |f: &CommitFacts| {
+            matches!(valid_commit(&pol(""), f, &fake), CommitVerdict::Invalid(_))
+                && matches!(valid_commit(&pol(""), f, &none), CommitVerdict::Invalid(_))
+        };
+        // root, unbound: its remove, a re-seat and a policy change are refused.
+        let mut r = facts("did:root");
+        r.sender_bound = false;
+        r.removes = s(&["did:x"]);
+        assert!(inv(&r));
+        let mut rs = facts("did:m");
+        rs.sender_bound = false;
+        rs.removes = s(&["did:a"]);
+        rs.adds = s(&["did:a"]);
+        assert!(inv(&rs), "re-seating someone else, unbound");
+        let mut c = facts("did:root");
+        c.sender_bound = false;
+        c.policy_change = Some(pol(""));
+        assert!(inv(&c));
+        // The exception: re-seating its own DID onto a BOUND leaf.
+        let mut own = facts("did:m");
+        own.sender_bound = false;
+        own.removes = s(&["did:m"]);
+        own.adds = s(&["did:m"]);
+        assert_eq!(valid_commit(&pol(""), &own, &fake), CommitVerdict::Valid);
+        // ...but not onto an unbound one, and not with a policy change.
+        let mut unb = own.clone();
+        unb.unbound_adds = s(&["did:m"]);
+        assert!(inv(&unb));
+        let mut pc = own.clone();
+        pc.policy_change = Some(pol(""));
+        assert!(inv(&pc));
+        // An unbound sender may still add and self-update ("adds always pass").
+        let mut a = facts("did:m");
+        a.sender_bound = false;
+        a.adds = s(&["did:new"]);
+        assert_eq!(valid_commit(&pol(""), &a, &none), CommitVerdict::Valid);
+        assert_eq!(
+            valid_commit(&pol(""), &facts("did:m"), &none),
+            CommitVerdict::Valid
+        );
+    }
+
+    #[test]
+    fn an_unbound_leaf_naming_root_an_admin_or_a_seated_did_is_refused() {
+        let none = NoLocalKnowledge;
+        for claimed in ["did:root", "did:adm", "did:seat"] {
+            let mut f = facts("did:m");
+            f.seated = s(&["did:m", "did:seat"]);
+            f.adds = s(&[claimed]);
+            f.unbound_adds = s(&[claimed]);
+            assert!(
+                matches!(
+                    valid_commit(&pol(""), &f, &none),
+                    CommitVerdict::Invalid(w) if w.starts_with("unboundClaim")
+                ),
+                "{claimed}"
+            );
+        }
+        // A fresh DID, or a bound claimant, is fine.
+        let mut f = facts("did:m");
+        f.seated = s(&["did:m"]);
+        f.adds = s(&["did:fresh", "did:root"]);
+        f.unbound_adds = s(&["did:fresh"]);
+        assert_eq!(valid_commit(&pol(""), &f, &none), CommitVerdict::Valid);
     }
 
     #[test]

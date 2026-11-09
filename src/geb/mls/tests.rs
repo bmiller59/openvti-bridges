@@ -977,6 +977,257 @@ async fn a_missing_binding_is_seated_and_reported_unverified() {
     assert!(w.our_keys_match(&w.a));
 }
 
+// ---- 0.5.15 commit and tree rules (P0-c) -----------------------------------------
+
+/// Poll to hold what was posted, wait the window, poll to settle it.
+async fn settle_posted(w: &World) -> crate::Result<()> {
+    let t = w.now();
+    w.poll().await?;
+    w.at(t + 3000);
+    w.poll().await.map(|_| ())
+}
+
+/// Seat `who` (a fresh Sim) through A's commit: merged on A, B and us.
+async fn add_member(w: &mut World, who: &mut Sim) {
+    let (c, welcome) = w.a.stage_add(who.key_package());
+    w.post_mc(&w.a, &c).await;
+    w.a.merge_pending();
+    w.b.apply(&c).unwrap();
+    settle_posted(w).await.unwrap();
+    who.join(&welcome);
+    assert_eq!(w.client.epoch(), Some(w.a.epoch()));
+    w.at(w.now() + 10_000);
+}
+
+/// `bad` (made on B, the lower hash) must be REFUSED (not failed), the walk must
+/// go on, and A's ordinary commit must win and merge. Returns our client's
+/// failed-commit count (always 0 here, asserted).
+async fn refused_then_next_wins(w: &mut World, mk_bad_on_b: &dyn Fn(&mut Sim) -> Vec<u8>) {
+    let e = w.a.epoch();
+    let (good, bad) = staged_pair(
+        &mut w.a,
+        &mut w.b,
+        false,
+        &|s| s.stage_self_update(),
+        mk_bad_on_b,
+    );
+    assert!(commit_hash(&bad) < commit_hash(&good));
+    w.post_mc(&w.b, &bad).await;
+    w.post_mc(&w.a, &good).await;
+    settle_posted(w).await.unwrap();
+    assert!(
+        w.client.failed_commits().is_empty(),
+        "a refusal is not a failure"
+    );
+    assert_eq!(w.client.epoch(), Some(e + 1), "the next hash was merged");
+    w.a.merge_pending();
+    w.b.drop_pending();
+    assert!(w.our_keys_match(&w.a));
+}
+
+#[tokio::test]
+async fn by_reference_proposals_and_standalone_proposals_are_refused_not_failed() {
+    let kp = Sim::new(30).key_package();
+    let mut w = World::build(Arc::new(AllKnown), "");
+    w.seat().await;
+    // A commit that names its proposal by reference.
+    refused_then_next_wins(&mut w, &|s| s.stage_by_ref_add(kp.clone()).1).await;
+    // A standalone Proposal in an `mc` is refused and never stored.
+    let mut w = World::build(Arc::new(AllKnown), "");
+    w.seat().await;
+    refused_then_next_wins(&mut w, &|s| s.stage_proposal(kp.clone())).await;
+    assert!(
+        !w.client.members().iter().any(|m| m == &Sim::new(30).did),
+        "nobody was added by a proposal"
+    );
+    // A lone one: refused, nothing held afterwards, nothing failed.
+    let mut w = World::build(Arc::new(AllKnown), "");
+    w.seat().await;
+    let e = w.client.epoch();
+    let p = w.b.stage_proposal(kp.clone());
+    w.post_mc(&w.b, &p).await;
+    settle_posted(&w).await.unwrap();
+    assert_eq!(w.client.epoch(), e);
+    assert!(w.client.failed_commits().is_empty());
+    assert_eq!(w.client.held_commits(), 0);
+}
+
+#[tokio::test]
+async fn leaf_auth_refuses_an_update_path_leaf_that_names_another_did() {
+    let mut w = World::build(Arc::new(AllKnown), "");
+    w.seat().await;
+    let other = Sim::new(31);
+    refused_then_next_wins(&mut w, &|s| {
+        let params = LeafNodeParameters::builder()
+            .with_credential_with_key(CredentialWithKey {
+                credential: other.cred.credential.clone(),
+                signature_key: s.cred.signature_key.clone(),
+            })
+            .build();
+        s.stage_update_with(params)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_forged_binding_on_the_update_path_leaf_is_refused() {
+    let mut w = World::build(Arc::new(AllKnown), "");
+    w.seat().await;
+    refused_then_next_wins(&mut w, &|s| {
+        s.forge_binding = true;
+        let ext = s.binding_ext();
+        s.forge_binding = false;
+        s.stage_update_with(LeafNodeParameters::builder().with_extensions(ext).build())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unbound_leaf_naming_the_root_or_a_seated_did_is_never_seated() {
+    for (claimed_seed, who) in [(1u8, "the root"), (2u8, "a seated member")] {
+        let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+        w.seat().await;
+        let mut imp = Sim::new(claimed_seed);
+        imp.unbound = true;
+        let kp = imp.key_package();
+        assert_eq!(binding_status(kp.leaf_node()), BindingStatus::Missing);
+        refused_then_next_wins(&mut w, &|s| s.stage_add(kp.clone()).0).await;
+        assert_eq!(
+            w.client.members().len(),
+            3,
+            "{who}: the claimant is not seated"
+        );
+    }
+    // An unbound leaf of a DID nobody holds is still seated (answer 1).
+    // (a_missing_binding_is_seated_and_reported_unverified)
+}
+
+#[tokio::test]
+async fn an_unbound_sender_cannot_remove_or_change_policy_and_can_heal_its_own_leaf() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    let mut u = Sim::new(40);
+    u.unbound = true;
+    add_member(&mut w, &mut u).await;
+    let b_did = w.b.did.clone();
+    let status: std::collections::HashMap<_, _> = w.client.member_bindings().into_iter().collect();
+    assert_eq!(status[&u.did], BindingStatus::Missing);
+    // An unbound sender's Remove is refused, even though nothing about it
+    // needs persona cards; the walk goes on to A's commit.
+    let e = w.a.epoch();
+    let (good, bad) = staged_pair(&mut w.a, &mut u, false, &|s| s.stage_self_update(), &|s| {
+        s.stage_remove(&b_did)
+    });
+    w.post_mc(&u, &bad).await;
+    w.post_mc(&w.a, &good).await;
+    settle_posted(&w).await.unwrap();
+    assert_eq!(w.client.epoch(), Some(e + 1));
+    assert!(w.client.members().contains(&b_did));
+    w.a.merge_pending();
+    u.drop_pending();
+    u.apply(&good).unwrap();
+    w.b.apply(&good).unwrap();
+    w.at(w.now() + 10_000);
+    // Same for a policy change.
+    let e = w.a.epoch();
+    let edit = policy(&w.a.did, r#","edit":"admins""#);
+    let (good, bad) = staged_pair(&mut w.a, &mut u, false, &|s| s.stage_self_update(), &|s| {
+        s.stage_policy(&edit)
+    });
+    w.post_mc(&u, &bad).await;
+    w.post_mc(&w.a, &good).await;
+    settle_posted(&w).await.unwrap();
+    assert_eq!(w.client.epoch(), Some(e + 1));
+    w.a.merge_pending();
+    u.drop_pending();
+    u.apply(&good).unwrap();
+    w.b.apply(&good).unwrap();
+    w.at(w.now() + 10_000);
+    // The heal: a path-only self-update whose new leaf carries U's binding.
+    let heal = u.stage_update_with(
+        LeafNodeParameters::builder()
+            .with_extensions(u.binding_ext())
+            .build(),
+    );
+    w.post_mc(&u, &heal).await;
+    u.merge_pending();
+    w.a.apply(&heal).unwrap();
+    w.b.apply(&heal).unwrap();
+    settle_posted(&w).await.unwrap();
+    assert_eq!(w.client.epoch(), Some(u.epoch()));
+    let status: std::collections::HashMap<_, _> = w.client.member_bindings().into_iter().collect();
+    assert_eq!(
+        status[&u.did],
+        BindingStatus::Verified,
+        "the heal bound the leaf"
+    );
+    assert!(w.our_keys_match(&u));
+    // Now U is bound; its Remove is judged by the ordinary rules (not root:
+    // refused by AllKnown-style rules is P0-d's concern; here, undecidable
+    // without cards, which is the documented halt).
+}
+
+/// Steps of `seat()` up to, not including, the final join: A adds `extra`
+/// first (so the tree the Welcome carries holds it), then our KeyPackage.
+async fn offer_welcome_after(w: &mut World, extra: &mut Sim) -> JoinState {
+    assert_eq!(w.room.join().await.unwrap(), JoinState::Pending);
+    let (c, _) = w.a.stage_add(extra.key_package());
+    w.a.merge_pending();
+    w.b.apply(&c).unwrap();
+    let Some(Frame::Group(GroupOp::KpStock { kps, .. })) =
+        w.bus.take(&w.our_did, &w.a.did).first().cloned()
+    else {
+        panic!("no kp-stock")
+    };
+    let (commit, welcome) = w.a.stage_add(parse_kp(&kps[0]));
+    w.a.merge_pending();
+    w.b.apply(&commit).unwrap();
+    w.bus.put(
+        &w.a.did,
+        &w.our_did,
+        welcome_frame(ROOM, &w.a.did, &w.policy, &welcome),
+    );
+    w.room.join().await.unwrap()
+}
+
+#[tokio::test]
+async fn a_welcome_with_a_forged_leaf_or_a_duplicate_unbound_did_is_refused() {
+    // (a) a forged leaf in the tree.
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    let mut evil = Sim::new(41);
+    evil.forge_binding = true;
+    assert_eq!(
+        offer_welcome_after(&mut w, &mut evil).await,
+        JoinState::Pending
+    );
+    assert_eq!(w.client.epoch(), None, "nothing of it was kept");
+    // (b) two leaves for one DID, one of them unbound (B's DID, no binding).
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    let mut dup = Sim::new(2);
+    dup.unbound = true;
+    assert_eq!(
+        offer_welcome_after(&mut w, &mut dup).await,
+        JoinState::Pending
+    );
+    assert_eq!(w.client.epoch(), None);
+    // (c) two leaves for one DID, BOTH bound, is not a treeRefusal (a re-seat
+    // in flight leaves exactly this), and an unbound leaf of a fresh DID is
+    // seated.
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    let mut fresh = Sim::new(42);
+    fresh.unbound = true;
+    assert_eq!(
+        offer_welcome_after(&mut w, &mut fresh).await,
+        JoinState::Seated
+    );
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    let mut twin = Sim::new(2);
+    assert_eq!(
+        offer_welcome_after(&mut w, &mut twin).await,
+        JoinState::Seated
+    );
+}
+
 // ---- partial local knowledge ---------------------------------------------------
 
 #[tokio::test]
