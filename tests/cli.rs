@@ -118,8 +118,19 @@ async fn link_management_edits_the_config_and_the_grant_is_narrow() {
     cli::link_set_enabled(&path, "l1", true).unwrap();
     assert!(Config::load(&path).unwrap().links[0].enabled);
     assert!(cli::link_list(&Config::load(&path).unwrap())[0].contains("running"));
-    cli::link_set_enabled(&path, "l1", false).unwrap();
+    let said = cli::link_set_enabled(&path, "l1", false).unwrap();
     assert!(!Config::load(&path).unwrap().links[0].enabled);
+    // The message says whether a running process honours it and how soon.
+    assert!(
+        said.contains("already running") && said.contains("10s") && said.contains("next tick"),
+        "{said}"
+    );
+    assert!(
+        cli::link_set_enabled(&path, "l1", true)
+            .unwrap()
+            .contains("within 10s")
+    );
+    cli::link_set_enabled(&path, "l1", false).unwrap();
     assert!(cli::link_set_enabled(&path, "nope", true).is_err());
     cli::add_peer(&path, "l1", "did:peer:2.peer").unwrap();
     cli::add_peer(&path, "l1", "did:peer:2.peer").unwrap();

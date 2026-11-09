@@ -7,6 +7,7 @@ use crate::config::{Config, LinkConfig};
 use crate::custody::{BridgeSecrets, SecretStore};
 use crate::fjall_store::FjallStore;
 use crate::geb::nostr::{NostrConfig, NostrRelay};
+use crate::pause::{ConfigFilePause, PauseSource};
 use crate::run::{End, Health, LinkTick, Timing, supervise};
 use crate::store::BridgeStore;
 use crate::vtc::host::HostDelivery;
@@ -28,6 +29,7 @@ fn inputs_for(
     secrets: &BridgeSecrets,
     link: &LinkConfig,
     vta: Arc<VtaClient>,
+    pause: Option<Arc<dyn PauseSource>>,
 ) -> Result<(LinkInputs, Arc<FjallStore>)> {
     let ls = secrets
         .link(&link.id)
@@ -55,6 +57,7 @@ fn inputs_for(
             host: HostDelivery::new(host_url)?,
             clock: system_clock(),
             commit_inputs: None,
+            pause,
         },
         store,
     ))
@@ -104,7 +107,7 @@ async fn offline_parts(config_path: &Path, id: &str) -> Result<(LinkParts, Arc<F
     let vta = Arc::new(VtaClient::new(
         cfg.vta.url.as_deref().unwrap_or("https://vta.invalid"),
     ));
-    let (inputs, fjall) = inputs_for(&cfg, &data_dir, &secrets, link, vta)?;
+    let (inputs, fjall) = inputs_for(&cfg, &data_dir, &secrets, link, vta, None)?;
     Ok((assemble(inputs)?, fjall))
 }
 
@@ -146,7 +149,11 @@ pub async fn status(config_path: &Path, only: Option<&str>) -> Result<()> {
         println!(
             "{}: {} browse_version={} foreign_cursor={} outbox_depth={} last_relayed={} {}",
             l.id,
-            if l.enabled { "enabled" } else { "paused" },
+            if l.enabled {
+                "enabled"
+            } else {
+                "PAUSED (`link pause`: nothing is posted or written; resume with `link resume`)"
+            },
             s.browse_version,
             s.foreign_cursor_secs.map_or("-".into(), |v| v.to_string()),
             s.outbox_depth,
@@ -205,21 +212,38 @@ pub async fn clear_halt(
     Ok(())
 }
 
-/// `run`: supervise every enabled link until SIGINT or SIGTERM.
+/// `run`: supervise every link until SIGINT or SIGTERM. A link that is paused
+/// (`enabled = false`) is supervised too, idle: it sends and writes nothing
+/// until `link resume`, which the running process notices on its own (the kill
+/// switch re-reads the config, see [`crate::pause`]). Supervising paused links
+/// is what lets `link resume` take effect without a restart. A paused link
+/// whose parts cannot be built (no keys yet) is skipped with a warning and
+/// needs a restart after it is fixed; an enabled one still fails the run.
 pub async fn run(config_path: &Path) -> Result<()> {
     let (cfg, data_dir, store) = open(config_path).await?;
-    let enabled: Vec<&LinkConfig> = cfg.links.iter().filter(|l| l.enabled).collect();
-    if enabled.is_empty() {
-        tracing::warn!("no link is enabled; nothing to do (see `link resume`)");
+    if cfg.links.is_empty() {
+        tracing::warn!("no link is configured; nothing to do (see `link add`)");
         return Ok(());
+    }
+    if !cfg.links.iter().any(|l| l.enabled) {
+        tracing::warn!("every link is paused; they idle until `link resume`");
     }
     let secrets = secrets_of(&store).await?;
     let vta = authenticated_client(&cfg, &secrets).await?;
     let (stop, stopped) = watch::channel(false);
     let mut tasks = tokio::task::JoinSet::new();
-    for l in enabled {
-        let (inputs, fjall) = inputs_for(&cfg, &data_dir, &secrets, l, vta.clone())?;
-        let parts = assemble(inputs)?;
+    for l in &cfg.links {
+        let gate: Arc<dyn PauseSource> = Arc::new(ConfigFilePause::new(config_path, &l.id));
+        let built = inputs_for(&cfg, &data_dir, &secrets, l, vta.clone(), Some(gate))
+            .and_then(|(inputs, fjall)| Ok((assemble(inputs)?, fjall)));
+        let (parts, fjall) = match built {
+            Ok(p) => p,
+            Err(e) if !l.enabled => {
+                tracing::warn!(link = %l.id, error = %e, "paused link not started; fix it and restart `run` before resuming");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let timing = Timing::for_poll_secs(l.poll_secs);
         let id = l.id.clone();
         let (rx, health) = (stopped.clone(), Arc::new(Health::default()));

@@ -15,6 +15,11 @@
 //!   `permissionDenied` from the room side) and `Error::UndecidableCommit` end supervision for good with
 //!   [`End::Halted`]. The pump persists the halt, so a restart of the process
 //!   ends here too, on the first tick, without touching the foreign room.
+//! - **Paused.** The kill switch ([`crate::pause`]): while [`LinkTick::paused`]
+//!   the supervisor starts nothing and ticks nothing, and just waits a poll
+//!   interval at a time (or for the stop signal). A pause is not a failure: no
+//!   backoff, no health change beyond the last tick ageing. After a resume the
+//!   session starts again (the join is idempotent) from the preserved cursors.
 //! - **Health is derived, not stored.** [`Health::read`] compares "now" with the
 //!   time of the last successful tick; nothing is set to "connected" and left
 //!   there (R6.2).
@@ -36,6 +41,12 @@ pub trait LinkTick: Send + Sync {
     async fn tick(&self) -> Result<TickReport>;
     /// Release sockets and the like. Called exactly once on the way out.
     async fn close(&self) {}
+    /// The kill switch, read fresh. While `true` the supervisor starts no
+    /// session and runs no tick (it keeps the process, and whatever
+    /// connections the link holds, alive). Default: never paused.
+    fn paused(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -45,6 +56,9 @@ impl LinkTick for crate::pump::Pump {
     }
     async fn tick(&self) -> Result<TickReport> {
         crate::pump::Pump::tick(self).await
+    }
+    fn paused(&self) -> bool {
+        self.is_paused()
     }
 }
 
@@ -197,6 +211,13 @@ async fn supervise_inner(
         if *stop.borrow() {
             return End::Stopped;
         }
+        // Paused: idle, send nothing, touch no state.
+        if link.paused() {
+            if sleep_or_stop(timing.poll, stop).await {
+                return End::Stopped;
+            }
+            continue;
+        }
         // One session: start, then tick until something fails.
         let began = Instant::now();
         let mut ticked_ok = false;
@@ -204,6 +225,11 @@ async fn supervise_inner(
             Err(e @ (Error::Refused(_) | Error::UndecidableCommit(_))) => return halt(&e),
             Err(e) => Some(e),
             Ok(_) => loop {
+                // Paused between ticks: end the session without a failure, so
+                // no backoff; the top of the loop idles until a resume.
+                if link.paused() {
+                    break None;
+                }
                 match link.tick().await {
                     Ok(_) => {
                         ticked_ok = true;
@@ -243,6 +269,7 @@ mod tests {
         n_tick: AtomicUsize,
         closed: AtomicUsize,
         stop_after: Option<(usize, watch::Sender<bool>)>,
+        paused: AtomicBool,
     }
     impl Script {
         fn new(starts: Vec<Result<JoinState>>, ticks: Vec<Result<TickReport>>) -> Self {
@@ -253,6 +280,7 @@ mod tests {
                 n_tick: 0.into(),
                 closed: 0.into(),
                 stop_after: None,
+                paused: AtomicBool::new(false),
             }
         }
     }
@@ -281,6 +309,9 @@ mod tests {
         }
         async fn close(&self) {
             self.closed.fetch_add(1, Ordering::SeqCst);
+        }
+        fn paused(&self) -> bool {
+            self.paused.load(Ordering::SeqCst)
         }
     }
 
@@ -383,6 +414,116 @@ mod tests {
             .unwrap();
         assert_eq!(end, End::Stopped);
         assert_eq!(s.closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_paused_link_idles_without_start_or_tick_and_resumes_without_backoff() {
+        let (tx, rx) = watch::channel(false);
+        let s = Arc::new(Script::new(vec![], vec![]));
+        s.paused.store(true, Ordering::SeqCst);
+        let health = Arc::new(Health::default());
+        let task = tokio::spawn({
+            let (s, health) = (s.clone(), health.clone());
+            async move { supervise("l1", s, fast(), rx, health).await }
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(s.n_start.load(Ordering::SeqCst), 0, "no join while paused");
+        assert_eq!(s.n_tick.load(Ordering::SeqCst), 0, "no tick while paused");
+        s.paused.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(s.n_tick.load(Ordering::SeqCst) > 0, "resumed");
+        // Pause again: ticks stop within a poll or two (an in-flight one ends).
+        s.paused.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let frozen = s.n_tick.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            s.n_tick.load(Ordering::SeqCst),
+            frozen,
+            "no tick after the pause"
+        );
+        assert_eq!(
+            health.read(Duration::from_secs(60)).failures_since_ok,
+            0,
+            "a pause is not a failure"
+        );
+        // Stop still wins while paused.
+        let _ = tx.send(true);
+        let end = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("stop interrupts the idle")
+            .unwrap();
+        assert_eq!(end, End::Stopped);
+        assert_eq!(s.closed.load(Ordering::SeqCst), 1);
+    }
+
+    /// The whole path with nothing faked but the adapters: the supervisor, a
+    /// real pump over the loopback adapter, and the config-file kill switch
+    /// that `link pause` / `link resume` write.
+    #[tokio::test]
+    async fn link_pause_in_the_config_stops_a_running_link_and_resume_continues() {
+        use crate::config::Directions;
+        use crate::loopback::Loopback;
+        use crate::pause::ConfigFilePause;
+        use crate::pump::{LinkRuntime, Pump};
+        use crate::room::MemoryRoom;
+        use crate::store::MemoryStore;
+
+        let cfg_text = |enabled: bool| {
+            format!(
+                "[vta]\ndid = \"did:webvh:vta.example\"\n[[links]]\nid = \"l1\"\nvtc_room = \"r\"\n\
+                 host_did = \"did:webvh:h.example\"\npersona = \"did:key:p\"\ngeb_room_id = \"g\"\n\
+                 tier = \"open\"\ntier_optin = true\nenabled = {enabled}\n"
+            )
+        };
+        let dir = std::env::temp_dir().join(format!("geb-run-pause-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, cfg_text(true)).unwrap();
+
+        let room = Arc::new(MemoryRoom::new());
+        let lb = Arc::new(Loopback::new("bridge-id"));
+        let pump = Arc::new(
+            Pump::new(
+                LinkRuntime::new("l1", "did:key:p", b"s".to_vec(), Directions::Both),
+                room.clone(),
+                lb.clone(),
+                Arc::new(MemoryStore::new()),
+            )
+            .with_pause(Arc::new(ConfigFilePause::new(&path, "l1"))),
+        );
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn({
+            let pump = pump.clone();
+            async move { supervise("l1", pump, fast(), rx, Arc::new(Health::default())).await }
+        });
+        let ms = Duration::from_millis;
+        room.add("did:alice", None, "before", 1).unwrap();
+        tokio::time::sleep(ms(60)).await;
+        assert_eq!(lb.posted().len(), 1);
+
+        // `link pause`: the next tick (here, 2 ms) onward posts nothing.
+        std::fs::write(&path, cfg_text(false)).unwrap();
+        room.add("did:alice", None, "during the pause", 2).unwrap();
+        lb.inject("did:bob", "inbound during the pause", 3).unwrap();
+        tokio::time::sleep(ms(60)).await;
+        assert_eq!(lb.posted().len(), 1, "nothing posted while paused");
+        assert!(room.writes().is_empty(), "nothing written while paused");
+
+        // A config that cannot be read counts as paused, too.
+        std::fs::write(&path, "garbage {").unwrap();
+        tokio::time::sleep(ms(30)).await;
+        assert_eq!(lb.posted().len(), 1);
+
+        // `link resume`: carries on, once each.
+        std::fs::write(&path, cfg_text(true)).unwrap();
+        tokio::time::sleep(ms(80)).await;
+        assert_eq!(lb.posted().len(), 2, "the pending post, once");
+        assert_eq!(room.writes().len(), 1, "the pending inbound line, once");
+
+        let _ = tx.send(true);
+        assert_eq!(task.await.unwrap(), End::Stopped);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

@@ -370,8 +370,32 @@ pub fn link_list(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
-/// `link pause` / `link resume`. Resuming does not clear a halt.
-pub fn link_set_enabled(config_path: &Path, id: &str, enabled: bool) -> Result<()> {
+/// How soon a running `run` honours a pause or resume: it reads the config
+/// before every tick (so within `poll_secs`) and before every post and write.
+pub fn pause_notice(id: &str, poll_secs: u64, enabled: bool) -> String {
+    if enabled {
+        format!(
+            "{id}: resumed in the config. A running `run` picks this up within {poll_secs}s \
+             (its poll interval, the time between ticks) and carries on from the saved \
+             cursors and outbox, with no loss and no duplicates; if `run` is not running, start \
+             it. A halt is not cleared by resume (see `link clear-halt`)."
+        )
+    } else {
+        format!(
+            "{id}: paused in the config. A `run` of this version that is already running \
+             re-reads the config before every tick ({poll_secs}s apart) and before every post and \
+             every write into the VTC room, so it stops posting and writing at once and no later \
+             than the next tick, at most {poll_secs}s; it keeps its connections, and its cursors \
+             and outbox stay as they were (nothing is dropped or acknowledged). A tick already \
+             in flight finishes first. A `run` started by an older build does not read the \
+             flag: stop it (SIGTERM). If the config cannot be read the link counts as paused."
+        )
+    }
+}
+
+/// `link pause` / `link resume`. Resuming does not clear a halt. Returns the
+/// message to print: what a running process will do about it, and how soon.
+pub fn link_set_enabled(config_path: &Path, id: &str, enabled: bool) -> Result<String> {
     let mut cfg = Config::load(config_path)?;
     let l = cfg
         .links
@@ -379,7 +403,9 @@ pub fn link_set_enabled(config_path: &Path, id: &str, enabled: bool) -> Result<(
         .find(|l| l.id == id)
         .ok_or_else(|| Error::Config(format!("no link {id}")))?;
     l.enabled = enabled;
-    cfg.save(config_path)
+    let poll = l.poll_secs;
+    cfg.save(config_path)?;
+    Ok(pause_notice(id, poll, enabled))
 }
 
 /// `link remove`: drop the link and its secrets. The VTA key records are not

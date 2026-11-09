@@ -278,6 +278,7 @@ impl Env {
             host: vti_geb_bridge::vtc::host::HostDelivery::for_loopback_tests(&self.world.host.url),
             clock: Arc::new(move || n.load(Ordering::SeqCst) * 1000),
             commit_inputs: self.inputs.clone(),
+            pause: None,
         })?;
         Ok(Proc { parts, store })
     }

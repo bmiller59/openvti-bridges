@@ -272,7 +272,7 @@ second concurrent call fails with "dyad busy".
   feature): two-phase `setup`
   (`--setup-key-out`, then `--from`), `link add|list|pause|resume|remove`,
   `geb connect|stock-kps`, `status`, `run`. One fjall store per link under
-  `<data_dir>/links/<id>/`. `run` supervises each pump (`run`: stop observed at
+  `<data_dir>/links/<id>/`. `run` supervises each pump, paused links included (idle; kill switch: `pause.rs`, `ConfigFilePause` re-reads the config on every check, anything unreadable counts as PAUSED, the pump checks before every post and room write; DESIGN section 9) (`run`: stop observed at
   every wait, `close` on every exit, backoff reset only after a healthy session,
   `Refused` and `UndecidableCommit` halt for good and the halt is persisted, health derived from the
   time of the last good tick). Config load reads one file and contacts nothing.

@@ -17,6 +17,7 @@ use crate::mapping::{
     Notices, foreign_to_record, origin_id_for, prepare_outbound, record_to_event,
 };
 use crate::model::{BridgeEvent, EventKind, Origin};
+use crate::pause::{NeverPaused, PauseSource};
 use crate::room::{PutOutcome, RoomSide};
 use crate::store::BridgeStore;
 use crate::{Error, Result};
@@ -105,6 +106,10 @@ pub struct Pump {
     store: Arc<dyn BridgeStore>,
     /// Seating is awaiting approval ("ask" rooms): nothing is read or posted.
     pending: Mutex<bool>,
+    /// The kill switch (see [`crate::pause`]). Consulted at the start of a
+    /// tick, before every outbound post and before every write into the VTC
+    /// room; a step already begun finishes.
+    pause: Arc<dyn PauseSource>,
 }
 
 async fn version_cursor(store: &dyn BridgeStore) -> Result<u64> {
@@ -130,7 +135,20 @@ impl Pump {
             foreign,
             store,
             pending: Mutex::new(false),
+            pause: Arc::new(NeverPaused),
         }
+    }
+
+    /// Put the link behind a kill switch. A pump built without one never
+    /// pauses.
+    pub fn with_pause(mut self, pause: Arc<dyn PauseSource>) -> Self {
+        self.pause = pause;
+        self
+    }
+
+    /// Whether the kill switch is on (read fresh; unreadable counts as on).
+    pub fn is_paused(&self) -> bool {
+        self.pause.is_paused()
     }
 
     /// Whether seating is still pending approval.
@@ -192,6 +210,13 @@ impl Pump {
             return Err(why.stopped_error());
         }
         let mut report = TickReport::default();
+        // Paused: nothing is read, posted or written, no cursor moves, no
+        // frame is sent (the poll answers fork and seat-ask traffic), and
+        // nothing is acked. State is exactly as it was, so a resume carries on
+        // from it.
+        if self.is_paused() {
+            return Ok(report);
+        }
         if self.is_pending() && !self.join_and_announce().await? {
             return Ok(report);
         }
@@ -204,7 +229,7 @@ impl Pump {
         if self.link.directions != Directions::FromForeign {
             self.push_foreign(report).await?;
         }
-        if self.link.directions != Directions::ToForeign {
+        if self.link.directions != Directions::ToForeign && !self.is_paused() {
             self.pull_foreign(report).await?;
         }
         Ok(())
@@ -258,12 +283,18 @@ impl Pump {
         Ok(())
     }
 
+    /// Post one journalled event. `false` when the kill switch is on: nothing
+    /// is posted and nothing is marked, so the entry stays unposted in the
+    /// outbox and the next tick after a resume posts it exactly once.
     async fn post_one(
         &self,
         key: &str,
         ev: &crate::model::BridgeEvent,
         r: &mut TickReport,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if self.is_paused() {
+            return Ok(false);
+        }
         let posted = self.foreign.post(ev).await?;
         // Keep the foreign id of the line: a later retraction answers it.
         // Both cross-references are written before the outbox entry is marked
@@ -294,17 +325,24 @@ impl Pump {
                 .await?;
         }
         r.posted += 1;
-        Ok(())
+        Ok(true)
     }
 
     async fn push_foreign(&self, report: &mut TickReport) -> Result<()> {
         // Resume anything journalled but never posted.
         for (key, ev) in self.store.outbox_unposted().await? {
-            self.post_one(&key, &ev, report).await?;
+            if !self.post_one(&key, &ev, report).await? {
+                return Ok(());
+            }
         }
         let caps = self.foreign.capabilities();
         let since = version_cursor(self.store.as_ref()).await?;
         for rec in self.room.browse(since).await? {
+            // Before anything for this record is journalled or the cursor
+            // moves: a record not yet reached is browsed again after a resume.
+            if self.is_paused() {
+                return Ok(());
+            }
             let done = self
                 .store
                 .xref_has(&format!("vtc:{}", origin_id_for(&rec)))
@@ -358,7 +396,11 @@ impl Pump {
                     self.store
                         .set_cursor(BROWSE_CURSOR, &rec.version.to_be_bytes())
                         .await?;
-                    self.post_one(&key, &prepared, report).await?;
+                    // Paused between the journal and the post: the entry is
+                    // unposted in the outbox and goes out first after a resume.
+                    if !self.post_one(&key, &prepared, report).await? {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -369,6 +411,13 @@ impl Pump {
         let me = self.foreign.identity().id;
         let after = self.store.cursor(FOREIGN_CURSOR).await?.map(Cursor);
         for p in self.foreign.poll(after.as_ref()).await? {
+            // Paused mid-batch: nothing more is written into the VTC room and
+            // the cursor stays where it was, so the rest is offered again (the
+            // poll may return events at or before the cursor; the create-only
+            // write dedups).
+            if self.is_paused() {
+                return Ok(());
+            }
             let mut ev = p.event;
             ev.link = self.link.id.clone();
             let skip = ev.author == me || self.link.deny_list.contains(&ev.author);
@@ -403,6 +452,11 @@ impl Pump {
         }
         if let Some(why) = self.halted().await? {
             return Err(why.stopped_error());
+        }
+        // Paused: no join, no announcement. The supervisor starts again after
+        // a resume.
+        if self.is_paused() {
+            return Ok(JoinState::Pending);
         }
         Ok(if self.join_and_announce().await? {
             JoinState::Seated
@@ -861,5 +915,226 @@ mod tests {
             Err(Error::UndecidableCommit(_))
         ));
         assert_eq!(fr.1.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // ---- the kill switch (`crate::pause`) ----
+
+    use crate::pause::PauseSwitch;
+
+    /// A store that flips the kill switch the moment the browse cursor moves:
+    /// the pause lands between the outbox journal and the post.
+    struct PauseOnBrowseCursor {
+        inner: MemoryStore,
+        switch: Arc<PauseSwitch>,
+    }
+    #[async_trait::async_trait]
+    impl BridgeStore for PauseOnBrowseCursor {
+        async fn cursor(&self, n: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.cursor(n).await
+        }
+        async fn set_cursor(&self, n: &str, v: &[u8]) -> Result<()> {
+            self.inner.set_cursor(n, v).await?;
+            if n == BROWSE_CURSOR {
+                self.switch.set(true);
+            }
+            Ok(())
+        }
+        async fn journal_insert(&self, k: &str, e: &BridgeEvent) -> Result<bool> {
+            self.inner.journal_insert(k, e).await
+        }
+        async fn outbox_insert(&self, k: &str, e: &BridgeEvent) -> Result<bool> {
+            self.inner.outbox_insert(k, e).await
+        }
+        async fn outbox_mark(&self, k: &str, r: crate::foreign::Receipt) -> Result<()> {
+            self.inner.outbox_mark(k, r).await
+        }
+        async fn outbox_receipt(&self, k: &str) -> Result<Option<crate::foreign::Receipt>> {
+            self.inner.outbox_receipt(k).await
+        }
+        async fn outbox_unposted(&self) -> Result<Vec<(String, BridgeEvent)>> {
+            self.inner.outbox_unposted().await
+        }
+        async fn xref_set(&self, a: &str, b: &str) -> Result<()> {
+            self.inner.xref_set(a, b).await
+        }
+        async fn xref_has(&self, a: &str) -> Result<bool> {
+            self.inner.xref_has(a).await
+        }
+        async fn xref_get(&self, a: &str) -> Result<Option<String>> {
+            self.inner.xref_get(a).await
+        }
+    }
+
+    /// A foreign room that pauses the link right after its first post: the
+    /// pause lands in the middle of a tick that has more to send.
+    struct PauseAfterFirstPost {
+        inner: Arc<Loopback>,
+        switch: Arc<PauseSwitch>,
+    }
+    #[async_trait::async_trait]
+    impl ForeignRoom for PauseAfterFirstPost {
+        async fn join(&self) -> Result<JoinState> {
+            self.inner.join().await
+        }
+        async fn leave(&self) -> Result<()> {
+            self.inner.leave().await
+        }
+        async fn poll(&self, a: Option<&Cursor>) -> Result<Vec<crate::foreign::Polled>> {
+            self.inner.poll(a).await
+        }
+        async fn post(&self, e: &BridgeEvent) -> Result<crate::foreign::Posted> {
+            let r = self.inner.post(e).await;
+            self.switch.set(true);
+            r
+        }
+        fn identity(&self) -> crate::foreign::ForeignIdentity {
+            self.inner.identity()
+        }
+        fn capabilities(&self) -> crate::foreign::RoomCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    fn gated(
+        switch: &Arc<PauseSwitch>,
+    ) -> (Pump, Arc<MemoryRoom>, Arc<Loopback>, Arc<MemoryStore>) {
+        let (room, lb, store) = parts();
+        let pump =
+            Pump::new(link(), room.clone(), lb.clone(), store.clone()).with_pause(switch.clone());
+        (pump, room, lb, store)
+    }
+
+    #[tokio::test]
+    async fn a_pause_stops_outbound_posts_and_a_resume_posts_the_pending_one_once() {
+        let sw = Arc::new(PauseSwitch::new(false));
+        let (pump, room, lb, store) = gated(&sw);
+        pump.start().await.unwrap();
+        room.add("did:alice", None, "first", 1).unwrap();
+        assert_eq!(pump.tick().await.unwrap().posted, 1);
+        let browse_before = store.cursor(BROWSE_CURSOR).await.unwrap();
+
+        sw.set(true);
+        room.add("did:alice", None, "second", 2).unwrap();
+        let r = pump.tick().await.unwrap();
+        assert_eq!(r, TickReport::default(), "a paused tick does nothing");
+        assert_eq!(lb.posted().len(), 1, "the post after the pause is not made");
+        assert_eq!(
+            store.cursor(BROWSE_CURSOR).await.unwrap(),
+            browse_before,
+            "the cursor does not advance"
+        );
+        assert!(
+            store.outbox_unposted().await.unwrap().is_empty(),
+            "nothing journalled"
+        );
+
+        sw.set(false);
+        assert_eq!(
+            pump.tick().await.unwrap().posted,
+            1,
+            "the pending one goes out"
+        );
+        assert_eq!(lb.posted().len(), 2);
+        assert_eq!(pump.tick().await.unwrap().posted, 0, "exactly once");
+        assert_eq!(lb.posted().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_pause_in_the_middle_of_a_tick_keeps_the_rest_for_the_resume() {
+        let sw = Arc::new(PauseSwitch::new(false));
+        let (room, lb, store) = parts();
+        let foreign = Arc::new(PauseAfterFirstPost {
+            inner: lb.clone(),
+            switch: sw.clone(),
+        });
+        let pump = Pump::new(link(), room.clone(), foreign, store.clone()).with_pause(sw.clone());
+        pump.start().await.unwrap();
+        for (i, t) in ["alpha", "bravo", "charlie"].iter().enumerate() {
+            room.add("did:alice", None, t, i as u64 + 1).unwrap();
+        }
+        // The step in flight (the first post) finishes; nothing after it goes.
+        assert_eq!(pump.tick().await.unwrap().posted, 1);
+        assert_eq!(lb.posted().len(), 1);
+        sw.set(false);
+        // The switch flips again after the next post: one more per tick.
+        assert_eq!(pump.tick().await.unwrap().posted, 1);
+        sw.set(false);
+        assert_eq!(pump.tick().await.unwrap().posted, 1);
+        sw.set(false);
+        assert_eq!(pump.tick().await.unwrap().posted, 0);
+        let texts: Vec<_> = lb.posted().iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts.len(), 3, "no loss, no duplicate: {texts:?}");
+        for t in ["alpha", "bravo", "charlie"] {
+            assert_eq!(
+                texts.iter().filter(|x| x.contains(t)).count(),
+                1,
+                "{texts:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pause_between_the_journal_and_the_post_leaves_the_entry_for_the_resume() {
+        let sw = Arc::new(PauseSwitch::new(false));
+        let (room, lb) = (
+            Arc::new(MemoryRoom::new()),
+            Arc::new(Loopback::new("bridge-id")),
+        );
+        let store = Arc::new(PauseOnBrowseCursor {
+            inner: MemoryStore::new(),
+            switch: sw.clone(),
+        });
+        let pump =
+            Pump::new(link(), room.clone(), lb.clone(), store.clone()).with_pause(sw.clone());
+        pump.start().await.unwrap();
+        room.add("did:alice", None, "journalled first", 1).unwrap();
+        let r = pump.tick().await.unwrap();
+        assert_eq!(r.posted, 0, "paused before the post");
+        assert!(lb.posted().is_empty());
+        assert_eq!(
+            store.outbox_unposted().await.unwrap().len(),
+            1,
+            "the journalled entry waits in the outbox"
+        );
+        sw.set(false);
+        assert_eq!(pump.tick().await.unwrap().posted, 1);
+        assert_eq!(lb.posted().len(), 1);
+        assert_eq!(pump.tick().await.unwrap().posted, 0, "exactly once");
+        assert_eq!(lb.posted().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pause_writes_nothing_into_the_room_and_keeps_the_foreign_cursor() {
+        let sw = Arc::new(PauseSwitch::new(false));
+        let (pump, room, lb, store) = gated(&sw);
+        pump.start().await.unwrap();
+        lb.inject("did:bob", "one", 1).unwrap();
+        assert_eq!(pump.tick().await.unwrap().written, 1);
+        let cursor = store.cursor(FOREIGN_CURSOR).await.unwrap();
+
+        sw.set(true);
+        lb.inject("did:bob", "two", 2).unwrap();
+        let r = pump.tick().await.unwrap();
+        assert_eq!(r, TickReport::default());
+        assert_eq!(room.writes().len(), 1, "nothing written into the room");
+        assert_eq!(store.cursor(FOREIGN_CURSOR).await.unwrap(), cursor);
+
+        sw.set(false);
+        assert_eq!(pump.tick().await.unwrap().written, 1);
+        assert_eq!(room.writes().len(), 2);
+        assert_eq!(pump.tick().await.unwrap().written, 0, "no duplicate");
+        assert_eq!(room.writes().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn start_while_paused_joins_nothing_and_a_later_start_does() {
+        let sw = Arc::new(PauseSwitch::new(true));
+        let (pump, room, lb, _store) = gated(&sw);
+        assert_eq!(pump.start().await.unwrap(), JoinState::Pending);
+        room.add("did:alice", None, "x", 1).unwrap();
+        assert!(lb.posted().is_empty());
+        sw.set(false);
+        assert_eq!(pump.start().await.unwrap(), JoinState::Seated);
+        assert_eq!(pump.tick().await.unwrap().posted, 1);
     }
 }

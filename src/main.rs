@@ -38,7 +38,7 @@ enum Command {
         #[arg(long)]
         link: Option<String>,
     },
-    /// Run every enabled link until SIGINT or SIGTERM.
+    /// Run every link until SIGINT or SIGTERM (a paused link idles).
     Run,
 }
 
@@ -88,9 +88,11 @@ enum LinkCmd {
     },
     /// List links.
     List,
-    /// Stop a link running (set enabled = false).
+    /// Pause a link (enabled = false): a running `run` stops posting and
+    /// writing within one poll interval, keeping its cursors and outbox.
     Pause { id: String },
-    /// Let a link run. Does not clear a halt.
+    /// Let a paused link run again; a running `run` notices within one poll
+    /// interval. Does not clear a halt.
     Resume { id: String },
     /// Remove a link and its keys (does not revoke the VTA key records).
     Remove { id: String },
@@ -175,8 +177,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 }
                 Ok(())
             }
-            LinkCmd::Pause { id } => cli::link_set_enabled(&config, &id, false),
-            LinkCmd::Resume { id } => cli::link_set_enabled(&config, &id, true),
+            LinkCmd::Pause { id } => {
+                println!("{}", cli::link_set_enabled(&config, &id, false)?);
+                Ok(())
+            }
+            LinkCmd::Resume { id } => {
+                println!("{}", cli::link_set_enabled(&config, &id, true)?);
+                Ok(())
+            }
             LinkCmd::Remove { id } => cli::link_remove(&config, &id).await,
             LinkCmd::ClearHalt {
                 id,

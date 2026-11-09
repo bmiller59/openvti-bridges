@@ -50,7 +50,7 @@ layer.
 ## 2. Architecture
 
 The bridge is a separate process (`vti-geb-bridge run`). One link joins one VTC room to one Geb
-room; the process supervises every enabled link.
+room; the process supervises every link (a paused one idles).
 
 ```
                  +-------------------- vti-geb-bridge (one process) --------------------+
@@ -483,8 +483,8 @@ The analysis is reasoning, not testing. The residual risk is bounded, not elimin
 - Fail closed on unknown authority-bearing kinds (unknown envelope or frame kind: error, dropped
   unacked). Unknown group ops without authority are acked and ignored.
 - Size limits both sides (section 5, section 4.3).
-- Kill switch: see section 9. `link pause` stops a link at the next `run`; stopping the process
-  stops everything; removing the bridge's ACL entry at the VTA revokes room access.
+- Kill switch: see section 9. `link pause` stops a RUNNING link within one poll interval (the
+  running process re-reads the flag, `pause.rs`); stopping the process stops everything; removing the bridge's ACL entry at the VTA revokes room access.
 - Bridged content is never presented as verified.
 
 ## 8. Failure handling
@@ -508,9 +508,44 @@ not an error: the link idles and re-checks each tick.
 Not covered by a halt: too many held commits (`Error::Unsupported` from `hold_commit`), and a build
 without `geb-mls` (`UnsupportedGroup` refuses each tick), which fail per tick with backoff.
 
-**What `status` shows.** The pinned Geb reading, then per link: enabled or paused, the browse
+**What `status` shows.** The pinned Geb reading, then per link: `enabled` or `PAUSED`, the browse
 version, the foreign cursor (seconds), the outbox depth (journalled, not yet posted), the time of
 the last relayed post, and `ok` or `HALTED (<reason>)`.
+
+**Kill switch (`link pause` / `link resume`, `pause.rs`).** `link pause` sets `enabled = false` in
+the config file (an atomic replace). The store is locked by the running process, so the config is
+the one channel a second process can write; `run` re-reads it: `ConfigFilePause` reads and
+validates the file and looks at the link's `enabled` on every check, with no cache and no mtime
+test (a same-size edit within a clock tick would be missed). **Fail-safe:** anything but a clean
+read of `enabled = true` (file missing, unparsable, invalid, link no longer named) is PAUSED, and
+the log says why. A broken config therefore pauses a running bridge.
+
+- *Latency.* The pump checks before every outbound post and before every write into the VTC room,
+  and the supervisor before every session start and tick. A pause therefore stops posting at the
+  next step, which is within one tick; an idle link notices within its `poll_secs`. The message
+  `link pause` prints states this with the link's own interval.
+- *A paused link* posts nothing to Geb and writes nothing into the room; the tick does not poll
+  (so it answers no fork, `rs` or `seat-ask` traffic, sends no frame, and acks nothing); no cursor
+  moves; the outbox, journal and xref stay as they were. The process and its connections stay
+  alive. It is not a failure: no backoff, no health alert beyond the last good tick ageing.
+- *In-flight work.* A step that has begun finishes (one post with its xref and outbox mark; one
+  room write): the pump is crash-safe, and a half-posted line is wasted work. A pause between the
+  outbox journal and the post leaves the entry unposted in the outbox; the first tick after a
+  resume posts it, exactly once. A pause in the middle of an inbound batch leaves the cursor at
+  the last handled event; the rest is offered again (the poll may return events at or before the
+  cursor and the create-only write dedups).
+- *Resume* continues from the preserved cursors with no loss and no duplicate. The supervisor
+  starts the session again (the join is idempotent) and ticks.
+- *Caveat of a long pause.* Nothing is read from Geb meanwhile. Geb keeps an unacked frame for at
+  most 15 minutes, 256 frames or 2 MB (round 4 Q7), and a room can commit meanwhile, so after a
+  long pause the bridge may find itself behind the room's epoch; the existing catch-up (`rc`,
+  re-seat) deals with that after the resume, and a bridge that was removed meanwhile halts as
+  usual. Pausing is the kill switch, not a way to hold a place in the room.
+- `run` supervises paused links too (idle), so a `link resume` needs no restart. A paused link
+  whose parts cannot be built (no keys) is skipped with a warning; restart `run` after fixing it.
+  A `run` started by a build without this mechanism does not read the flag; stop it.
+- Tests: `pump::tests::a_pause_*`, `run::tests::link_pause_in_the_config_*` (the supervisor, a
+  real pump and the config switch over the loopback adapter), `pause::tests`.
 
 **Clearing a halt.** `link clear-halt <link>` prints what the halt was, then clears it only with
 `--yes`. A `Refused` halt also needs `--i-have-been-readmitted`, a statement by the operator that
@@ -546,13 +581,13 @@ stderr via `tracing_subscriber`. Security alerts carry `security_alert = true`.
 | `setup --from <setup.toml>` | Phase 2: mint and export device keys for each `[[links]]`, store them, write the config. Refuses to overwrite a config or a non-empty secret store | The VTA |
 | `link add --setup-key-file ... --id ... --vtc-room ... --host-did ... --host-url ... --persona ... --geb-room-id ... [--directions] [--tier] [--tier-optin] [--poll-secs] [--display-name]` | Mint this link's keys with a fresh granted setup key, then record the link. Starts paused | The VTA |
 | `link list` | One line per link | Nothing |
-| `link pause <id>` / `link resume <id>` | Set `enabled` in the config. `resume` does not clear a halt. Only read at the start of `run` | Nothing |
+| `link pause <id>` / `link resume <id>` | Set `enabled` in the config and print what a running process will do and how soon. `resume` does not clear a halt. A running `run` re-reads the flag (below) | Nothing |
 | `link remove <id>` | Drop the link and its secrets. Does not revoke the VTA key records and leaves the link's data directory | Secret store |
 | `link clear-halt <id> [--yes] [--i-have-been-readmitted]` | See section 8 | Local store |
 | `geb connect --link <id> <did>` | Open a dyad with a Geb member's device DID (waits up to 60 s) and add it to `geb_peers` | The relay |
 | `geb stock-kps --link <id>` | Stock KeyPackages with the link's peers; counts as consent to be added | The relay |
 | `status [--link <id>]` | Local state, see section 8 | Nothing |
-| `run` | Supervise every enabled link until SIGINT or SIGTERM | VTA, host, relay |
+| `run` | Supervise every link until SIGINT or SIGTERM; a paused link idles | VTA, host, relay |
 
 Typical order: `setup --setup-key-out`, apply the grant at the VTA, write a setup file,
 `setup --from`, apply the printed client grant, `link resume`, `geb connect`, `geb stock-kps`, then

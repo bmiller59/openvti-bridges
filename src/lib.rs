@@ -39,6 +39,7 @@ pub mod mapping;
 pub mod model;
 #[cfg(all(feature = "vtc", feature = "geb-mls"))]
 pub mod ops;
+pub mod pause;
 pub mod pump;
 pub mod room;
 #[cfg(feature = "vtc")]

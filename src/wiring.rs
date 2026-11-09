@@ -20,6 +20,7 @@ use crate::geb::mls::{MlsConfig, MlsGroupClient};
 use crate::geb::policy::{CommitCheckInputs, NoLocalKnowledge};
 use crate::geb::room::{Clock, GebRoom};
 use crate::geb::traits::{GebRelay, GebSigner};
+use crate::pause::PauseSource;
 use crate::pump::{LinkRuntime, Pump};
 use crate::store::BridgeStore;
 use crate::vtc::host::HostDelivery;
@@ -72,6 +73,9 @@ pub struct LinkInputs {
     /// card-dependent Remove (see `geb::policy::valid_commit`) and halts on
     /// that one. Tests inject a fake to reach the other paths.
     pub commit_inputs: Option<Arc<dyn CommitCheckInputs>>,
+    /// The kill switch the pump obeys (`link pause`, see [`crate::pause`]).
+    /// `None` is a link that never pauses (tests with no config file).
+    pub pause: Option<Arc<dyn PauseSource>>,
 }
 
 /// A link, assembled.
@@ -159,7 +163,11 @@ pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
     rt.announce = i.link.announce;
     rt.notices = i.link.notices.clone();
     let device_did = i.secrets.device_did.clone();
-    let pump = Arc::new(Pump::new(rt, room, geb_room.clone(), store.clone()));
+    let mut pump = Pump::new(rt, room, geb_room.clone(), store.clone());
+    if let Some(p) = i.pause {
+        pump = pump.with_pause(p);
+    }
+    let pump = Arc::new(pump);
     Ok(LinkParts {
         pump,
         dyad,
