@@ -84,11 +84,13 @@ Build with `--features cli`. Every command takes `--config <path>` (default `con
 |---|---|
 | `setup --setup-key-out <path>` then `setup --from <setup.toml>` | Two-phase provisioning against the operator's VTA: mint the Geb device keys, store them, write the config |
 | `link add\|list\|pause\|resume\|remove` | Manage links. `add` mints keys and starts paused. `pause` stops a running `run` within one poll interval (see DESIGN section 9), `resume` lets it continue |
-| `link clear-halt <id> [--yes] [--i-have-been-readmitted]` | Clear a persisted halt after reading why it happened |
-| `geb connect --link <id> <did>` | Open a dyad with a Geb member's device DID |
-| `geb stock-kps --link <id>` | Stock KeyPackages with the link's peers (consent to be added) |
+| `link clear-halt <id> [--yes] [--i-have-been-readmitted]` | Clear a persisted halt after reading why it happened. A VTA or room-host refusal (`VtcRefused`) needs the ACL grant or room membership fixed first, then `--yes` only |
+| `geb connect --link <id> <did>` | Open a dyad with a Geb member's device DID (refused while the link is paused or halted) |
+| `geb stock-kps --link <id>` | Stock KeyPackages with the link's peers (consent to be added; refused while the link is paused or halted) |
 | `status [--link <id>]` | Cursors, outbox depth, last relayed post, halt state (stop `run` first) |
 | `run` | Supervise every link until SIGINT or SIGTERM (a paused link idles) |
+
+`directions` is required in every link (no default). The config file is written `0600` and edits are serialised by a `<config>.lock` file beside it. `retention_days` (default 7, at least 1) bounds how long posted, journalled and cross-reference records are kept; bridged text in the journal and outbox is sealed at rest (see `docs/DESIGN.md`, sections 6 and 8). A catch-up read of more than 20 pages of 5,000 events fails with an error rather than return a partial result. None of this is verified against live Geb, a real VTA, host or relay.
 
 A link needs the room owner's explicit opt-in (`tier_optin = true`), and `private` rooms are
 refused. Logs go to stderr; set `RUST_LOG` (default `info`). Config shape: `docs/DESIGN.md`,

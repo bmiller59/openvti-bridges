@@ -604,24 +604,15 @@ alignment change.
 
 ### Review backlog (2026-11-09 reviews; P0 fixed, these are not)
 
-From `the 2026-11-09 review notes`. One line each.
+From `the 2026-11-09 review notes`. One line each. Fixed and removed: the `rs` flood, the two-phase `recv`, REQ close and the 5,000 truncation, `connect`/`stock-kps` obeying pause and halt, the `link pause` race and config durability, required `directions`, `VtcRefused`, forged attribution, and state growth (P1-4).
 
-- `rs` flood: a member varying `a`/`e` defeats the once-a-minute guard and draws up to 64 `rc` frames per 5 s (`geb/mls/client/heal.rs` `on_rs`, `COMMIT_KEEP`). Rate-limit per peer.
 - A false fork status from any member overwrites `heal.p.split`; `same_auth` compares a 1-hex-char prefix (`geb/mls/client/heal.rs`, `geb/status.rs` `clean_hex`). Require 16 hex, ignore epochs we hold no chain entry for.
 - `judged` is unbounded between merges (`geb/mls/client.rs`); state is not persisted after `open`, so a crash loses lines opened earlier in the poll (pump atomicity).
-- `StatefulDyad::recv` clears opened frames durably before the consumer has acted, so a crash loses an acked Welcome/`rc`/leave (`geb/dyad.rs` `recv`; needs a two-phase hand-off).
-- Nostr client leaves REQ subscriptions open after a timeout and truncates silently at 5,000 events (`geb/nostr.rs` `expire`, `MAX_FETCH_EVENTS`).
 - `newest` is not clamped to the local clock, so a future-dated event stalls the read window (`geb/dyad.rs` `newest`, `inbox_newest`).
 - `did_peer::document` panics on a multi-byte purpose character (`geb/crypto/did_peer.rs:146`, latent).
 - Line `sg` is verified over a lossy re-serialisation, so a newer Geb field makes lines show Unverified (`geb/room.rs`, `geb/wire/mod.rs` `signing_doc`).
 - Secret hygiene: chain keys as plain `String`/`Vec<u8>`, no `Zeroizing` on `state_get` or `ecdh`/`hkdf32` outputs (`geb/crypto/ratchet.rs`, `atrest.rs`).
 - A frame that opens but fails `parse_frame` is dropped unacked, so the sender reposts for ever (`geb/dyad.rs`; Geb acks before reading the op); the jump limit is 65,536 with no cooldown (more lenient than Geb); at-rest records have no rollback counter in the AAD.
-- `geb connect` and `geb stock-kps` ignore the pause flag and a persisted halt (`service.rs` `offline_parts`, `ops.rs`, `main.rs`).
-- Unbounded state growth: journal, outbox and xref are never pruned and `outbox_unposted` scans all history each tick (`fjall_store.rs`, `pump.rs`, `ops.rs`).
-- `link pause` can be reverted by a concurrent `link add` (read-modify-write over a network call); `Config::save` does not fsync or create 0600 (`cli.rs` `link_add`, `config.rs`).
-- `directions` defaults to `both` (absence is the most permissive reading) (`config.rs`, `main.rs`).
-- A VTC-side refusal halts as "the foreign room refused" with the wrong remediation; add `HaltReason::VtcRefused` (`vtc/host.rs`, `pump.rs`, `halt.rs`).
-- Forged attribution: only the first line of a bridged body is the real header; quote every body line and strip bidi format characters (`mapping.rs` `prepare_outbound`, `strip_controls`, `sanitize_label`).
 - CI: the `harness` job is manual-only and cannot resolve `room-host` until the placeholder URL is replaced; Cargo.lock is not committed; patched VTI crate versions/features are unchecked against crates.io (`.github/workflows/ci.yml`, `harness/Cargo.toml`).
 
 ### UNVERIFIED points that still stand
@@ -647,6 +638,32 @@ usual wrapper; and, from round 3:
 - **Event and line limits:** 120,000 / 20,000 come from the answers; the live
   relay's per-event cap is UNCONFIRMED (131,072 in the repo copy, raised to
   256 KB on 2026-11-02 per Geb's record).
+
+Bridge-side choices of the P1 pass, none stated by Geb and none checked against a live Geb, a real VTA, host or relay:
+
+- **Bridged-line format:** the one header line is unquoted and every line of the body is quoted
+  (`mapping.rs` `prepare_outbound`, `quote_lines`); Geb's rendering of that is not known.
+- **ZWJ stripping:** every format character is removed in both directions, including U+200D, which
+  splits joined emoji (family, profession) into their parts.
+- **`rc` and re-read limits** (`geb/mls/client/heal.rs`): `RC_BURST_MIN_INTERVAL_MS` (60 s),
+  `RC_GLOBAL_MAX_FRAMES` (2 x `COMMIT_KEEP`), `RC_GLOBAL_WINDOW_MS` (60 s), `REREAD_PEER_MIN_MS`
+  (300 s) are ours, per peer and not by the status a peer claims.
+- **Fetch bounds:** `MAX_FETCH_EVENTS` (5,000) and `MAX_FETCH_PAGES` (20) are ours; past them a read
+  is an error and the cursor stays.
+- **`last_welcome` redelivery guard** (`heal.rs`): a Welcome whose frame id equals the last one
+  applied, while seated or re-seating, is skipped; Geb does not say this.
+- **Two-phase hand-off** (`geb/dyad.rs`): `recv` hands frames over, the consumer persists, then the
+  frames are cleared; a crash in between redelivers (one dyad-level test, with a stand-in frame).
+  Redelivery of an `rc` or a leave frame relies on the existing dedup downstream and is not
+  separately tested.
+- **Config file:** mode `0600` and an advisory lock on `<config>.lock` (mode `0600`, left beside the
+  config). Its semantics on non-local filesystems (NFS and the like) are unverified.
+- **Retention and pruning (P1-4):** `retention_days` default 7 (chosen to match Geb's relay
+  retention), the rule that only a confirmed or retired outbox row, journal rows and the `foreign:` /
+  `failed:` xref keys are pruned and `vtc:` / `vtkey:` never are, hourly pruning, and that a pruned
+  never-posted dead-lettered record is attempted again if replayed. Journal and outbox text, title
+  and author are sealed under the `state` at-rest key; everything else in those rows stays in clear
+  (`atrest.rs`, DESIGN section 6).
 
 ## Round 4 answers (2026-11-09, read at `fdf804d`): summary notes
 

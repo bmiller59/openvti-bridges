@@ -116,7 +116,7 @@ VTC side, operations (feature-gated):
 | Module | Feature | Role |
 |---|---|---|
 | `vtc/mod.rs`, `vtc/host.rs` | `vtc` | `VtcRoom` (`RoomSide` over `VtaClient`), HTTPS delivery, typed error reading |
-| `fjall_store.rs` | `vtc` | `FjallStore`, the durable `BridgeStore`; keyspaces `links cursors journal_in outbox_out xref geb_mls ratchets`; journal fsync after each write |
+| `fjall_store.rs` | `vtc` | `FjallStore`, the durable `BridgeStore`; keyspaces `links cursors journal_in outbox_out xref geb_mls ratchets outbox_pending retention`; journal fsync after each write; the pending index and the day-bucketed retention schedule (section 8, Retention) |
 | `custody.rs` | `vtc` | Device key minting and export, `BridgeSecrets` in a `vti-secrets` store |
 | `run.rs` | `vtc` | `supervise`: shutdown, backoff, halted-stays-halted, derived health |
 | `wiring.rs` | `vtc` + `geb-mls` | `assemble`: builds one link from its parts (used by the binary and by `tests/e2e.rs`) |
@@ -442,9 +442,18 @@ nonce and the record's own name as associated data, so a blob moved to another r
 open. `EncryptedState` wraps a `BridgeStore` for dyad and ratchet state. `SealedFile` holds the MLS
 signature key and the OpenMLS key-store snapshot (`mls-state.enc`, `mls-sigkey.enc` under
 `<data_dir>/links/<id>/`). The state is saved before a KeyPackage leaves, after joining, before a
-sealed line is returned and after a merged commit. Not encrypted: cursors, journal, outbox and
-xref (bridged text, not secrets). A process holding the store key in memory can read everything:
-this protects disks, not a live compromise. (Some older source comments, such as the schema note
+sealed line is returned and after a merged commit. `EncryptedState` also seals the **text, title and
+author of every journal and outbox event** (purpose `state`, AAD `journal|outbox/<link>/<key>`), so
+bridged message text is not on disk in clear. **In clear, exactly:** the events' `origin`,
+`origin_id`, `link`, `at`, `kind`, `reply_to`, `record_key` and `provenance` (ids, a timestamp, the
+foreign room and device ids, the message hash; no message text); the outbox receipt rank and retired
+flag; the xref (`vtc:`, `vtkey:`, `foreign:` and `failed:` keys, holding ids, foreign line ids and
+failure reasons that may quote an error message); the cursors; the retention index; and fjall's own
+file metadata. Rows written by an earlier version are plaintext and are read as they are until
+pruned. Sealing gives confidentiality, not protection against whole-row replacement or rollback.
+`status` counts pending entries from the outbox index without opening any body, so it needs no key.
+A process holding the store key in memory can read everything: this protects disks, not a live
+compromise. (Some older source comments, such as the schema note
 at the top of `geb/dyad.rs`, still say the fjall store does not encrypt; the assembled link wraps
 it.)
 
@@ -504,7 +513,8 @@ with `End::Halted` and never retries.
 
 | Halt | Cause | Meaning |
 |---|---|---|
-| `Refused` | Seating refused, our leaf removed by a merged commit, a `permissionDenied` / `actionNotHeld` / `notAMember` or VTA `Forbidden` on the room side, or a Welcome into a direct room | Permanent until the bridge is admitted again |
+| `Refused` | Seating refused, our leaf removed by a merged commit, a `permissionDenied` / `actionNotHeld` / `notAMember` from the Geb room, or a Welcome into a direct room | Permanent until the bridge is admitted again |
+| `VtcRefused` | The VTA or the room host refused the bridge's own write or read (an ACL or room-membership refusal, not Geb's doing) | Permanent until the grant is fixed. Fix the bridge's ACL grant or room membership at the VTA (the grant `link add` printed), then `link clear-halt <id> --yes` (no `--i-have-been-readmitted`: Geb did not remove the bridge) |
 | `UndecidableCommit` | A Remove of another DID by a non-root, non-admin sender in a v2 room, with no signed leave we hold and not a re-seat; or a direct-room Add of a DID that is not exactly one of the pair. The record names the commit's epoch and hash and says the bridge holds no persona store | A Geb device holding a persona card linking the DIDs would merge it and we cannot know, so neither merging nor skipping is safe. **A deliberate bridge-side choice, the honest alternative to a silent fork: Geb itself refuses such a commit and continues.** A card-free refusal in the same commit wins over the undecidable part |
 
 Commits that are decided without a persona store (ordinary adds, removes by exact-DID root or admin
@@ -521,7 +531,7 @@ epoch hold the read cursor. A commit with content the check is not described for
 skipped, not a halt (UNVERIFIED against Geb).
 
 **What `status` shows.** The pinned Geb reading, then per link: `enabled` or `PAUSED`, the browse
-version, the foreign cursor (seconds), the outbox depth (journalled, not yet posted), the time of
+version, the foreign cursor (seconds), the outbox depth (journalled, not yet posted or retired), the time of
 the last relayed post, and `ok` or `HALTED (<reason>)`. When the Geb room has split, a second line
 shows the **fork marker** (`geb/forkmark.rs`): state (`waiting-for-reseat` when our branch lost,
 `branch-won`, or `reseated` once a re-seat Welcome was accepted), the fork epoch, our and their
@@ -542,6 +552,9 @@ the log says why. A broken config therefore pauses a running bridge.
   and the supervisor before every session start and tick. A pause therefore stops posting at the
   next step, which is within one tick; an idle link notices within its `poll_secs`. The message
   `link pause` prints states this with the link's own interval.
+- *`geb connect` and `geb stock-kps` obey the same switch*: a paused link (or a config that cannot be
+  read, which counts as paused) or a persisted halt makes them refuse before any keys are loaded or
+  anything is sent, naming the cause.
 - *A paused link* posts nothing to Geb and writes nothing into the room; the tick does not poll
   (so it answers no fork, `rs` or `seat-ask` traffic, sends no frame, and acks nothing); no cursor
   moves; the outbox, journal and xref stay as they were. The process and its connections stay
@@ -566,8 +579,8 @@ the log says why. A broken config therefore pauses a running bridge.
   real pump and the config switch over the loopback adapter), `pause::tests`.
 
 **Clearing a halt.** `link clear-halt <link>` prints what the halt was, then clears it only with
-`--yes`. A `Refused` halt also needs `--i-have-been-readmitted`, a statement by the operator that
-the room's members have admitted the bridge again. Clearing does not start the link; `run` does.
+`--yes`. A `Refused` (Geb-side) halt also needs `--i-have-been-readmitted`, a statement by the operator that
+the room's members have admitted the bridge again. A `VtcRefused` halt needs `--yes` only; the message tells the operator to fix the ACL grant or room membership at the VTA first. Clearing does not start the link; `run` does.
 Clearing an `UndecidableCommit` makes the link read the commit again, so it halts again at once
 unless something changed. Both commands open the link's store, so `run` must be stopped first
 (they fail with "the store at ... is in use by another process").
@@ -591,10 +604,29 @@ unless something changed. Both commands open the link's store, so `run` must be 
 - A restart loses the settle queue (re-read from the relay; the cursor barrier holds the position)
   and the dedup window (the journal covers it).
 - After a real fork the bridge asks and waits: a Geb member must commit the re-seat (healer duty is not built). A re-seat Welcome is accepted; if it never comes the bridge asks again with a fresh bound package every 600 s.
+- **Retention and pruning (P1-4).** Nothing the bridge keeps grows without bound. A tick reads only
+  the `outbox_pending` index (entries not yet posted or retired), written before the outbox row and
+  removed after it is marked, so a crash leaves at worst a stale index entry that the next read
+  removes; a store from before the index is indexed once on first use (guarded by a cursor flag).
+  Per link, `retention_days` (default 7, at least 1; it matches Geb's seven-day relay retention) sets
+  how long the following are kept before `prune` deletes them, run by the pump at most hourly and
+  scheduled in day buckets so only days since a persisted floor are scanned: journal rows; outbox
+  rows whose remote effect is confirmed (any receipt) or that were retired (dead-lettered); and the
+  `foreign:` and `failed:` xref keys. **Never pruned:** an unposted outbox row (re-checked at delete
+  time, whatever the schedule says), the `vtc:` and `vtkey:` xref keys (no plaintext; they stop a
+  lost browse cursor re-bridging and resolve edits and retractions), the cursors, counters and halt
+  record. A store that predates the schedule ages its old rows out one retention period after the
+  upgrade. A dead-lettered entry is retired when its `failed:` record is written; once both are
+  pruned, a replayed record that was never posted would be attempted (and refused) again.
+- **Fetch paging.** A catch-up read stopping at `MAX_FETCH_EVENTS` (5,000) is continued with `until`
+  and merged by id, up to `MAX_FETCH_PAGES` (20) reads; beyond that, or when `until` cannot move,
+  the read is an error ("more than 20 pages ... not returning a partial result") and the caller's
+  cursor is unchanged. A truncated result is never returned as complete, and every `REQ` is closed on
+  every exit.
 - An oversize outbox entry cannot come out of the mapping layer (it cuts at the room's unit limit),
   but one journalled under another limit could exist. It is a permanent failure: journalled
   (xref `failed:<outbox key>` with the reason), counted (`status` shows `oversize_failed`), logged
-  once, never retried and no longer counted in `outbox_depth`; the entries behind it still go out.
+  once, never retried, retired (so no longer pending or counted in `outbox_depth`) and pruned after retention; the entries behind it still go out.
 
 **Supervision.** `run::supervise` observes the stop signal at every wait, lets a tick in flight
 finish, closes on every exit path, doubles the backoff to a cap with jitter and resets it only after
@@ -650,20 +682,26 @@ host_url = "https://host.example" # required to run; https only (http only for 1
 persona = "did:key:z6Mk..."
 geb_room_id = "geb-1"
 geb_peers = []                    # added by `geb connect`
-directions = "both"               # required, no default: both | to_foreign | from_foreign
+directions = "both"               # required, no default (absence is refused): both | to_foreign | from_foreign
 tier = "open"                     # open | attributed; private is refused
 tier_optin = true                 # required
 poll_secs = 10
 enabled = false                   # off by default
 display_name = "Ada"              # optional, 1 to 40 characters; bridges are unmarked by default
 announce = false                  # one join announcement line, off by default
+retention_days = 7                # days before posted/journal/expiring-xref rows are pruned; >= 1
 [links.notices]
 update  = "[update to earlier post {target}]"
 retract = "[retracted: earlier post {target}]"
 ```
 
 Per-link state lives under `<data_dir>/links/<link id>/`: `store/` (fjall), `mls-state.enc`,
-`mls-sigkey.enc`. The config load reads one file and contacts nothing. Note: there is no
+`mls-sigkey.enc`. The config load reads one file and contacts nothing. The config file is written
+mode `0600`, replaced atomically and fsynced (file and directory); every read-modify-write
+(`link add`, `link pause`, ...) holds an exclusive lock on `<config>.lock` (also `0600`, kept beside
+the config) around the read and the write, never across a network call. The lock is an OS advisory
+lock: it serialises commands on one host; on a filesystem that does not honour it (some network
+filesystems) it does not, and that is UNVERIFIED. Note: there is no
 `[geb] settle_ms`; a config that names it is rejected (the error says so). The settle window comes
 from the room's own `0xF001` policy (`geb/mls/client.rs`).
 
@@ -837,4 +875,4 @@ All of these need a person or Geb. None has been done.
   leaves a room. The bridge receives them and never sends one.
 - **Echo suppression**: not re-bridging what the bridge itself wrote.
 - **Xref**: the store's cross-reference between origin ids and foreign line ids.
-- **Halt**: a persisted stop of a link (`Refused` or `UndecidableCommit`).
+- **Halt**: a persisted stop of a link (`Refused`, `VtcRefused` or `UndecidableCommit`).
