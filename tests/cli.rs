@@ -32,6 +32,7 @@ host_url = "https://host.example"
 persona = "did:key:z6Mkp1"
 geb_room_id = "geb-room-0001"
 tier = "open"
+directions = "both"
 tier_optin = true
 
 [[links]]
@@ -42,6 +43,7 @@ host_url = "https://host.example"
 persona = "did:key:z6Mkp2"
 geb_room_id = "geb-room-0002"
 tier = "attributed"
+directions = "to_foreign"
 tier_optin = true
 "#;
 
@@ -379,4 +381,62 @@ async fn geb_connect_and_stock_kps_refuse_a_paused_or_halted_link() {
             "{args:?}: {err}"
         );
     }
+}
+
+/// P1-2: `directions` has no default on `link add` or in the config file.
+#[test]
+fn directions_is_required_on_link_add_and_in_the_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let out = bin()
+        .args([
+            "-c",
+            path.to_str().unwrap(),
+            "link",
+            "add",
+            "--setup-key-file",
+            "/nonexistent",
+            "--id",
+            "l9",
+            "--vtc-room",
+            "r",
+            "--host-did",
+            "did:webvh:h.example",
+            "--host-url",
+            "https://h.example",
+            "--persona",
+            "did:key:z6Mkp9",
+            "--geb-room-id",
+            "g",
+            "--tier-optin",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--directions"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A hand-written config without it is refused, naming the key and values.
+    let cfg = SetupInputs::from_toml_str(SETUP).unwrap().config().unwrap();
+    cfg.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        text.lines()
+            .filter(|l| !l.starts_with("directions"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let out = bin()
+        .args(["-c", path.to_str().unwrap(), "link", "list"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("directions") && err.contains("to_foreign"),
+        "{err}"
+    );
 }

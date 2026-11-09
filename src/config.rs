@@ -6,7 +6,11 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 /// Which way content may flow on a link.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// There is no default: a link that omits `directions` is refused at config
+/// load, because absence must mean the most restrictive reading and the
+/// operator has to choose which way content may flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Directions {
     /// VTC room to foreign room only.
@@ -14,7 +18,6 @@ pub enum Directions {
     /// Foreign room to VTC room only.
     FromForeign,
     /// Both ways.
-    #[default]
     Both,
 }
 
@@ -52,8 +55,7 @@ pub struct LinkConfig {
     /// through. Added by `geb connect`.
     #[serde(default)]
     pub geb_peers: Vec<String>,
-    /// Allowed flow.
-    #[serde(default)]
+    /// Allowed flow. Required: no default (absence is not "both").
     pub directions: Directions,
     /// The room's tier.
     pub tier: Tier,
@@ -203,7 +205,13 @@ impl Config {
             // `settle_ms` used to be accepted and was never read: the settle
             // window is the room's own (`0xF001` policy, `settleWindowMs`).
             // Name the key and say where the value really comes from.
-            if msg.contains("settle_ms") {
+            if msg.contains("missing field `directions`") {
+                Error::Config(format!(
+                    "{msg}\nevery [[links]] must state `directions` (no default: absence means \
+                     the most restrictive reading). Allowed values: \"to_foreign\" (VTC room to \
+                     Geb only), \"from_foreign\" (Geb to VTC room only), \"both\""
+                ))
+            } else if msg.contains("settle_ms") {
                 Error::Config(format!(
                     "{msg}\n[geb] settle_ms is no longer a setting: the commit settle window is \
                      taken from the room's own 0xF001 policy (settleWindowMs); remove the key"
@@ -304,9 +312,30 @@ vtc_room = "room-1"
 host_did = "did:webvh:host.example"
 persona = "did:key:z6Mkpersona"
 geb_room_id = "geb-1"
+directions = "both"
 tier = "open"
 tier_optin = true
 "#;
+
+    #[test]
+    fn directions_must_be_stated_and_the_error_names_the_key_and_the_values() {
+        // Absence means the most restrictive reading, and there is no
+        // restrictive default to pick for the operator: it must be stated.
+        let bad = BASE.replace("directions = \"both\"\n", "");
+        let e = Config::from_toml(&bad).unwrap_err().to_string();
+        assert!(
+            e.contains("directions")
+                && e.contains("to_foreign")
+                && e.contains("from_foreign")
+                && e.contains("both"),
+            "{e}"
+        );
+        let ok = BASE.replace("\"both\"", "\"to_foreign\"");
+        assert_eq!(
+            Config::from_toml(&ok).unwrap().links[0].directions,
+            Directions::ToForeign
+        );
+    }
 
     #[test]
     fn parses_with_defaults() {
@@ -411,7 +440,7 @@ tier_optin = true
     fn one_persona_and_one_geb_room_per_link() {
         let l2 = |persona: &str, room: &str| {
             format!(
-                "{BASE}\n[[links]]\nid = \"l2\"\nvtc_room = \"room-2\"\nhost_did = \"did:webvh:host.example\"\npersona = \"{persona}\"\ngeb_room_id = \"{room}\"\ntier = \"open\"\ntier_optin = true\n"
+                "{BASE}\n[[links]]\nid = \"l2\"\nvtc_room = \"room-2\"\nhost_did = \"did:webvh:host.example\"\npersona = \"{persona}\"\ngeb_room_id = \"{room}\"\ndirections = \"both\"\ntier = \"open\"\ntier_optin = true\n"
             )
         };
         assert!(Config::from_toml(&l2("did:key:z6Mkother", "geb-2")).is_ok());

@@ -74,7 +74,9 @@ enum LinkCmd {
         persona: String,
         #[arg(long)]
         geb_room_id: String,
-        #[arg(long, default_value = "both")]
+        /// Which way content may flow: `to_foreign`, `from_foreign` or `both`.
+        /// Required: there is no default.
+        #[arg(long)]
         directions: String,
         #[arg(long, default_value = "open")]
         tier: String,

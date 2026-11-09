@@ -604,7 +604,7 @@ stderr via `tracing_subscriber`. Security alerts carry `security_alert = true`.
 |---|---|---|
 | `setup --setup-key-out <path> [--context <ctx>]` | Phase 1: mint an ephemeral setup key, store it (0600), print the grant the operator must apply at the VTA | Nothing |
 | `setup --from <setup.toml>` | Phase 2: mint and export device keys for each `[[links]]`, store them, write the config. Refuses to overwrite a config or a non-empty secret store | The VTA |
-| `link add --setup-key-file ... --id ... --vtc-room ... --host-did ... --host-url ... --persona ... --geb-room-id ... [--directions] [--tier] [--tier-optin] [--poll-secs] [--display-name]` | Mint this link's keys with a fresh granted setup key, then record the link. Starts paused | The VTA |
+| `link add --setup-key-file ... --id ... --vtc-room ... --host-did ... --host-url ... --persona ... --geb-room-id ... --directions <to_foreign|from_foreign|both> [--tier] [--tier-optin] [--poll-secs] [--display-name]` | Mint this link's keys with a fresh granted setup key, then record the link. Starts paused | The VTA |
 | `link list` | One line per link | Nothing |
 | `link pause <id>` / `link resume <id>` | Set `enabled` in the config and print what a running process will do and how soon. `resume` does not clear a halt. A running `run` re-reads the flag (below) | Nothing |
 | `link remove <id>` | Drop the link and its secrets. Does not revoke the VTA key records and leaves the link's data directory | Secret store |
@@ -643,7 +643,7 @@ host_url = "https://host.example" # required to run; https only (http only for 1
 persona = "did:key:z6Mk..."
 geb_room_id = "geb-1"
 geb_peers = []                    # added by `geb connect`
-directions = "both"               # both | to_foreign | from_foreign
+directions = "both"               # required, no default: both | to_foreign | from_foreign
 tier = "open"                     # open | attributed; private is refused
 tier_optin = true                 # required
 poll_secs = 10
