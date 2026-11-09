@@ -61,6 +61,10 @@ mod tests {
         }
         let over = format!(r#"{{"t":"l","at":1,"text":"{}"}}"#, "x".repeat(20_001));
         assert!(c.decode_line(over.as_bytes()).is_err());
+        // Units, not chars: 10,001 emoji are 10,001 chars and 20,002 units.
+        let emoji = |n: usize| format!(r#"{{"t":"l","at":1,"text":"{}"}}"#, "\u{1F600}".repeat(n));
+        assert!(c.decode_line(emoji(10_000).as_bytes()).is_ok());
+        assert!(c.decode_line(emoji(10_001).as_bytes()).is_err());
         assert!(c.decode_envelope(br#"{"t":"nope"}"#).is_err());
     }
 }

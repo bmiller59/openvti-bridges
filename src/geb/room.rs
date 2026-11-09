@@ -15,7 +15,7 @@ use super::crypto::{b64_decode, b64_encode, did_peer, pair, sign};
 use super::traits::{
     GebCodec, GebGroup, GebRelay, GebSigner, OpenedMessage, RelayEvent, SettleReport,
 };
-use super::wire::{Envelope, LineBody, MAX_EVENT_BYTES, MAX_LINE_CHARS, signing_doc};
+use super::wire::{Envelope, LineBody, MAX_EVENT_BYTES, MAX_LINE_CHARS, signing_doc, utf16_len};
 use crate::foreign::{
     Cursor, ForeignIdentity, ForeignRoom, JoinState, Polled, Posted, Receipt, RoomCapabilities,
     Verifiability,
@@ -271,8 +271,15 @@ impl ForeignRoom for GebRoom {
                 "Geb accepts only plain posts; mapping must flatten edits and retractions".into(),
             ));
         }
-        if event.text.chars().count() > MAX_LINE_CHARS {
-            return Err(Error::Foreign("line over 20,000 characters".into()));
+        // Geb counts a line's text in UTF-16 code units (JavaScript string
+        // length) and every receiver drops a longer one (round 3 section 6):
+        // refuse, never truncate. The mapping layer already cuts text to the
+        // byte cap in `capabilities()`, which is never more than 20,000 units.
+        let units = utf16_len(&event.text);
+        if units > MAX_LINE_CHARS {
+            return Err(Error::Foreign(format!(
+                "line is {units} UTF-16 code units; the limit is {MAX_LINE_CHARS}; refused, not truncated"
+            )));
         }
         // A retraction (or a supersede, where edit is unsupported) is an
         // ordinary signed line whose `re` is the original line's derived id:
@@ -300,7 +307,10 @@ impl ForeignRoom for GebRoom {
             content,
         )?;
         if ev.json_len() > MAX_EVENT_BYTES {
-            return Err(Error::Foreign("event over 65,536 bytes".into()));
+            return Err(Error::Foreign(format!(
+                "event is {} bytes; the limit is {MAX_EVENT_BYTES}; refused, not truncated",
+                ev.json_len()
+            )));
         }
         let id = ev.id.clone();
         self.relay.publish(ev).await?;
@@ -329,8 +339,10 @@ impl ForeignRoom for GebRoom {
 
     fn capabilities(&self) -> RoomCapabilities {
         RoomCapabilities {
-            // Characters are capped at 20,000; a byte cap of 20,000 satisfies
-            // that for any UTF-8 text.
+            // Geb caps a line at 20,000 UTF-16 code units; a byte cap of
+            // 20,000 satisfies that for any UTF-8 text (a unit is at least
+            // one byte), at the price of cutting multi-byte text early.
+            // `post` itself counts units.
             max_message_bytes: MAX_LINE_CHARS,
             supports_edit: false,
             supports_delete: false,
@@ -560,6 +572,127 @@ mod tests {
             Arc::new(|| 0),
         );
         assert!(matches!(r.join().await, Err(Error::Unsupported(_))));
+    /// Round 3 section 6: a line is at most 20,000 UTF-16 code units, counted
+    /// as JavaScript counts, not bytes and not characters.
+    #[tokio::test]
+    async fn the_line_limit_counts_utf16_units_not_chars_or_bytes() {
+        let relay = Arc::new(FakeRelay::new());
+        let (a, _, _) = room_for(&relay, 1, 1_700_000_000_000);
+        let (b, _, _) = room_for(&relay, 2, 1_700_000_001_000);
+        // 10,000 emoji are 20,000 units (and 40,000 bytes): at the limit.
+        assert_eq!(utf16_len(&"\u{1F600}".repeat(10_000)), 20_000);
+        a.post(&post_event(&"\u{1F600}".repeat(10_000)))
+            .await
+            .unwrap();
+        // 10,001 emoji are only 10,001 chars but 20,002 units: refused.
+        let e = a
+            .post(&post_event(&"\u{1F600}".repeat(10_001)))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("20002") && e.contains("UTF-16"), "{e}");
+        // 19,999 ASCII + one emoji: 20,000 chars, 20,001 units: refused.
+        let edge = format!("{}\u{1F600}", "a".repeat(19_999));
+        assert_eq!(edge.chars().count(), 20_000);
+        assert!(a.post(&post_event(&edge)).await.is_err());
+        // 20,000 two-byte characters are 20,000 units: accepted.
+        a.post(&post_event(&"\u{e9}".repeat(20_000))).await.unwrap();
+        assert_eq!(
+            relay.all().len(),
+            2,
+            "refused lines never reached the relay"
+        );
+        let got = b.poll(None).await.unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_received_line_over_20000_units_is_dropped() {
+        let relay = Arc::new(FakeRelay::new());
+        let (b, _, _) = room_for(&relay, 2, 1_700_000_001_000);
+        let (did, _) = device(9);
+        let g = FakeGroup::new(&did);
+        let keys = g.relay_keys().unwrap();
+        let line = |at: u64, text: &str| {
+            let plain =
+                serde_json::to_vec(&serde_json::json!({"t":"l","at":at,"text":text})).unwrap();
+            let env = format!(
+                r#"{{"t":"ml","m":"{}"}}"#,
+                b64_encode(&g.seal(&plain).unwrap())
+            );
+            RelayEvent::sign(
+                &keys.nostr_secret,
+                KIND_MAILBOX,
+                at / 1000,
+                vec![],
+                pair::seal(&keys, KIND_MAILBOX, env.as_bytes()).unwrap(),
+            )
+            .unwrap()
+        };
+        relay.inject(line(1_700_000_000_000, &"\u{1F600}".repeat(10_001)));
+        relay.inject(line(1_700_000_000_001, &"\u{1F600}".repeat(10_000)));
+        let got = b.poll(None).await.unwrap();
+        assert_eq!(got.len(), 1, "only the line within the limit");
+        assert_eq!(got[0].event.text.chars().count(), 10_000);
+    }
+
+    /// Round 3 section 6: no event over 120,000 bytes; an error, not a cut.
+    struct Padded(FakeGroup, usize);
+    #[async_trait]
+    impl GebGroup for Padded {
+        async fn ensure_seated(&self) -> Result<JoinState> {
+            self.0.ensure_seated().await
+        }
+        async fn leave(&self) -> Result<()> {
+            Ok(())
+        }
+        fn relay_keys(&self) -> Result<RelayKeys> {
+            self.0.relay_keys()
+        }
+        fn seal(&self, p: &[u8]) -> Result<Vec<u8>> {
+            let mut v = self.0.seal(p)?;
+            v.extend(std::iter::repeat_n(b' ', self.1));
+            Ok(v)
+        }
+        fn open(&self, m: &[u8]) -> Result<OpenedMessage> {
+            self.0.open(m)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_over_120000_bytes_is_refused_not_truncated() {
+        let (did, key) = device(1);
+        let mk = |pad: usize, relay: &Arc<FakeRelay>| {
+            GebRoom::new(
+                "room-1".into(),
+                relay.clone(),
+                Arc::new(Padded(FakeGroup::new(&did), pad)),
+                Arc::new(LocalSigner::new(did.clone(), key.clone())),
+                Arc::new(GuideCodec),
+                Arc::new(|| 1_700_000_000_000),
+            )
+        };
+        let relay = Arc::new(FakeRelay::new());
+        let e = mk(100_000, &relay)
+            .post(&post_event("hi"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("120000") && e.contains("not truncated"), "{e}");
+        assert!(relay.all().is_empty());
+        // The largest legal line (20,000 three-byte characters, about 107,000
+        // bytes once sealed and wrapped twice) is under the limit, and was
+        // over the old 65,536.
+        let ok = mk(0, &relay)
+            .post(&post_event(&"\u{4e2d}".repeat(20_000)))
+            .await
+            .unwrap();
+        assert_eq!(ok.receipt, Receipt::Relayed);
+        let sent = relay.all();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].json_len() > 65_536 && sent[0].json_len() <= MAX_EVENT_BYTES);
+    }
+
         assert!(matches!(
             r.post(&post_event("x")).await,
             Err(Error::Unsupported(_))

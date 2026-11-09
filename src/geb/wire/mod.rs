@@ -14,10 +14,15 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// Longest line text, in characters.
+/// Longest line text, in UTF-16 code units (JavaScript string length), not
+/// bytes and not scalar values: an emoji outside the BMP counts 2.
 pub const MAX_LINE_CHARS: usize = 20_000;
-/// Largest Nostr event we post, in bytes of NIP-01 JSON.
-pub const MAX_EVENT_BYTES: usize = 65_536;
+/// Largest Nostr event we post, in bytes of NIP-01 JSON: Geb plans every event
+/// to fit 120,000 bytes, under the 131,072-byte per-event cap public relays
+/// carry (round 3 section 6). Over it is an error, never a truncation.
+pub const MAX_EVENT_BYTES: usize = 120_000;
+/// Largest event we will read from a relay: the relay's own per-event cap.
+pub const MAX_RECV_EVENT_BYTES: usize = 131_072;
 
 /// Longest KeyPackage in a `kp-stock`, in base64 characters.
 pub const MAX_STOCK_KP_CHARS: usize = 65_536;
@@ -35,6 +40,11 @@ pub const MAX_OPTION_CHARS: usize = 60;
 pub const MAX_EMOJI_UNITS: usize = 16;
 /// Longest room name, in characters.
 pub const MAX_ROOM_NAME_CHARS: usize = 80;
+
+/// The length Geb's code measures: UTF-16 code units (JavaScript `.length`).
+pub fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
 
 /// Whether `id` matches the room id pattern `[A-Za-z0-9_-]{8,64}` (also the
 /// MLS group id, as UTF-8).
@@ -655,12 +665,14 @@ impl LineBody {
     /// limit and a well-formed `re`. Mentions and options are not rejected on
     /// content, because the bridge acts on neither and Geb cleans them.
     pub fn validate_inbound(&self) -> Result<()> {
-        let n = self.text.chars().count();
+        let n = utf16_len(&self.text);
         if n == 0 {
             return Err(Error::Wire("line text is empty".into()));
         }
         if n > MAX_LINE_CHARS {
-            return Err(Error::Wire("line text over 20,000 characters".into()));
+            return Err(Error::Wire(
+                "line text over 20,000 UTF-16 code units".into(),
+            ));
         }
         if self.re.as_deref().is_some_and(|r| !is_line_ref(r)) {
             return Err(Error::Wire("line re must be 16-64 lowercase hex".into()));
@@ -1078,6 +1090,18 @@ mod tests {
     fn line_limits_and_signing_doc_excludes_sg() {
         assert!(LineBody::new(1, "é".repeat(20_000)).validate().is_ok());
         assert!(LineBody::new(1, "x".repeat(20_001)).validate().is_err());
+        // UTF-16 code units, as JavaScript counts: an emoji is two.
+        assert!(
+            LineBody::new(1, "\u{1F600}".repeat(10_000))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            LineBody::new(1, "\u{1F600}".repeat(10_001))
+                .validate()
+                .is_err()
+        );
+        assert_eq!(utf16_len("a\u{1F600}\u{e9}"), 4);
         let mut l = LineBody::new(7, "hello".into());
         let unsigned = signing_doc("room", "did:a", &l).unwrap();
         l.sg = Some("SIG".into());

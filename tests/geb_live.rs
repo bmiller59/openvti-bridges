@@ -124,7 +124,7 @@ async fn client_publish_fetch_and_every_refusal() {
     let mut forged = ev.clone();
     forged.sig = "22".repeat(64);
     assert!(c.publish(forged).await.is_err());
-    let big = RelayEvent::sign(&sk, KIND_MAILBOX, T0, vec![], "A".repeat(70_000)).unwrap();
+    let big = RelayEvent::sign(&sk, KIND_MAILBOX, T0, vec![], "A".repeat(121_000)).unwrap();
     assert!(c.publish(big).await.is_err());
     // Refused by the relay: expired (NIP-40).
     let old = RelayEvent::sign(
@@ -143,7 +143,7 @@ async fn client_publish_fetch_and_every_refusal() {
     let (mut ws, _) = tokio_tungstenite::connect_async(relay.url().as_str())
         .await
         .unwrap();
-    let big = RelayEvent::sign(&sk, KIND_MAILBOX, T0, vec![], "A".repeat(70_000)).unwrap();
+    let big = RelayEvent::sign(&sk, KIND_MAILBOX, T0, vec![], "A".repeat(135_000)).unwrap();
     let mut bad = ev.clone();
     bad.sig = "33".repeat(64);
     for raw in [big, bad] {

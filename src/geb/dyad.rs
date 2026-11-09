@@ -376,7 +376,10 @@ impl StatefulDyad {
 
     async fn publish(&self, ev: RelayEvent) -> Result<()> {
         if ev.json_len() > MAX_EVENT_BYTES {
-            return Err(Error::Foreign("event over 65,536 bytes".into()));
+            return Err(Error::Foreign(format!(
+                "event is {} bytes; the limit is {MAX_EVENT_BYTES}; refused, not truncated",
+                ev.json_len()
+            )));
         }
         self.relay.publish(ev).await
     }
