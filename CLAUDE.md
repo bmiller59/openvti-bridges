@@ -59,6 +59,17 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   wrapper fail) in standard base64 matching `^[A-Za-z0-9+/=]+$`; base64url
   strings are dropped, in our `kp` / `kp-stock` frames (`Frame::validate`) and
   in `geb::mls::parse_key_package`.
+- **Unknown group ops are ignored, unknown kinds are not** (`wire::parse_frame`).
+  A dyad frame `{k:"g", op:<not kp-stock|kp-req|rs|kp|welcome>}` (Geb's `rc`,
+  `seat-ask`, `leave`, or anything newer) parses as `GroupOp::Ignored`, is
+  logged, recorded done and ACKED, and never reaches the consumer. An unknown
+  frame kind `k`, a `g` frame without a string `op`, or a known op with a bad
+  body still fails and is dropped unacked (a kind may carry authority).
+  UNVERIFIED: whether an unacked frame blocks Geb's ratchet or only repeats.
+  Our own receive chain cannot stall (opening a frame commits the chain, and the
+  skipped-key window heals gaps), but without an ack the sender would repost
+  the frame for ever, so ack is the safe choice either way. Geb's expected
+  reply to `rc` / `seat-ask` / `leave` (P1/P2) is not built.
 - **No new message kinds.** Geb has no edit, delete or retract on the wire. A
   retraction (or a supersede, since edit is unsupported) is an ordinary signed
   `{t:"l"}` line whose `re` is the original line's *derived* id

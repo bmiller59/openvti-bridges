@@ -308,6 +308,36 @@ pub enum GroupOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ent: Option<u64>,
     },
+    /// A group op this bridge does not implement (`rc`, `seat-ask`, `leave`, or
+    /// any other `op`). Never built by serde: only [`parse_frame`] makes it,
+    /// so a peer's unknown op is not a parse failure. It carries the op name
+    /// for the log and nothing else; it is acked and ignored (see
+    /// `geb::dyad`). Never sent.
+    #[serde(skip)]
+    Ignored(String),
+}
+
+/// The `op` values [`GroupOp`] has typed variants for.
+const KNOWN_GROUP_OPS: [&str; 5] = ["kp-stock", "kp-req", "rs", "kp", "welcome"];
+
+/// Parse the JSON of a dyad frame. Strict about *kinds* (an unknown `k`
+/// fails: a kind may carry authority, so the caller fails closed), tolerant of
+/// *group ops*: `{k:"g", op:<anything else>}` is [`GroupOp::Ignored`], because
+/// Geb sends ops this bridge does not build (`rc`, `seat-ask`, `leave`) and an
+/// op without authority here must neither fail the parse nor be dropped. A
+/// known op with a malformed body, or a `g` frame with no string `op`, still
+/// fails.
+pub fn parse_frame(bytes: &[u8]) -> Result<Frame> {
+    let v: Value = serde_json::from_slice(bytes).map_err(|e| Error::Wire(format!("frame: {e}")))?;
+    if v.get("k").and_then(Value::as_str) == Some("g")
+        && let Some(op) = v.get("op").and_then(Value::as_str)
+        && !KNOWN_GROUP_OPS.contains(&op)
+    {
+        // The name is peer-controlled: bounded and printable for the log.
+        let op: String = op.chars().filter(|c| !c.is_control()).take(32).collect();
+        return Ok(Frame::Group(GroupOp::Ignored(op)));
+    }
+    serde_json::from_value(v).map_err(|e| Error::Wire(format!("frame: {e}")))
 }
 
 /// A frame inside a dyad envelope.
@@ -656,6 +686,48 @@ mod tests {
             json!({"k":"g","op":"rs","room":{"id":"geb-room-0001"}})
         );
         assert!(serde_json::from_value::<RoomPlaintext>(json!({"t":"ag","at":1,"d":{}})).is_err());
+    }
+
+    #[test]
+    fn unknown_group_ops_parse_as_ignored_but_unknown_kinds_and_bad_known_ops_fail() {
+        for op in ["rc", "seat-ask", "leave", "brand-new"] {
+            let j = json!({"k":"g","op":op,"room":{"id":"r"},"e":1,"c":"AA"}).to_string();
+            assert_eq!(
+                parse_frame(j.as_bytes()).unwrap(),
+                Frame::Group(GroupOp::Ignored(op.into()))
+            );
+        }
+        // A hostile op name is bounded and printable.
+        let long = format!("x\n{}", "y".repeat(100));
+        let j = json!({"k":"g","op":long}).to_string();
+        let Frame::Group(GroupOp::Ignored(n)) = parse_frame(j.as_bytes()).unwrap() else {
+            panic!()
+        };
+        assert!(n.len() <= 32 && !n.contains('\n'));
+        // Known ops still parse typed.
+        let j = json!({"k":"g","op":"kp-req","room":{"id":"r"}}).to_string();
+        assert!(matches!(
+            parse_frame(j.as_bytes()).unwrap(),
+            Frame::Group(GroupOp::KpReq { .. })
+        ));
+        // Fail closed: an unknown kind (it may carry authority), a `g` with no
+        // string op, a known op with a bad body, not JSON.
+        for bad in [
+            json!({"k":"zz","op":"rc"}),
+            json!({"k":"g"}),
+            json!({"k":"g","op":5}),
+            json!({"k":"g","op":"kp-req"}),
+            json!({"k":"g","op":"welcome","w":"AA"}),
+        ] {
+            assert!(parse_frame(bad.to_string().as_bytes()).is_err(), "{bad}");
+        }
+        assert!(parse_frame(b"not json").is_err());
+        // The typed serde still refuses an unknown op; Ignored is never sent.
+        assert!(
+            serde_json::from_value::<Frame>(json!({"k":"g","op":"rc"})).is_err(),
+            "only parse_frame is tolerant"
+        );
+        assert!(serde_json::to_vec(&Frame::Group(GroupOp::Ignored("rc".into()))).is_err());
     }
 
     #[test]

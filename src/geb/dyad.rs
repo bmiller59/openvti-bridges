@@ -23,8 +23,10 @@
 //! UNVERIFIED (the guide and the answers are silent; each is a choice, not
 //! Geb's behaviour):
 //! - whether a receiver re-acks a frame it has already opened (we do);
-//! - whether an authenticated frame of an unknown kind or non-JSON text is acked
-//!   (we drop it unacked; Geb shows non-JSON text);
+//! - whether an authenticated frame of an unknown kind (`k`) or non-JSON text is
+//!   acked (we drop it unacked; Geb shows non-JSON text). An unknown group
+//!   `op` (`rc`, `seat-ask`, `leave`, anything new) is NOT in this class: it is
+//!   acked and ignored (`wire::parse_frame`, `GroupOp::Ignored`);
 //! - the inbox is read from the start (no `since`) because inbox events expire
 //!   after 7 days; a processed invitation is remembered by its connection;
 //! - a second invitation from a peer we already hold a connection record for
@@ -45,8 +47,8 @@ use super::room::{Clock, EXPIRY_SECS, SINCE_SLACK_SECS};
 use super::traits::{GebCodec, GebDyad, GebRelay, GebSigner, RelayEvent};
 use super::vrc;
 use super::wire::{
-    COMPLETION_TYPE, Envelope, Frame, INVITATION_TYPE, Invitation, InvitePayload, MAX_ACK_IDS,
-    MAX_EVENT_BYTES, RESPONSE_TYPE, VrcCompletion, VrcResponse, is_nonce,
+    COMPLETION_TYPE, Envelope, Frame, GroupOp, INVITATION_TYPE, Invitation, InvitePayload,
+    MAX_ACK_IDS, MAX_EVENT_BYTES, RESPONSE_TYPE, VrcCompletion, VrcResponse, is_nonce, parse_frame,
 };
 use crate::store::{BridgeStore, StateSpace};
 use crate::{Error, Result};
@@ -780,16 +782,31 @@ impl StatefulDyad {
                         }
                         let frame = rc
                             .open_b64(&f)
-                            .and_then(|b| {
-                                serde_json::from_slice::<Frame>(&b)
-                                    .map_err(|e| Error::Wire(format!("frame: {e}")))
-                            })
+                            .and_then(|b| parse_frame(&b))
                             .and_then(|fr| fr.validate().map(|()| fr));
                         match frame {
                             Ok(Frame::Cap { dm, fc, rv, wp }) => {
                                 p.conn.peer_cap = Some(serde_json::json!(
                                     {"k":"cap","dm":dm,"fc":fc,"rv":rv,"wp":wp}
                                 ));
+                                r.done.push_back(id.clone());
+                                to_ack.push(id);
+                            }
+                            // An op this bridge does not build (`rc`, `seat-ask`,
+                            // `leave`, anything new): no authority here, so it
+                            // is neither a failure nor queued. Opening it
+                            // already advanced our receive chain, so the frame
+                            // is recorded done and ACKED: an unacked frame
+                            // would stay in the sender's pending set and be
+                            // reposted for ever, to be dropped again by the
+                            // `done` check.
+                            // UNVERIFIED: whether an unacked frame blocks
+                            // Geb's ratchet or only repeats; acking is safe
+                            // either way. Whether Geb requires a particular
+                            // reply to `rc` / `seat-ask` / `leave` is a
+                            // P1/P2 matter, not an ack.
+                            Ok(Frame::Group(GroupOp::Ignored(op))) => {
+                                tracing::info!(%op, "ignoring a group op this bridge does not implement");
                                 r.done.push_back(id.clone());
                                 to_ack.push(id);
                             }
@@ -890,11 +907,16 @@ impl StatefulDyad {
         if p.conn.phase != Phase::Connected {
             return Err(Error::Foreign("not connected to this peer".into()));
         }
+        let plain = serde_json::to_vec(frame).map_err(|e| Error::Wire(e.to_string()))?;
+        self.send_plain(p, peer, plain).await
+    }
+
+    /// Seal, persist and post the frame's JSON bytes.
+    async fn send_plain(&self, p: &mut Peer, peer: &str, plain: Vec<u8>) -> Result<()> {
         let r = p
             .ratchet
             .as_mut()
             .ok_or_else(|| Error::Foreign("no ratchet for this peer".into()))?;
-        let plain = serde_json::to_vec(frame).map_err(|e| Error::Wire(e.to_string()))?;
         if plain.len() > MAX_FRAME_PLAINTEXT {
             return Err(Error::Foreign(
                 "frame too large for one event (fragments are not supported)".into(),
@@ -910,6 +932,18 @@ impl StatefulDyad {
         let mine = my_side(&self.id.did, peer)?;
         self.post_envelope(peer, &Envelope::Frame { f, d: mine })
             .await
+    }
+
+    /// Test only: send raw frame JSON, as a peer speaking a newer protocol would.
+    #[cfg(test)]
+    async fn send_raw(&self, peer: &str, json: &[u8]) -> Result<()> {
+        let mut lease = self.lease()?;
+        let core = lease.core.get_or_insert_with(HashMap::new);
+        self.load(core, peer).await?;
+        let p = core
+            .get_mut(peer)
+            .ok_or_else(|| Error::Foreign("no connection with this peer".into()))?;
+        self.send_plain(p, peer, json.to_vec()).await
     }
 
     /// Repost every sent-but-unacked frame, unchanged (same ratchet frame, a
@@ -1116,6 +1150,47 @@ mod tests {
         let c: ConnRecord = serde_json::from_slice(&ra).unwrap();
         vrc::verify(c.their_vrc.as_ref().unwrap(), w.b.did(), w.a.did()).unwrap();
         vrc::verify(c.our_vrc.as_ref().unwrap(), w.a.did(), w.b.did()).unwrap();
+    }
+
+    /// P0-b: ops this bridge does not build (`rc`, `seat-ask`, `leave`, and any
+    /// unknown `op`) are acked and ignored, never queued and never a failure;
+    /// an unknown frame KIND (`k`) and a known op with a bad body still drop
+    /// unacked.
+    #[tokio::test]
+    async fn unknown_group_ops_are_acked_and_ignored_and_unknown_kinds_fail_closed() {
+        let w = world();
+        connect(&w).await;
+        w.b.recv(w.a.did()).await.unwrap();
+        let ignored = [
+            r#"{"k":"g","op":"rc","room":{"id":"geb-room-0001"},"e":3,"c":"AAAA"}"#,
+            r#"{"k":"g","op":"seat-ask","room":{"id":"geb-room-0001"},"kp":"AAAA"}"#,
+            r#"{"k":"g","op":"leave","room":{"id":"geb-room-0001"},"by":"did:x","at":1,"sig":"s"}"#,
+            r#"{"k":"g","op":"something-new","x":1}"#,
+        ];
+        let refused = [
+            r#"{"k":"zz","op":"rc"}"#,
+            r#"{"k":"g"}"#,
+            r#"{"k":"g","op":7}"#,
+            r#"{"k":"g","op":"kp-req"}"#,
+        ];
+        for j in ignored.iter().chain(refused.iter()) {
+            w.a.send_raw(w.b.did(), j.as_bytes()).await.unwrap();
+        }
+        w.a.send(w.b.did(), &msg("after")).await.unwrap();
+        w.now.fetch_add(1, Ordering::SeqCst);
+        let got = w.b.recv(w.a.did()).await.unwrap();
+        assert_eq!(
+            got.iter().map(text).collect::<Vec<_>>(),
+            ["after"],
+            "an ignored op is not queued for the consumer"
+        );
+        // The ratchet was not stalled by any of them, and the four ignored ops
+        // (plus the message and our connect-time `cap`) were acked; the four
+        // refused ones were not.
+        w.now.fetch_add(1, Ordering::SeqCst);
+        let r = w.a.sync(w.b.did()).await.unwrap();
+        assert_eq!(r.acked, 6, "{r:?}");
+        assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), refused.len());
     }
 
     #[tokio::test]
