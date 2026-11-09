@@ -29,8 +29,9 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
 - **Geb is a foreign-protocol interface** (workspace `CLAUDE.md`, exceptions
   to "every remote operation is a Trust Task"). Its wire has no versioned spec:
   pin to Geb's authoritative answers `Geb's path B answers, round 1` (code at
-  release 0.5.14) and round 2 (release 0.5.15, `fdf804d`; the 0.5.15 paragraphs are
-  the current rules; they supersede `Geb's implementer's guide (2026-11-07)` where they differ), keep
+  release 0.5.14), round 2 (release 0.5.15, `fdf804d`; the 0.5.15 paragraphs are
+  the current rules; they supersede `Geb's implementer's guide (2026-11-07)` where they differ)
+  and round 3 (round 3, 2026-11-09, read at `fdf804d`; see "Round 3 answers"), keep
   changes behind `GebCodec` and the other `geb::traits`, and mark anything the
   answers do not settle `// UNVERIFIED:`. Remaining markers: the `did:peer`
   purpose-element order, a few `parsePolicy` details (see `geb/policy.rs`), the
@@ -111,7 +112,15 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   `{t:"l"}` line whose `re` is the original line's *derived* id
   (`geb::crypto::line_id`); the xref therefore stores that derived id for each
   bridged record. Notice wording is configurable per link (`[links.notices]`).
-- **Capabilities.** The bridge sends `cap` with `dm: 0` and never `fc` / `rv`.
+- **Capabilities.** The bridge sends `cap` `{k:"cap", dm:0, fc:0}`: `fc` is
+  stated because an UNKNOWN `fc` makes Geb hold a large frame back until it
+  hears from us; `rv` and `wp` stay unset (a …
+  … which is what we want); it never claims `dm >= 1`,
+  `fc: 1` or `rv: 1`. KNOWN LIMITATION: with `fc:0` Geb sends a frame too big
+  for one 120,000-byte event whole and the relay refuses it, so …
+  … in it) NEVER reaches us and joining a
+  large room fails. Fragment reassembly (`{k:"fc", id, i, n, d}`, `n` <= 64)
+  is not built (open item).
 - **Refusal stops the link.** If seating is refused or the leaf is removed
   (`Error::Refused`), the link halts, alerts and is never retried; the halt is
   persisted. An "ask" room may leave seating `JoinState::Pending`, which is a
@@ -159,7 +168,8 @@ Run the harness: `cargo test --features harness` (needs the `room-host` git depe
 
 - **`geb-live`**: `geb::nostr::NostrRelay` (a `GebRelay` over one websocket per
   identity: wss only, `ws://` only for 127.0.0.1, capped jittered reconnect,
-  every event verified, 65,536-byte cap) and `geb::test_relay::TestRelay` (an
+  every event verified; posts refused over 120,000 bytes, reads over the
+  relay's 131,072 dropped; relay manners, see "Round 3 answers") and `geb::test_relay::TestRelay` (an
   in-process loopback relay for tests). `tests/geb_live.rs` runs the dyad over
   it. No test may reach a real relay or Geb node. The wss/TLS path is not
   exercised by any test.
@@ -184,7 +194,7 @@ messaging (`send`, `recv`, `retransmit`). State goes through
 `BridgeStore::state_get/state_put` (`links/dyad/<peer>` and `ratchets/<peer>`);
 a received frame is queued durably before its ack is posted, and a sent
 frame's counter is persisted before the post. It sends `cap` with `dm:0` and
-refuses to send `dm>=1`, `fc` or `rv` of 1. The state is leased, not locked: a
+`fc:0` and refuses to send `dm>=1`, `fc` or `rv` of 1. The state is leased, not locked: a
 second concurrent call fails with "dyad busy".
 
 ## VTC room side rules
@@ -317,6 +327,20 @@ the live run says it is needed.
 7. Is a re-seat's added unbound leaf (naming a DID the same commit removes)
    refused as an `unboundClaim`? (We refuse it.)
 
+## Open questions for Geb (round 3 follow-ups)
+
+1. Does Geb accept (or silently ignore) an `rs` with no status body `s`, and is a
+   seat-check answered by anything short of a full `rs`? (We send the minimal one.)
+2. With `fc:0`, is a Welcome over 120,000 bytes really never delivered, or is
+   there a fallback (a re-send in pieces, a smaller tree)? What room size is the
+   practical limit?
+3. Is the live relay's per-event cap 131,072 or 256 KB, and is the 900 s future
+   limit and 20-subscription limit still as in the repo copy?
+4. `kp-low {gen, n}`: can `n` be 0, and what should we answer when we have lost our
+   per-contact state (we use `their gen + 1`)?
+5. Does Geb reject a KeyPackage whose lifetime range is exactly 84 days + 1 h
+   (OpenMLS 0.8.2 defines a maximum range of that size but does not call it)?
+
 ## Not built (blocked or later)
 
 M3 remainder: persona cards and signed leaves (`geb::policy::CommitCheckInputs`
@@ -324,6 +348,88 @@ has only the `NoLocalKnowledge` production implementation), so the two
 card-dependent commit kinds halt the link; leaving a room (a signed `{t:"lv"}`); a
 re-seat after a fork (`rs` is sent, a replacement Welcome is not processed);
 a peer index (the dyad is driven per peer DID, peers are listed per link in
-`geb_peers`); `fc` fragments. Also not
+`geb_peers`); `fc` fragments; the `rs` status body and its fork repair (`rs` is
+sent minimal, see "Round 3 answers"); `seat-ask` and `rc` handling; accepting a
+re-seat Welcome; persona-card intake; fork choice. Also not
 built on the room side: recovery of a sealed record left at a wrong version
 by a crash mid-race (it is reported as a typed read error).
+
+## Round 3 answers (2026-11-09, read at `fdf804d`): summary notes
+
+Summary in our own words. Geb's answers are private and are not reproduced here. Nothing below has been
+checked against a live Geb; the status of each point is stated.
+
+- **OpenMLS (UNVERIFIED).** Geb is on stock OpenMLS 0.8.2 and has not compared its rooms with any other
+  version or library, so this bridge (on 0.9.x) is the first such comparison. Where the bridge relies on
+  an OpenMLS default (leaf capabilities, KeyPackage lifetime, ciphertext-only wire format, no padding, no
+  retained past epochs, the standard exporter, no last-resort packages), check it against the live run.
+  A line that loses an epoch race is recovered by the line self-heal, not by MLS. Whether a Welcome or
+  Commit carrying … accepted is not known.
+  See "OpenMLS version".
+- **Release facts (implemented: pin only).** The bridge builds to release 0.5.15. The release metadata
+  carries a wire number that is not a compatibility signal; there is no changelog and no release event,
+  and Geb says breaking changes are announced to implementers before they ship. This crate reads none
+  of that metadata. Whether 0.5.15 still counts as path B 0.1 is not decided on Geb's side.
+- **Decisions Geb has not made yet (not assumed).** Staying on OpenMLS 0.8.2; a path B compatibility
+  policy; a room member cap; bridge and agent room settings and how a member declares itself a bridge;
+  … devices; the live relay limits.
+- **KeyPackages (implemented).** One mint path: always bound (leaf extension `0xF002`), with an explicit
+  lifetime (back-dated one hour, valid 84 days). `gen` counts the stocks we sent to one contact, never
+  packages and never globally; a stock is 6 packages (receivers keep at most 16) and a receiver replaces
+  its set only for a higher `gen`. A `kp-low` is answered with `max(our last gen to them, theirs) + 1`;
+  a contact whose last stock is over 7 days old is re-stocked while its link waits for a Welcome.
+  Private keys are kept for the newest two stock gens per contact plus anything minted in the last hour,
+  and for single packages (`kp` answers) for 7 days. Bridge-side choices: a `kp-low` is answered at most
+  once a minute per contact; the newest batch of a gen is the one kept. A `seat-check` is answered with
+  `rs` when seated.
+- **Limits and relay manners (implemented; live values UNVERIFIED).** A line is at most 20,000 UTF-16
+  code units (refused on post, dropped on read). We post events of at most 120,000 bytes (an error naming
+  the size, never truncated) and never one dated more than 900 s ahead. Catch-up reads page by `limit`
+  and `until`, at most 8 at once, re-reading a little behind the newest delivered event; the first read
+  starts at the 7-day retention floor, never unbounded. Dyad frames are planned at 36,000 bytes of
+  plaintext. The `mapping` layer cuts outbound text at `RoomCapabilities::max_message_units` (20,000 units
+  for Geb, `mapping::truncate_utf16`: char boundary, `[truncated]` marker inside the limit, never over).
+  The relay's live limits are unconfirmed (see "Round 4 answers").
+- **Room plaintext kinds (implemented).** A newer interop-announcement kind `{t:"wp", ...}` may arrive
+  inside a share and older builds drop it. We drop every unknown `t` (and a reaction) without effect, halt
+  or any log above debug (`codec::is_not_a_line`); a batch share is never opened by the bridge.
+- **Direct rooms (implemented, OPEN at link time).** A bridge cannot sit in a direct room: Geb's commit
+  check refuses an … persons. A Welcome into one is refused
+  before the group is stored (`Error::Refused`, the link halts; `declares_direct` reads the policy JSON
+  raw). `link add` is config-only and contacts nothing, so it cannot detect this beforehand. The leaf the
+  adder made for us stays in that room (leaving is not built).
+- **Persona cards, heal, leave, `rs`, `seat-ask` (implemented as a follower).** A persona card is needed
+  only with two or more devices per person. A heal is path-only and bound leaves need no card. A new
+  device DID is a new member; a wiped store sends a `seat-ask` with a fresh bound package. Silence never
+  commits.
+
+### Open items (recorded, not built)
+
+- `fc` fragments (large-room joins fail; see Capabilities).
+- A proper `rs` status body `s:{e, a, chain, ...}`, `rc`, `seat-ask`, and
+  accepting a re-seat Welcome (P1). Until then our `rs` is the minimal
+  `{k:"g", op:"rs", room:{id}}`.
+- Re-stocking a SEATED member every 7 days (re-seat needs it; there is no natural
+  place until the dyad is driven while seated; we do read it every 30 s while
+  seated for `kp-low` / `seat-check`).
+- A `link add` check for direct rooms (needs a network read).
+- An oversize outbox entry (cannot come out of the mapping layer, which cuts at
+  20,000 bytes) would be retried every tick, not dropped.
+- Leave, persona-card intake, fork choice.
+
+### UNVERIFIED points that still stand
+
+The seven round-2 follow-ups under "Open questions for Geb" are all still open;
+round 3 narrows only the first (Geb pins 0.8.2 as stated; whether it carries a
+`[patch]` is still unanswered). Added by round 3:
+
+- **`rs` for `seat-check`:** our `rs` has no status body, which Geb's
+  `cleanStatus` requires, so it most likely does NOT satisfy a seat-check
+  (nothing worse follows: silence never commits). `geb/mls/client.rs`.
+- **`kp-low` / `seat-check` frames:** field types are read from the answers
+  (`gen`, `n` integers; `e` an epoch integer), not from a vector.
+- **`fc:0` in `cap`:** Geb reads `fc` only when exactly `1`; `0` is "stated, not
+  fragments". The effect on large Welcomes is as Geb describes, unobserved.
+- **Event and line limits:** 120,000 / 20,000 come from the answers; whether
+  the live relay (256 KB claim vs 131,072 in the repo copy) still takes 131,072
+  is unconfirmed.

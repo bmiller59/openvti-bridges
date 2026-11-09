@@ -15,6 +15,15 @@ run against a live relay, Geb node or VTA. Geb's path B has no versioned specifi
 details not settled by Geb's answers are marked `// UNVERIFIED:` in the source. Tests
 prove self-consistency and the vendored Geb vectors, not byte-compatibility with real Geb.
 
+Geb's round 3 answers (2026-11-09, read at `fdf804d`) are recorded in `CLAUDE.md`
+("Round 3 answers"): OpenMLS is stock 0.8.2 on Geb's side and has never run against
+another version; `latest.json` and `releases.json` are readable but `wire: 2` is NOT a
+compatibility signal; Geb's "Not decided yet" list is copied there. Known limitations:
+we say `fc:0`, so a Welcome too large for one 120,000-byte event never reaches us and
+large-room joins fail (fragments are not built); bridges cannot sit in direct rooms (a
+Welcome into one is refused at join time, `link add` cannot see it). Nothing is verified
+against live Geb.
+
 Read `CLAUDE.md` for the boundary rules and `docs/` for the plan and companion notes
 (threat model, decisions, open questions for Geb). Those documents were written inside the
 VTI repository and mean that repository when they say "the workspace".
@@ -90,7 +99,8 @@ All of these need a person or Geb; none has been done.
 4. Real-VTA end-to-end on the sealed tier with an MLS group; wss/TLS soak; compatibility
    soak against the Geb CLI on a test relay.
 5. Choose a `vti-secrets` backend (plaintext is dev-only).
-6. Not built: leave, re-seat after a fork, `fc` fragments, a peer index, repair of a sealed
+6. Not built: leave, re-seat after a fork, `fc` fragments (large-room joins fail), the `rs`
+   status body, `seat-ask`, persona-card intake, a peer index, repair of a sealed
    record left at the wrong version.
 7. Record in the VTI specification's divergence register (Appendix F): `room-host` answers
    a refused create-only put as a bare `taskFailed`, where the specification names

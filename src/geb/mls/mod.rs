@@ -37,7 +37,12 @@
 //!   everything a PrivateMessage, applies; a PublicMessage is refused.)
 //! - The OpenMLS 0.9 defaults for the capability lists other than extensions
 //!   (answer 7 says to check them against our stack).
-//! - The `{k:"g", op:"rs"}` body (we send `room:{id}`) and its reply.
+//! - The `{k:"g", op:"rs"}` body (we send `room:{id}` and no status body `s`,
+//!   which Geb's `cleanStatus` requires: it most likely does not satisfy a
+//!   `seat-check`) and its reply.
+//! - `kp-low {gen, n}` and `seat-check {room, e}` field types (read from the
+//!   answers, no vector); our own choice of one `kp-low` answer a minute per
+//!   contact.
 //! - Settle window start: local first sight of the epoch's earliest commit.
 //! - A commit made from an epoch below ours is ignored; one made from an
 //!   epoch ahead of ours is held, never tested.

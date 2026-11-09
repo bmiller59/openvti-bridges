@@ -132,7 +132,7 @@ Recommend one `G_b` and one `P_b` per link (a shared identity correlates every r
 3. Map to a Geb line `{t:"l", at, text, re?, sg}`: `text` = quoted header naming the VTC author's persona DID, then
    title and body, truncated to 20,000 chars; `sg` = `G_b` sign_json over `{v:1, room, author:G_b, body}`.
 4. Seal as an MLS application message in the current Geb epoch, wrap `{t:"ml"}`, seal with the epoch relay AEAD key,
-   post as kind 4177, event <= 65,536 bytes.
+   post as kind 4177, event <= 120,000 bytes (round 3; it was 65,536).
 5. A new version of a record posts a new line with `re` pointing at the earlier line. A retraction posts a notice line
    (Geb has no visible edit/delete).
 
