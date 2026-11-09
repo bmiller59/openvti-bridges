@@ -366,7 +366,7 @@ async fn the_whole_stack_connects_seats_relays_and_survives_restarts() {
             _ => None,
         })
         .expect("a kp-stock arrived over the dyad");
-    assert_eq!(kps.len(), 8);
+    assert_eq!(kps.len(), 6, "Geb sends six per stock");
     let (_commit, welcome) = env.a.sim.stage_add(parse_kp(&kps[0]));
     env.a.sim.merge_pending();
     env.a

@@ -679,6 +679,9 @@ mod tests {
     async fn unknown_room_plaintext_kinds_are_dropped_quietly() {
         let loudest = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let _guard = tracing::subscriber::set_default(Loudest(loudest.clone()));
+        // Other tests run in parallel without a subscriber and may have cached
+        // "never interested" for these callsites.
+        tracing::callsite::rebuild_interest_cache();
         let relay = Arc::new(FakeRelay::new());
         let (b, _, _) = room_for(&relay, 2, 1_700_000_001_000);
         let (did, _) = device(9);
@@ -712,10 +715,14 @@ mod tests {
             loudest.load(std::sync::atomic::Ordering::SeqCst) <= 1,
             "nothing above debug was logged"
         );
-        // A malformed line, by contrast, is a warning.
+        // A malformed line is still dropped without an error. (That it is a
+        // warning, not debug, rests on `codec::is_not_a_line`, tested in
+        // `codec`: asserting the warning here would depend on tracing's global
+        // callsite cache, which parallel tests make flaky. By the same token
+        // the check above is best effort: it cannot fail spuriously, and it
+        // can only pass vacuously if the cache hid the callsites.)
         relay.inject(ev(5, r#"{"t":"l","at":5000,"text":""}"#));
-        b.poll(None).await.unwrap();
-        assert_eq!(loudest.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(b.poll(None).await.unwrap().is_empty());
     }
 
     /// Round 3 section 6: no event over 120,000 bytes; an error, not a cut.

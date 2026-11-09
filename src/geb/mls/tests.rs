@@ -1881,7 +1881,7 @@ async fn private_keys_are_kept_for_the_newest_two_gens_and_the_last_hour_only() 
     w.advance(KP_LOW_MIN_INTERVAL_MS);
     w.room.join().await.unwrap();
     let g6 = w.stock().1;
-    for k in [&g4, &g5, &g6] {
+    for k in [g4, &g5, &g6] {
         assert!(
             w.client.holds_key_package(&k[0]),
             "g4 is the third newest but was minted within the hour"
