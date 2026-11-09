@@ -28,6 +28,13 @@
 //!   of starting over, and callers re-read from the newest event they have
 //!   delivered minus 300 s (`since`). An event whose `created_at` is more than
 //!   900 s in the future is refused locally (the relay refuses it too).
+//! - Every `REQ` we open is closed on every exit path: after its `EOSE`, when
+//!   its fetch passes its deadline (a relay keeps a subscription until it is
+//!   closed, and allows only 20, or 200 since 2026-11-04 per Geb's record,
+//!   per connection), and for any `EOSE` or `EVENT` naming a subscription no
+//!   operation of ours owns. A read that stops at [`MAX_FETCH_EVENTS`] says so
+//!   ([`FetchPage::more_until`]) and [`GebRelay::fetch`] reads on with `until`;
+//!   it returns an error, never a partial result, past [`MAX_FETCH_PAGES`].
 //! - Health is read from the live socket ([`NostrRelay::is_connected`]); there
 //!   is no flag set once and left set.
 //!
@@ -50,8 +57,26 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 /// Relay socket cap (Geb's relay accepts frames up to this size).
 pub const MAX_MESSAGE_BYTES: usize = 262_144;
-/// Most events one fetch will collect before it stops reading.
+/// Most events one [`NostrRelay::fetch_page`] will collect before it stops
+/// reading and reports [`FetchPage::more_until`].
 pub const MAX_FETCH_EVENTS: usize = 5_000;
+/// Most pages [`GebRelay::fetch`] chains (each up to [`MAX_FETCH_EVENTS`])
+/// before it gives up with an error rather than return a partial result. The
+/// caller's `since` cursor is then still where it was, so nothing is lost; a
+/// backlog this size needs an operator, not a silent cut.
+pub const MAX_FETCH_PAGES: usize = 20;
+
+/// One page of a catch-up read and whether the relay may hold more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchPage {
+    /// The events collected (verified, deduplicated by id).
+    pub events: Vec<RelayEvent>,
+    /// `Some(until)` when the read stopped at [`MAX_FETCH_EVENTS`] and older
+    /// events (down to `since`) may remain: read again with this `until`
+    /// (inclusive, so an event sharing the second is not skipped; deduplicate
+    /// by id). `None`: the window is complete.
+    pub more_until: Option<u64>,
+}
 /// Catch-up page size: `limit` of every `REQ` (Geb's client page size, round 3
 /// section 7; the relay's own cap is 500).
 pub const CATCHUP_PAGE: usize = 200;
@@ -127,7 +152,8 @@ enum Cmd {
         kind: u32,
         author: String,
         since: Option<u64>,
-        reply: oneshot::Sender<Result<Vec<RelayEvent>>>,
+        until: Option<u64>,
+        reply: oneshot::Sender<Result<FetchPage>>,
     },
 }
 
@@ -155,7 +181,7 @@ enum Op {
         page_oldest: Option<u64>,
         events: Vec<RelayEvent>,
         seen: HashSet<String>,
-        reply: oneshot::Sender<Result<Vec<RelayEvent>>>,
+        reply: oneshot::Sender<Result<FetchPage>>,
         deadline: Instant,
     },
 }
@@ -240,13 +266,71 @@ impl GebRelay for NostrRelay {
         wait(rx, self.cfg.op_timeout).await
     }
 
+    /// A catch-up read of the whole window. When one read stops at
+    /// [`MAX_FETCH_EVENTS`] this reads again with `until` (the relay-manners
+    /// paging: `limit` 200 per `REQ`, at most 8 open) and merges by id, up to
+    /// [`MAX_FETCH_PAGES`] reads. It never returns a truncated result as if it
+    /// were complete: past the page bound, or when `until` cannot move, it is
+    /// an error and the caller keeps its cursor.
     async fn fetch(&self, kind: u32, author: &str, since: Option<u64>) -> Result<Vec<RelayEvent>> {
+        let mut all: Vec<RelayEvent> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut until: Option<u64> = None;
+        for _ in 0..MAX_FETCH_PAGES {
+            let page = self.fetch_page(kind, author, since, until).await?;
+            let fresh = page
+                .events
+                .into_iter()
+                .filter(|e| seen.insert(e.id.clone()))
+                .count_into(&mut all);
+            match page.more_until {
+                None => return Ok(all),
+                Some(next) => {
+                    if until == Some(next) && fresh == 0 {
+                        return Err(Error::Foreign(
+                            "the relay holds more events than one read returns and the read \
+                             cannot move past them; not returning a partial result"
+                                .into(),
+                        ));
+                    }
+                    until = Some(next);
+                }
+            }
+        }
+        Err(Error::Foreign(format!(
+            "more than {MAX_FETCH_PAGES} pages of {MAX_FETCH_EVENTS} events are waiting on the \
+             relay; not returning a partial result (the read cursor is unchanged)"
+        )))
+    }
+}
+
+/// Collect an iterator into a vector and return how many items it added.
+trait CountInto<T>: Iterator<Item = T> + Sized {
+    fn count_into(self, out: &mut Vec<T>) -> usize {
+        let before = out.len();
+        out.extend(self);
+        out.len() - before
+    }
+}
+impl<T, I: Iterator<Item = T>> CountInto<T> for I {}
+
+impl NostrRelay {
+    /// One bounded read: at most [`MAX_FETCH_EVENTS`] events, paged inside
+    /// with `limit` 200. [`FetchPage::more_until`] says whether to read again.
+    pub async fn fetch_page(
+        &self,
+        kind: u32,
+        author: &str,
+        since: Option<u64>,
+        until: Option<u64>,
+    ) -> Result<FetchPage> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Cmd::Fetch {
                 kind,
                 author: author.to_string(),
                 since,
+                until,
                 reply,
             })
             .await
@@ -282,12 +366,13 @@ fn into_op(cmd: Cmd, op_timeout: Duration) -> Op {
             kind,
             author,
             since,
+            until,
             reply,
         } => Op::Fetch {
             kind,
             author,
             since,
-            until: None,
+            until,
             sub: new_sub(),
             active: false,
             page_total: 0,
@@ -301,17 +386,40 @@ fn into_op(cmd: Cmd, op_timeout: Duration) -> Op {
     }
 }
 
-fn expire(ops: &mut Vec<Op>) {
+/// Fail the operations past their deadline. Returns the subscription ids of
+/// the expired fetches whose `REQ` is open on the live socket: the caller
+/// sends `CLOSE` for each (a relay keeps a subscription until it is closed,
+/// and allows only a few per connection).
+fn expire(ops: &mut Vec<Op>) -> Vec<String> {
     let now = Instant::now();
     let mut keep = Vec::with_capacity(ops.len());
+    let mut to_close = Vec::new();
     for op in ops.drain(..) {
         if op.deadline() <= now {
+            if let Op::Fetch {
+                sub, active: true, ..
+            } = &op
+            {
+                to_close.push(sub.clone());
+            }
             op.fail("relay did not answer before the deadline");
         } else {
             keep.push(op);
         }
     }
     *ops = keep;
+    to_close
+}
+
+/// Send `CLOSE` for each subscription. A send failure means the socket is
+/// gone, which closes every subscription on it anyway.
+async fn close_subs(ws: &mut Ws, subs: &[String]) -> std::result::Result<(), ()> {
+    for sub in subs {
+        ws.send(Message::Text(json!(["CLOSE", sub]).to_string().into()))
+            .await
+            .map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 type Ws =
@@ -366,7 +474,7 @@ async fn owner(
         // Back off, still accepting and expiring operations meanwhile.
         let until = Instant::now() + backoff_delay(&cfg, attempt);
         loop {
-            expire(&mut ops);
+            let _ = expire(&mut ops);
             let tick = until.min(Instant::now() + Duration::from_millis(250));
             tokio::select! {
                 c = rx.recv() => match c {
@@ -379,7 +487,7 @@ async fn owner(
                 break;
             }
         }
-        expire(&mut ops);
+        let _ = expire(&mut ops);
     }
 }
 
@@ -461,8 +569,12 @@ async fn session(
     if flush(&mut ws, ops).await.is_err() {
         return Session::Lost(worked);
     }
+    let mut stale: HashSet<String> = HashSet::new();
     loop {
-        expire(ops);
+        let expired = expire(ops);
+        if close_subs(&mut ws, &expired).await.is_err() {
+            return Session::Lost(worked);
+        }
         let tick = tokio::time::Instant::now() + Duration::from_millis(250);
         tokio::select! {
             c = rx.recv() => {
@@ -474,7 +586,7 @@ async fn session(
                 let Some(Ok(msg)) = m else { return Session::Lost(worked) };
                 match msg {
                     Message::Text(t) => {
-                        if handle(&mut ws, ops, t.as_str()).await.is_err() {
+                        if handle(&mut ws, ops, &mut stale, t.as_str()).await.is_err() {
                             return Session::Lost(worked);
                         }
                         worked = true;
@@ -492,7 +604,32 @@ async fn session(
     }
 }
 
-async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Result<(), ()> {
+/// Most unknown subscription ids remembered as already closed.
+const STALE_SUBS_KEPT: usize = 256;
+
+/// `CLOSE` a subscription no operation of ours owns (a timed-out one whose
+/// `CLOSE` was lost, an id left from before a reconnect), once per id, so
+/// nothing we opened stays open on the relay.
+async fn close_stale(
+    ws: &mut Ws,
+    stale: &mut HashSet<String>,
+    sub: &str,
+) -> std::result::Result<(), ()> {
+    if stale.len() >= STALE_SUBS_KEPT {
+        stale.clear();
+    }
+    if stale.insert(sub.to_string()) {
+        close_subs(ws, &[sub.to_string()]).await?;
+    }
+    Ok(())
+}
+
+async fn handle(
+    ws: &mut Ws,
+    ops: &mut Vec<Op>,
+    stale: &mut HashSet<String>,
+    text: &str,
+) -> std::result::Result<(), ()> {
     let Ok(Value::Array(msg)) = serde_json::from_str::<Value>(text) else {
         tracing::warn!("ignoring a relay message that is not a JSON array");
         return Ok(());
@@ -503,6 +640,7 @@ async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Resu
             let (Some(sub), Some(ev)) = (msg.get(1).and_then(Value::as_str), msg.get(2)) else {
                 return Ok(());
             };
+            let mut matched = false;
             for op in ops.iter_mut() {
                 if let Op::Fetch {
                     kind,
@@ -520,6 +658,7 @@ async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Resu
                 } = op
                     && s == sub
                 {
+                    matched = true;
                     if events.len() >= MAX_FETCH_EVENTS {
                         break;
                     }
@@ -546,6 +685,9 @@ async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Resu
                     }
                 }
             }
+            if !matched {
+                close_stale(ws, stale, sub).await?;
+            }
         }
         "EOSE" => {
             let Some(sub) = msg.get(1).and_then(Value::as_str) else {
@@ -555,7 +697,8 @@ async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Resu
                 .iter()
                 .position(|o| matches!(o, Op::Fetch { sub: s, active: true, .. } if s == sub))
             else {
-                return Ok(());
+                // An EOSE for a subscription we hold no operation for: close it.
+                return close_stale(ws, stale, sub).await;
             };
             let _ = ws
                 .send(Message::Text(json!(["CLOSE", sub]).to_string().into()))
@@ -586,13 +729,32 @@ async fn handle(ws: &mut Ws, ops: &mut Vec<Op>, text: &str) -> std::result::Resu
                         *deadline = Instant::now() + Duration::from_secs(20);
                         true
                     } else {
+                        // Stopped by the event cap rather than by running out
+                        // of events: say there may be more (never `Ok` as if
+                        // complete). `until` is where the next read starts.
+                        *until = page_oldest.filter(|o| {
+                            events.len() >= MAX_FETCH_EVENTS && since.is_none_or(|s| *o > s)
+                        });
                         false
                     }
                 }
                 Op::Publish { .. } => false,
             };
-            if !more && let Op::Fetch { events, reply, .. } = ops.remove(i) {
-                let _ = reply.send(Ok(events));
+            if !more
+                && let Op::Fetch {
+                    events,
+                    until,
+                    reply,
+                    ..
+                } = ops.remove(i)
+            {
+                // `until` now holds the next read's start when the cap cut
+                // this one short, `None` when the window is complete.
+                let capped = events.len() >= MAX_FETCH_EVENTS;
+                let _ = reply.send(Ok(FetchPage {
+                    events,
+                    more_until: if capped { until } else { None },
+                }));
             }
             // A slot is free (or a next page is due): send what is waiting.
             return flush(ws, ops).await;

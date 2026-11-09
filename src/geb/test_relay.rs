@@ -32,6 +32,14 @@ struct Shared {
     reqs: Mutex<Vec<Value>>,
     max_open: AtomicU64,
     eose_delay_ms: AtomicU64,
+    /// Every subscription id a client sent `CLOSE` for, in order.
+    closes: Mutex<Vec<String>>,
+    /// Subscriptions open right now across all connections.
+    open_total: AtomicU64,
+    /// Answer a `REQ` with its events but never an `EOSE`.
+    withhold_eose: AtomicBool,
+    /// Also send an `EOSE` for a subscription nobody opened.
+    stray_eose: AtomicBool,
 }
 
 /// The relay. Dropping it stops the listener.
@@ -69,6 +77,10 @@ impl TestRelay {
             reqs: Mutex::new(Vec::new()),
             max_open: AtomicU64::new(0),
             eose_delay_ms: AtomicU64::new(0),
+            closes: Mutex::new(Vec::new()),
+            open_total: AtomicU64::new(0),
+            withhold_eose: AtomicBool::new(false),
+            stray_eose: AtomicBool::new(false),
         });
         let sh = shared.clone();
         let task = tokio::spawn(async move {
@@ -117,6 +129,32 @@ impl TestRelay {
     /// `REQ` opens one, a `CLOSE` ends it).
     pub fn max_open_subscriptions(&self) -> u64 {
         self.shared.max_open.load(Ordering::SeqCst)
+    }
+
+    /// Every subscription id a client closed (`CLOSE`), in order.
+    pub fn closes_seen(&self) -> Vec<String> {
+        self.shared
+            .closes
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Subscriptions open right now, across all connections (a `REQ` opens
+    /// one; a `CLOSE` or a dropped connection ends it).
+    pub fn open_subscriptions(&self) -> u64 {
+        self.shared.open_total.load(Ordering::SeqCst)
+    }
+
+    /// Answer every `REQ` with its events but no `EOSE`, as a hung relay does.
+    pub fn set_withhold_eose(&self, on: bool) {
+        self.shared.withhold_eose.store(on, Ordering::SeqCst);
+    }
+
+    /// Answer every `REQ` also with an `EOSE` for a subscription id nobody
+    /// opened.
+    pub fn set_stray_eose(&self, on: bool) {
+        self.shared.stray_eose.store(on, Ordering::SeqCst);
     }
 
     /// Delay every `EOSE` by this many milliseconds, so concurrent requests
@@ -182,6 +220,21 @@ fn matches(f: &Value, e: &RelayEvent) -> bool {
     true
 }
 
+/// A connection's open subscriptions; dropping it (the connection ended)
+/// closes them in the relay-wide count.
+struct Open {
+    set: std::collections::HashSet<String>,
+    sh: Arc<Shared>,
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.sh
+            .open_total
+            .fetch_sub(self.set.len() as u64, Ordering::SeqCst);
+    }
+}
+
 async fn serve(stream: tokio::net::TcpStream, sh: Arc<Shared>) {
     let cfg = WebSocketConfig::default()
         .max_message_size(Some(super::nostr::MAX_MESSAGE_BYTES))
@@ -190,7 +243,10 @@ async fn serve(stream: tokio::net::TcpStream, sh: Arc<Shared>) {
         return;
     };
     let mut gen_rx = sh.generation.subscribe();
-    let mut open: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut open = Open {
+        set: std::collections::HashSet::new(),
+        sh: sh.clone(),
+    };
     loop {
         tokio::select! {
             _ = gen_rx.changed() => return, // drop the socket without a close frame
@@ -210,9 +266,11 @@ async fn serve(stream: tokio::net::TcpStream, sh: Arc<Shared>) {
                         vec![ok]
                     }
                     Some("REQ") => {
-                        if let Some(sub) = msg.get(1).and_then(Value::as_str) {
-                            open.insert(sub.to_string());
-                            sh.max_open.fetch_max(open.len() as u64, Ordering::SeqCst);
+                        if let Some(sub) = msg.get(1).and_then(Value::as_str)
+                            && open.set.insert(sub.to_string())
+                        {
+                            sh.open_total.fetch_add(1, Ordering::SeqCst);
+                            sh.max_open.fetch_max(open.set.len() as u64, Ordering::SeqCst);
                         }
                         if let (Ok(mut r), Some(f)) = (sh.reqs.lock(), msg.get(2)) {
                             r.push(f.clone());
@@ -225,7 +283,12 @@ async fn serve(stream: tokio::net::TcpStream, sh: Arc<Shared>) {
                     }
                     Some("CLOSE") => {
                         if let Some(sub) = msg.get(1).and_then(Value::as_str) {
-                            open.remove(sub);
+                            if open.set.remove(sub) {
+                                sh.open_total.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            if let Ok(mut c) = sh.closes.lock() {
+                                c.push(sub.to_string());
+                            }
                         }
                         vec![]
                     }
@@ -311,6 +374,11 @@ fn on_req(sh: &Shared, msg: &[Value]) -> Vec<Value> {
             out.push(json!(["EVENT", sub, e.to_json()]));
         }
     }
-    out.push(json!(["EOSE", sub]));
+    if sh.stray_eose.load(Ordering::SeqCst) {
+        out.push(json!(["EOSE", format!("stray-{sub}")]));
+    }
+    if !sh.withhold_eose.load(Ordering::SeqCst) {
+        out.push(json!(["EOSE", sub]));
+    }
     out
 }

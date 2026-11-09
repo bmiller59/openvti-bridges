@@ -434,3 +434,111 @@ async fn posting_stops_at_120_000_bytes_without_truncating() {
     assert!(e.contains("120000") && e.contains("not truncated"), "{e}");
     assert_eq!(relay.events().len(), 1);
 }
+
+// ---- P1-9: CLOSE on every exit path, and no silent truncation ----------------
+
+async fn eventually(mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..100 {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f()
+}
+
+#[tokio::test]
+async fn a_fetch_that_times_out_closes_its_subscription() {
+    let now = Arc::new(AtomicU64::new(T0 + 10_000));
+    let relay = TestRelay::start(now).await.unwrap();
+    relay.set_withhold_eose(true);
+    let mut c = cfg(&relay.url());
+    c.op_timeout = Duration::from_millis(600);
+    let client = NostrRelay::new(c).unwrap();
+    let err = client
+        .fetch(KIND_MAILBOX, &author(), Some(T0 - 300))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("deadline") || err.to_string().contains("answer"));
+    assert!(
+        eventually(|| relay.open_subscriptions() == 0).await,
+        "the timed-out REQ was left open: {} open, closes {:?}",
+        relay.open_subscriptions(),
+        relay.closes_seen()
+    );
+    assert_eq!(relay.closes_seen().len(), 1);
+}
+
+#[tokio::test]
+async fn an_eose_for_an_unknown_subscription_is_answered_with_close() {
+    let now = Arc::new(AtomicU64::new(T0 + 10_000));
+    let relay = TestRelay::start(now).await.unwrap();
+    relay.set_stray_eose(true);
+    relay.inject_unchecked(event_at(T0, "x"));
+    let client = NostrRelay::new(cfg(&relay.url())).unwrap();
+    let got = client
+        .fetch(KIND_MAILBOX, &author(), Some(T0 - 300))
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert!(
+        eventually(|| relay.closes_seen().iter().any(|s| s.starts_with("stray-"))).await,
+        "{:?}",
+        relay.closes_seen()
+    );
+}
+
+#[tokio::test]
+async fn more_than_5000_events_are_paged_with_until_not_silently_cut() {
+    let now = Arc::new(AtomicU64::new(T0 + 100_000));
+    let relay = TestRelay::start(now).await.unwrap();
+    let total = 5_300u64;
+    for i in 0..total {
+        relay.inject_unchecked(event_at(T0 + i, &format!("e{i}")));
+    }
+    let client = NostrRelay::new(cfg(&relay.url())).unwrap();
+    let got = client
+        .fetch(KIND_MAILBOX, &author(), Some(T0 - 300))
+        .await
+        .unwrap();
+    assert_eq!(got.len() as u64, total, "every event, none lost");
+    let ids: std::collections::HashSet<_> = got.iter().map(|e| e.id.clone()).collect();
+    assert_eq!(ids.len() as u64, total, "once each");
+    // The oldest are there: the cut used to drop them.
+    assert!(got.iter().any(|e| e.created_at == T0));
+    // Every REQ kept the relay manners: limit 200, never from zero.
+    for r in relay.req_filters() {
+        assert_eq!(r["limit"], 200);
+        assert_eq!(r["since"], T0 - 300);
+    }
+    assert!(relay.max_open_subscriptions() <= 8);
+    assert!(eventually(|| relay.open_subscriptions() == 0).await);
+}
+
+#[tokio::test]
+async fn one_read_reports_that_more_is_available() {
+    let now = Arc::new(AtomicU64::new(T0 + 100_000));
+    let relay = TestRelay::start(now).await.unwrap();
+    for i in 0..5_300u64 {
+        relay.inject_unchecked(event_at(T0 + i, &format!("e{i}")));
+    }
+    let client = NostrRelay::new(cfg(&relay.url())).unwrap();
+    let page = client
+        .fetch_page(KIND_MAILBOX, &author(), Some(T0 - 300), None)
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 5_000);
+    let until = page.more_until.expect("the read says there is more");
+    let rest = client
+        .fetch_page(KIND_MAILBOX, &author(), Some(T0 - 300), Some(until))
+        .await
+        .unwrap();
+    assert_eq!(rest.more_until, None, "the window is complete");
+    let all: std::collections::HashSet<_> = page
+        .events
+        .iter()
+        .chain(&rest.events)
+        .map(|e| e.id.clone())
+        .collect();
+    assert_eq!(all.len(), 5_300);
+}
