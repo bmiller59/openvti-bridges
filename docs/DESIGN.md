@@ -570,7 +570,6 @@ context = "geb-bridge"            # default
 
 [geb]
 relay_url = "wss://nostr.myceli.al"   # default
-settle_ms = 3000                  # parsed and validated, but not read by the bridge (see below)
 deny_list = []                    # device DIDs of other bridges whose lines are never bridged
 
 [secrets]                         # the vti-secrets table; no seed, no config_seed
@@ -597,9 +596,9 @@ retract = "[retracted: earlier post {target}]"
 ```
 
 Per-link state lives under `<data_dir>/links/<link id>/`: `store/` (fjall), `mls-state.enc`,
-`mls-sigkey.enc`. The config load reads one file and contacts nothing. Note: `[geb] settle_ms` is
-accepted but no code outside `config.rs` reads it; the settle window comes from the room's own
-`0xF001` policy (`geb/mls/client.rs`). Treat the key as inert.
+`mls-sigkey.enc`. The config load reads one file and contacts nothing. Note: there is no
+`[geb] settle_ms`; a config that names it is rejected (the error says so). The settle window comes
+from the room's own `0xF001` policy (`geb/mls/client.rs`).
 
 ## 10. Testing
 

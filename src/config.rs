@@ -95,9 +95,6 @@ pub struct GebConfig {
     /// Relay URL.
     #[serde(default = "default_relay")]
     pub relay_url: String,
-    /// Commit settle window in ms.
-    #[serde(default = "default_settle_ms")]
-    pub settle_ms: u64,
     /// Device DIDs of other bridges whose lines are never bridged.
     #[serde(default)]
     pub deny_list: Vec<String>,
@@ -107,7 +104,6 @@ impl Default for GebConfig {
     fn default() -> Self {
         Self {
             relay_url: default_relay(),
-            settle_ms: default_settle_ms(),
             deny_list: Vec::new(),
         }
     }
@@ -115,9 +111,6 @@ impl Default for GebConfig {
 
 fn default_relay() -> String {
     "wss://nostr.myceli.al".into()
-}
-fn default_settle_ms() -> u64 {
-    3000
 }
 
 /// The `[vta]` table.
@@ -205,7 +198,20 @@ impl Config {
 
     /// Parse and validate.
     pub fn from_toml(s: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(s).map_err(|e| Error::Config(e.to_string()))?;
+        let cfg: Config = toml::from_str(s).map_err(|e| {
+            let msg = e.to_string();
+            // `settle_ms` used to be accepted and was never read: the settle
+            // window is the room's own (`0xF001` policy, `settleWindowMs`).
+            // Name the key and say where the value really comes from.
+            if msg.contains("settle_ms") {
+                Error::Config(format!(
+                    "{msg}\n[geb] settle_ms is no longer a setting: the commit settle window is \
+                     taken from the room's own 0xF001 policy (settleWindowMs); remove the key"
+                ))
+            } else {
+                Error::Config(msg)
+            }
+        })?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -280,9 +286,6 @@ impl Config {
                     .into(),
             ));
         }
-        if self.geb.settle_ms == 0 {
-            return Err(Error::Config("geb.settle_ms must be positive".into()));
-        }
         Ok(())
     }
 }
@@ -311,7 +314,6 @@ tier_optin = true
         assert_eq!(c.links[0].directions, Directions::Both);
         assert_eq!(c.links[0].poll_secs, 10);
         assert!(!c.links[0].enabled);
-        assert_eq!(c.geb.settle_ms, 3000);
         assert_eq!(c.geb.relay_url, "wss://nostr.myceli.al");
         assert_eq!(c.vta.context, "geb-bridge");
     }
@@ -322,6 +324,16 @@ tier_optin = true
         assert!(Config::from_toml(&bad).is_err());
         let bad = BASE.replace("tier = \"open\"", "tier = \"open\"\nextra = 1");
         assert!(Config::from_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn settle_ms_is_rejected_and_the_error_says_where_the_window_comes_from() {
+        let bad = format!("{BASE}\n[geb]\nsettle_ms = 3000\n");
+        let e = Config::from_toml(&bad).unwrap_err().to_string();
+        assert!(
+            e.contains("settle_ms") && e.contains("room's own 0xF001 policy"),
+            "{e}"
+        );
     }
 
     #[test]

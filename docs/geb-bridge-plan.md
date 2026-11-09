@@ -203,7 +203,7 @@ it; same author and hash means done.
 
 - Two-phase setup like vti-witness: `vti-geb-bridge setup --setup-key-out`, a pnm or keyring grant, then `setup --from`.
 - `[[links]]`: `vtc_room`, `host_did`, `persona`, `geb_room_id`, `directions`, `tier_optin`, `poll_secs`.
-- `[geb]`: relay URL (default `wss://nostr.myceli.al`), `settle_ms`, deny-list of other bridges' device DIDs.
+- `[geb]`: relay URL (default `wss://nostr.myceli.al`), deny-list of other bridges' device DIDs.
 - Keys only in `[secrets]`.
 - CLI: `link add|list|pause`, `geb connect <did>`, `geb stock-kps`, `status` (cursors, outbox depth, last relayed).
 - Kill switch: pausing a link stops both pumps; removing the ACL entry revokes room access.
