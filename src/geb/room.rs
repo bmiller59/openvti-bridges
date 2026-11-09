@@ -928,7 +928,7 @@ mod tests {
             bridged[0]
                 .event
                 .text
-                .starts_with("> did:alice wrote:\nPlan\n\nship it")
+                .starts_with("did:alice wrote:\n> Plan\n>\n> ship it")
         );
         // Nothing echoes on the next tick.
         let r2 = pump.tick().await.unwrap();

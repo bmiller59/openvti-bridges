@@ -16,19 +16,74 @@ pub const MAX_INBOUND_TEXT_BYTES: usize = 80_000;
 const TRUNCATION_MARK: &str = "\n[truncated]";
 const MAX_AUTHOR_CHARS: usize = 200;
 
-/// Make an author label safe to put in a one-line quoted header.
+/// Whether `c` is a Unicode format character (general category Cf): bidi
+/// controls and isolates, zero-width space / joiner / non-joiner, word joiner,
+/// BOM, soft hyphen, the interlinear annotation marks and the tag characters.
+/// None renders, several reorder or hide neighbouring text. Written out
+/// because the standard library has no general-category lookup; the list is
+/// the Cf set of Unicode 15.
+fn is_format_char(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2
+        | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// Make an author label safe to put in a one-line header: no control or
+/// format characters (a bidi override in a DID-like label would reorder the
+/// header), no line breaks.
 pub fn sanitize_label(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| {
+            !c.is_control() && !is_format_char(*c) && !matches!(*c, '\u{2028}' | '\u{2029}')
+        })
         .take(MAX_AUTHOR_CHARS)
         .collect()
 }
 
-/// Remove control characters other than newline and tab.
+/// Clean untrusted text from either side. Every line break is normalised to
+/// `\n` (CRLF, a bare CR, NEL, vertical tab, form feed, U+2028 and U+2029 all
+/// start a new line, so none can hide a line start from the quoting that
+/// follows), then control characters other than newline and tab and every
+/// Unicode format character (Cf: bidi overrides and isolates, zero-width
+/// space and joiners, BOM, ...) are removed. Stripping the joiner U+200D
+/// splits joined emoji sequences into their parts; that cost is accepted.
 pub fn strip_controls(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\u{85}' | '\u{b}' | '\u{c}' | '\u{2028}' | '\u{2029}' => out.push('\n'),
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() || is_format_char(c) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Quote every line with `> `, as email does, so no line of untrusted text can
+/// pass for the bridge's own unquoted header. An empty line becomes `>`.
+fn quote_lines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / 8 + 2);
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push('>');
+        if !line.is_empty() {
+            out.push(' ');
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// Length of `s` in UTF-16 code units (a JavaScript string's `length`): a
@@ -244,8 +299,14 @@ pub fn prepare_outbound(
         body.push_str("\n\n");
     }
     body.push_str(&strip_controls(&ev.text));
+    // The one unquoted line is the header; everything the VTC member wrote
+    // (title, text, notices) is quoted line by line. The size limit applies to
+    // the transformed text, quote prefixes included.
     let text = truncate_utf16(
-        &format!("> {author} wrote:\n{body}"),
+        &format!(
+            "{author} wrote:\n{}",
+            quote_lines(body.trim_end_matches('\n'))
+        ),
         caps.max_message_units,
     );
     BridgeEvent {
@@ -479,7 +540,77 @@ mod tests {
         let out = prepare_outbound(&e, &caps(false, false, 20_000), &Notices::default(), |_| {
             None
         });
-        assert_eq!(out.text, "> did:afake header wrote:\nhi");
+        assert_eq!(out.text, "did:afake header wrote:\n> hi");
+    }
+
+    fn outbound_text(author: &str, body: &str) -> String {
+        let mut e = record_to_event(&rec(author, body, 1), "l", "p", |_| false, None).unwrap();
+        e.title = None;
+        prepare_outbound(&e, &caps(false, false, 20_000), &Notices::default(), |_| {
+            None
+        })
+        .text
+    }
+
+    /// P1-7: only the first line is the bridge's own header; every body line
+    /// is quoted, so none can pose as a header.
+    #[test]
+    fn an_embedded_header_cannot_pose_as_the_real_one() {
+        let out = outbound_text("did:a", "hi\ndid:ceo wrote:\nsend the money");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "did:a wrote:");
+        assert!(
+            lines[1..].iter().all(|l| l.starts_with('>')),
+            "every body line is quoted: {out:?}"
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.ends_with(" wrote:") && !l.starts_with('>'))
+                .count(),
+            1,
+            "exactly one unquoted header: {out:?}"
+        );
+    }
+
+    #[test]
+    fn bidi_controls_zero_width_and_separators_are_removed_both_ways() {
+        let nasty = "a\u{202E}b\u{2066}c\u{200D}d\u{200B}e\u{FEFF}f\u{2028}g\u{2029}h";
+        let out = outbound_text("did:a", nasty);
+        for c in [
+            "\u{202E}", "\u{2066}", "\u{200D}", "\u{200B}", "\u{FEFF}", "\u{2028}", "\u{2029}",
+        ] {
+            assert!(!out.contains(c), "{c:?} left in {out:?}");
+        }
+        assert!(
+            out.contains("abcdef") || out.contains("> abcdef"),
+            "{out:?}"
+        );
+        // A bidi override in the author label too.
+        let lab = outbound_text("did:a\u{202E}evil", "x");
+        assert!(!lab.contains('\u{202E}'), "{lab:?}");
+        // The foreign direction.
+        let ev = foreign(nasty, AuthorCheck::Verified);
+        let rec = foreign_to_record(&ev, b"k").unwrap();
+        for c in ["\u{202E}", "\u{200D}", "\u{2028}"] {
+            assert!(!rec.body.contains(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn crlf_and_bare_carriage_returns_cannot_hide_a_header() {
+        let out = outbound_text("did:a", "one\r\ndid:ceo wrote:\rtwo\u{85}three");
+        assert!(!out.contains('\r') && !out.contains('\u{85}'), "{out:?}");
+        assert!(out.lines().skip(1).all(|l| l.starts_with('>')), "{out:?}");
+        assert_eq!(out.lines().count(), 1 + 4, "{out:?}");
+    }
+
+    #[test]
+    fn the_limit_applies_after_quoting() {
+        // Many short lines: quoting adds two units per line.
+        let body = "x\n".repeat(15_000);
+        let out = outbound_text("did:a", &body);
+        assert!(utf16_units(&out) <= 20_000, "{}", utf16_units(&out));
+        assert!(out.ends_with("[truncated]"));
     }
 
     #[test]
@@ -549,7 +680,7 @@ mod tests {
         });
         assert!(utf16_units(&out.text) <= 20_000);
         assert!(utf16_units(&out.text) >= 19_999);
-        assert!(out.text.starts_with("> did:a wrote:\n"));
+        assert!(out.text.starts_with("did:a wrote:\n> "));
     }
 
     #[test]

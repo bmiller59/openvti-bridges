@@ -188,16 +188,23 @@ an exporter key); the VTA opens it on read. A Geb line is a signed `{t:"l", at, 
 inside an MLS application message. `BridgeEvent` is the neutral form between them.
 
 ```
-VTC record ---> record_to_event ---> prepare_outbound ---> post (Geb line "> author wrote:\n...")
+VTC record ---> record_to_event ---> prepare_outbound ---> post (Geb line "author wrote:\n> ...")
 Geb line   ---> poll (verify sg) ---> foreign_to_record ---> create-only put (basis "observed")
 ```
 
 ### 4.2 VTC to Geb
 
 - **Quoting the original author.** The line is signed by the bridge's Geb device key, so Geb
-  members cannot verify the VTC author. The text is `> <author> wrote:\n<title>\n\n<body>`, with
-  the author label stripped of control characters and cut to 200 characters, control characters
-  other than newline and tab removed from the body, and the whole text cut to
+  members cannot verify the VTC author. The text is `<author> wrote:` on its own,
+  unquoted first line, then the title and body with EVERY line quoted (`> ` prefix, `>` for an empty
+  line), so a VTC member cannot write a second, convincing header: any line they write starts with
+  `>`. UNVERIFIED: how Geb clients render the quote (the format is the bridge's own; Geb's
+  vectors do not fix it). Untrusted text from both directions goes through `mapping::strip_controls`:
+  CRLF, bare CR, NEL, VT, FF, U+2028 and U+2029 become newlines (before quoting), other control
+  characters (except newline and tab) and every Unicode format character (Cf: bidi overrides and
+  isolates, zero-width space/joiners, BOM, tag characters) are removed (this splits joined emoji
+  sequences; accepted). The author label is stripped likewise and cut to 200 characters. The
+  transformed text, quote prefixes included, is cut to
   `max_message_units`: UTF-16 code units (JavaScript string length; an emoji counts 2), 20,000
   for Geb. `mapping::truncate_utf16` cuts at a char boundary, never over the limit, and ends with a
   `[truncated]` marker inside it (earlier versions counted bytes and so cut multi-byte text at
