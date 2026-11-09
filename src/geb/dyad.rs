@@ -502,6 +502,19 @@ impl StatefulDyad {
         })
     }
 
+    /// What a VRC we issue carries besides the parties: a fresh credential
+    /// nonce (not the invitation's), our own DID as each party's endpoint (the
+    /// app passes the device's own DID, answers-2 section 4), and no
+    /// IEEE 7012 agreement claimed by the bridge.
+    fn vrc_params(&self, subject: &str) -> vrc::IssueParams {
+        vrc::IssueParams {
+            nonce: hex_nonce(),
+            issuer_endpoint: self.id.did.clone(),
+            subject_endpoint: Some(subject.to_string()),
+            ieee7012_agreed: false,
+        }
+    }
+
     /// Answer an invitation (steps 4 and 6): record the intent, issue our VRC
     /// about the inviter and post `{t:"response"}` on the pair mailbox. A
     /// repeat for the same invitation reposts it.
@@ -517,7 +530,13 @@ impl StatefulDyad {
             Some(p) if p.conn.role == Role::Invitee && p.conn.nonce == inv.nonce => {}
             Some(_) => return Err(Error::Foreign("a connection with this peer exists".into())),
             None => {
-                let our_vrc = vrc::issue(&self.id.did, &self.id.signing, &inv.from, now)?;
+                let our_vrc = vrc::issue(
+                    &self.id.did,
+                    &self.id.signing,
+                    &inv.from,
+                    now,
+                    &self.vrc_params(&inv.from),
+                )?;
                 let conn = ConnRecord {
                     v: 1,
                     peer: inv.from.clone(),
@@ -695,7 +714,13 @@ impl StatefulDyad {
                         report.dropped += 1;
                         continue;
                     }
-                    let ours = vrc::issue(&self.id.did, &self.id.signing, peer, now)?;
+                    let ours = vrc::issue(
+                        &self.id.did,
+                        &self.id.signing,
+                        peer,
+                        now,
+                        &self.vrc_params(peer),
+                    )?;
                     let r = self.start_ratchets(peer)?;
                     // Ratchets first, then the connection that points at them.
                     self.save_ratchet(peer, &r).await?;
@@ -1253,6 +1278,15 @@ mod tests {
         assert_eq!(got[0].from, eve.did());
     }
 
+    fn test_params(issuer: &str, subject: &str) -> vrc::IssueParams {
+        vrc::IssueParams {
+            nonce: hex_nonce(),
+            issuer_endpoint: issuer.into(),
+            subject_endpoint: Some(subject.into()),
+            ieee7012_agreed: false,
+        }
+    }
+
     #[tokio::test]
     async fn a_response_with_the_wrong_nonce_issuer_or_subject_is_refused() {
         let w = world();
@@ -1290,15 +1324,29 @@ mod tests {
         };
         let b = w.b.did().to_string();
         let a = w.a.did().to_string();
-        let good = vrc::issue(&b, &w.b.id.signing, &a, T0).unwrap();
+        let good = vrc::issue(&b, &w.b.id.signing, &a, T0, &test_params(&b, &a)).unwrap();
         post(good.clone(), &hex_nonce(), &b); // wrong nonce
         post(
-            vrc::issue(w.b.did(), &w.b.id.signing, mallory.did(), T0).unwrap(),
+            vrc::issue(
+                w.b.did(),
+                &w.b.id.signing,
+                mallory.did(),
+                T0,
+                &test_params(w.b.did(), mallory.did()),
+            )
+            .unwrap(),
             &nonce,
             &b,
         ); // subject not us
         post(
-            vrc::issue(mallory.did(), &mallory.signing, &a, T0).unwrap(),
+            vrc::issue(
+                mallory.did(),
+                &mallory.signing,
+                &a,
+                T0,
+                &test_params(mallory.did(), &a),
+            )
+            .unwrap(),
             &nonce,
             &b,
         ); // issuer not responder

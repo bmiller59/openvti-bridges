@@ -468,3 +468,50 @@ fn vrc_verifies_with_our_verifier() {
         assert!(vrc::verify(&t, issuer, subject).is_err());
     }
 }
+
+#[test]
+fn vrc_issue_reproduces_geb_byte_for_byte() {
+    // Our `vrc::issue`, given the vector's inputs (the credential nonce is
+    // the one real run's, the clock is the stated `created`), emits exactly
+    // Geb's credential: same JCS bytes, same proofValue.
+    let v = vec_of("vrc");
+    let secs = |iso: &str| {
+        let t = iso.strip_suffix('Z').unwrap();
+        let (d, tm) = t.split_once('T').unwrap();
+        let d: Vec<i64> = d.split('-').map(|x| x.parse().unwrap()).collect();
+        let tm: Vec<i64> = tm.split(':').map(|x| x.parse().unwrap()).collect();
+        // days from civil (Hinnant), test-local.
+        let (y, m) = if d[1] <= 2 {
+            (d[0] - 1, d[1] + 9)
+        } else {
+            (d[0], d[1] - 3)
+        };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * m + 2) / 5 + d[2] - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        ((era * 146_097 + doe - 719_468) * 86_400 + tm[0] * 3600 + tm[1] * 60 + tm[2]) as u64
+    };
+    for (name, doc, issuer, subject, seed) in vrc_vectors() {
+        let when = if name == "response" {
+            s(&v["input"]["responder_created_iso"])
+        } else {
+            s(&v["input"]["inviter_created_iso"])
+        };
+        let cs = &doc["credentialSubject"];
+        let p = vrc::IssueParams {
+            nonce: s(&cs["nonce"]).to_string(),
+            issuer_endpoint: s(&cs["issuerEndpoint"]).to_string(),
+            subject_endpoint: Some(s(&cs["subjectEndpoint"]).to_string()),
+            ieee7012_agreed: cs["ieee7012Agreed"].as_bool().unwrap(),
+        };
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let ours = vrc::issue(issuer, &sk, subject, secs(when), &p).unwrap();
+        assert_eq!(hex::encode(jcs(&ours)), hex::encode(jcs(&doc)), "{name}");
+        assert_eq!(
+            ours["proof"]["proofValue"], doc["proof"]["proofValue"],
+            "{name}"
+        );
+        vrc::verify(&ours, issuer, subject).unwrap();
+    }
+}

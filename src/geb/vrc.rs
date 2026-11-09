@@ -5,16 +5,22 @@
 //! `credentialSubject.issuerPublicKey` equal to the issuer's assertion key
 //! (guide, "Connecting" step 8; `vrc.rs:11-14,59-149,210` in Geb).
 //!
-//! UNVERIFIED: Geb's own `vrc.rs` was not available to this crate, only the
-//! guide's summary of it. What the guide states is enforced exactly. What it
-//! does not state is taken from the DTG credential model (the
-//! `dtg-credentials` crate): the context pair, the type list
-//! `["VerifiableCredential","DTGCredential","RelationshipCredential"]`, a
-//! top-level `issuerScope`, and `validFrom`. The encoding of
-//! `issuerPublicKey` is assumed to be the multibase text of the `.A` element of
-//! the DID (the same string the DID carries). A VRC issued here is verified by
-//! this code; whether Geb accepts it, and whether this code accepts Geb's, is
-//! exactly what a live exchange with Geb would settle.
+//! The shape is Geb's v2 form (answers-2 section 4, `crates/identity/src/vrc.rs`
+//! at Geb), bound byte for byte to `tests/fixtures/geb-path-b-vectors-2.json`:
+//! an `id` of `vrc:<issuer DID>:<first 8 chars of the nonce>`, a
+//! `credentialSubject` of `id`, `issuerEndpoint`, `subjectEndpoint`,
+//! `issuerPublicKey` (the multibase text of the issuer DID's assertion key,
+//! `z6Mk...`), `nonce` (32 hex) and `ieee7012Agreed`, and a proof that carries
+//! its own `@context`, equal to the document's and signed.
+//! `hashData = SHA-256(JCS(proof without proofValue)) || SHA-256(JCS(document
+//! without proof))`. The older v1 flat shape is not read: this crate never did.
+//!
+//! UNVERIFIED: whether Geb accepts a VRC issued here is what a live exchange
+//! settles; the vectors prove only that this code reproduces Geb's bytes and
+//! verifies Geb's credentials. `ieee7012Agreed` is the issuing party's own
+//! claim and the bridge makes none (`false`); `terms` is never sent. A receiver
+//! here does not require `nonce`, `issuerEndpoint` or `ieee7012Agreed` (the
+//! answers' verifier list does not).
 
 use super::crypto::did_peer;
 use crate::{Error, Result};
@@ -70,12 +76,27 @@ fn assertion_key(did: &str) -> Result<([u8; 32], String)> {
     Ok((raw, multibase::encode(multibase::Base::Base58Btc, b)))
 }
 
+/// The parts of a v2 VRC that are not the parties and the time.
+#[derive(Debug, Clone)]
+pub struct IssueParams {
+    /// The credential's own nonce: 32 lowercase hex characters, fresh for each
+    /// credential (Geb's `fresh_nonce`: 16 random bytes). Not the invitation's.
+    pub nonce: String,
+    /// `credentialSubject.issuerEndpoint` (the device's own DID in the app).
+    pub issuer_endpoint: String,
+    /// `credentialSubject.subjectEndpoint`, when known.
+    pub subject_endpoint: Option<String>,
+    /// `credentialSubject.ieee7012Agreed`.
+    pub ieee7012_agreed: bool,
+}
+
 /// Issue a VRC from `issuer_did` about `subject_did`.
 pub fn issue(
     issuer_did: &str,
     issuer_key: &SigningKey,
     subject_did: &str,
     now_secs: u64,
+    params: &IssueParams,
 ) -> Result<Value> {
     let (raw, text) = assertion_key(issuer_did)?;
     if issuer_key.verifying_key().to_bytes() != raw {
@@ -83,14 +104,28 @@ pub fn issue(
             "signing key is not the issuer DID's assertion key".into(),
         ));
     }
+    if params.nonce.len() != 32 || !params.nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::Wire("VRC nonce must be 32 hex characters".into()));
+    }
     let when = iso8601(now_secs);
+    let mut subject = json!({
+        "id": subject_did,
+        "issuerEndpoint": params.issuer_endpoint,
+        "issuerPublicKey": text,
+        "nonce": params.nonce,
+        "ieee7012Agreed": params.ieee7012_agreed,
+    });
+    if let (Some(e), Some(o)) = (&params.subject_endpoint, subject.as_object_mut()) {
+        o.insert("subjectEndpoint".into(), Value::String(e.clone()));
+    }
     let unsecured = json!({
         "@context": [VC_CTX, DTG_CTX],
+        "id": format!("vrc:{issuer_did}:{}", &params.nonce[..8]),
         "type": ["VerifiableCredential", "DTGCredential", "RelationshipCredential"],
         "issuer": issuer_did,
         "issuerScope": "directed",
         "validFrom": when,
-        "credentialSubject": {"id": subject_did, "issuerPublicKey": text},
+        "credentialSubject": subject,
     });
     let mut proof = json!({
         "type": "DataIntegrityProof",
@@ -102,7 +137,6 @@ pub fn issue(
     });
     let sig = issuer_key.sign(&hash_data(&proof, &unsecured)?);
     if let Some(o) = proof.as_object_mut() {
-        o.remove("@context");
         o.insert(
             "proofValue".into(),
             Value::String(multibase::encode(
@@ -120,7 +154,8 @@ pub fn issue(
 
 /// Verify a VRC: the issuer is `expect_issuer`, the subject is
 /// `expect_subject`, scope is `directed`, the subject carries the issuer's
-/// assertion key, and the proof verifies against that key.
+/// assertion key, the proof's `@context` equals the document's, and the proof
+/// (strict `eddsa-jcs-2022` hashData) verifies against that key.
 pub fn verify(vrc: &Value, expect_issuer: &str, expect_subject: &str) -> Result<()> {
     let bad = |m: &str| Error::Crypto(format!("VRC refused: {m}"));
     let obj = vrc.as_object().ok_or_else(|| bad("not an object"))?;
@@ -166,6 +201,12 @@ pub fn verify(vrc: &Value, expect_issuer: &str, expect_subject: &str) -> Result<
         return Err(bad("proofValue must be base58btc"));
     }
     let sig = ed25519_dalek::Signature::from_slice(&sig).map_err(|_| bad("proofValue length"))?;
+    // Geb requires the proof's own `@context` to be present and equal to the
+    // document's; it is part of what was signed.
+    match (proof.get("@context"), obj.get("@context")) {
+        (Some(p), Some(d)) if p == d => {}
+        _ => return Err(bad("proof @context is missing or not the document's")),
+    }
     let mut unsecured = vrc.clone();
     let mut config = Value::Object(proof.clone());
     if let Some(o) = unsecured.as_object_mut() {
@@ -173,9 +214,6 @@ pub fn verify(vrc: &Value, expect_issuer: &str, expect_subject: &str) -> Result<
     }
     if let Some(o) = config.as_object_mut() {
         o.remove("proofValue");
-        if let Some(c) = obj.get("@context") {
-            o.insert("@context".into(), c.clone());
-        }
     }
     let key = ed25519_dalek::VerifyingKey::from_bytes(&raw).map_err(|_| bad("issuer key"))?;
     key.verify(&hash_data(&config, &unsecured)?, &sig)
@@ -194,6 +232,17 @@ mod tests {
         )
     }
 
+    const NONCE: &str = "9f3c1a77d2e84b05a6c1e0b3d7f25a48";
+
+    fn params(issuer: &str) -> IssueParams {
+        IssueParams {
+            nonce: NONCE.into(),
+            issuer_endpoint: issuer.into(),
+            subject_endpoint: None,
+            ieee7012_agreed: false,
+        }
+    }
+
     #[test]
     fn iso_dates() {
         assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
@@ -206,8 +255,19 @@ mod tests {
         let (a, ak) = party(1);
         let (b, _) = party(2);
         let (c, _) = party(3);
-        let v = issue(&a, &ak, &b, 1_700_000_000).unwrap();
+        let v = issue(&a, &ak, &b, 1_700_000_000, &params(&a)).unwrap();
         verify(&v, &a, &b).unwrap();
+        assert_eq!(v["id"], format!("vrc:{a}:{}", &NONCE[..8]));
+        assert!(v["proof"]["@context"] == v["@context"]);
+        let mut t = v.clone();
+        t["proof"].as_object_mut().unwrap().remove("@context");
+        assert!(verify(&t, &a, &b).is_err(), "proof @context required");
+        let mut t = v.clone();
+        t["proof"]["@context"] = serde_json::json!(["https://www.w3.org/ns/credentials/v2"]);
+        assert!(
+            verify(&t, &a, &b).is_err(),
+            "proof @context must equal doc's"
+        );
         assert_eq!(v["proof"]["verificationMethod"], format!("{a}#key-1"));
         assert_eq!(v["issuerScope"], "directed");
         assert!(verify(&v, &b, &b).is_err(), "wrong issuer");
@@ -229,6 +289,9 @@ mod tests {
         assert!(verify(&t, &a, &b).is_err());
         // A VRC signed by someone else but claiming to be from a.
         let (_, mk) = party(9);
-        assert!(issue(&a, &mk, &b, 1).is_err());
+        assert!(issue(&a, &mk, &b, 1, &params(&a)).is_err());
+        let mut bad = params(&a);
+        bad.nonce = "xyz".into();
+        assert!(issue(&a, &ak, &b, 1, &bad).is_err());
     }
 }
