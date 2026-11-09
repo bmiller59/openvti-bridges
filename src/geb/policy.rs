@@ -257,6 +257,22 @@ pub enum CommitVerdict {
     Undecidable(String),
 }
 
+/// `selfHeal` (used at; answers round 4, Q2):
+/// the one way an UNBOUND sender may commit a Remove. All of: …
+/// …
+/// …
+/// signature (a present binding that does not verify never reaches here: the
+/// judge refuses a forged one first, and an unbound one is in `unbound_adds`).
+/// A plain heal (path only, no Remove) never reaches this rule at all.
+fn self_heal(facts: &CommitFacts) -> bool {
+    facts.policy_change.is_none()
+        && !facts.removes.is_empty()
+        && facts.removes.iter().all(|d| d == &facts.sender)
+        && !facts.adds.is_empty()
+        && facts.adds.iter().all(|d| d == &facts.sender)
+        && facts.unbound_adds.is_empty()
+}
+
 fn is_root_or_admin(policy: &RoomPolicy, who: &str, inputs: &dyn CommitCheckInputs) -> bool {
     let is = |d: &String| d == who || inputs.same_person(who, d);
     policy.root.iter().any(is) || policy.admins.iter().any(is)
@@ -309,20 +325,18 @@ pub fn valid_commit(
         }
     }
     // …
-    // … bound; …
-    // … leaf.
-    if (!facts.removes.is_empty() || facts.policy_change.is_some()) && !facts.sender_bound {
-        let own_reseat = facts.policy_change.is_none()
-            && !facts.removes.is_empty()
-            && facts.unbound_adds.is_empty()
-            && facts.removes.iter().all(|d| d == &facts.sender)
-            && !facts.adds.is_empty()
-            && facts.adds.iter().all(|d| d == &facts.sender);
-        if !own_reseat {
-            return Invalid(
-                "a remove, re-seat or policy change needs a sender whose leaf is bound".into(),
-            );
-        }
+    // … leaf, as it stands BEFORE the commit, is bound
+    // ; the one exception is `selfHeal` (answers round 4,
+    // Q2), which is a Remove, never a policy change.
+    if (!facts.removes.is_empty() || facts.policy_change.is_some())
+        && !facts.sender_bound
+        && !self_heal(facts)
+    {
+        return Invalid(
+            "a remove, re-seat or policy change needs a sender whose leaf is bound \
+             (selfHeal excepted)"
+                .into(),
+        );
     }
     // From here, a rule that fails is `Invalid` when the inputs are real. When
     // they are not (`!can_evaluate`) a rule fails only if no persona card or
@@ -808,5 +822,54 @@ mod tests {
         own.removes = s(&["did:m"]);
         own.adds = s(&["did:m"]);
         assert!(ok(&pol(""), &own));
+    }
+
+    // ---- round 4 Q2: selfHeal
+
+    fn verdict(p: &RoomPolicy, f: &CommitFacts, i: &dyn CommitCheckInputs) -> CommitVerdict {
+        valid_commit(p, f, i)
+    }
+
+    #[test]
+    fn self_heal_needs_every_clause() {
+        let none = NoLocalKnowledge;
+        let base = || {
+            let mut f = facts("did:m");
+            f.sender_bound = false;
+            f.removes = s(&["did:m"]);
+            f.adds = s(&["did:m"]);
+            f
+        };
+        assert_eq!(verdict(&pol(""), &base(), &none), CommitVerdict::Valid);
+        let refused =
+            |f: &CommitFacts| matches!(verdict(&pol(""), f, &none), CommitVerdict::Invalid(_));
+        // no policy change
+        let mut f = base();
+        f.policy_change = Some(pol(""));
+        assert!(refused(&f), "a policy change");
+        // every removed leaf names the sender
+        let mut f = base();
+        f.removes = s(&["did:m", "did:x"]);
+        assert!(refused(&f), "a removed leaf of another DID");
+        let mut f = base();
+        f.removes = s(&["did:x"]);
+        assert!(refused(&f), "only another DID removed");
+        // at least one leaf is added
+        let mut f = base();
+        f.adds = vec![];
+        assert!(refused(&f), "nothing added");
+        // every added leaf names the sender
+        let mut f = base();
+        f.adds = s(&["did:m", "did:new"]);
+        assert!(refused(&f), "an added leaf of another DID");
+        // ...and is bound by the sender's own signature
+        let mut f = base();
+        f.unbound_adds = s(&["did:m"]);
+        assert!(refused(&f), "the added leaf is unbound");
+        // A plain heal (path only, no remove) is not a Remove: it never
+        // reaches this rule.
+        let mut f = facts("did:m");
+        f.sender_bound = false;
+        assert_eq!(verdict(&pol(""), &f, &none), CommitVerdict::Valid);
     }
 }

@@ -28,7 +28,7 @@
 //! carries a forged binding, that adds an unbound leaf naming the root, an
 //! admin or a seated DID (`unboundClaim`), or whose sender's leaf is unbound
 //! and who removes, re-seats or changes the policy (`validCommit`, with the
-//! one exception of re-seating its own DID onto a bound leaf). A bound
+//! one exception `selfHeal`, answers round 4 Q2). A bound
 //! update-path leaf from an unbound sender is the `heal` shape and is valid.
 //! At join, `tree_refusal` refuses a Welcome whose tree holds a forged leaf …
 //! … unbound.
