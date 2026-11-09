@@ -86,6 +86,16 @@ pub(crate) fn policy_of(exts: &Extensions<GroupContext>) -> RoomPolicy {
         .unwrap_or_default()
 }
 
+/// Whether the group context's policy declares a direct room at all (a
+/// `direct` member of the `0xF001` JSON, whatever its value: read raw, so a
+/// pair `parse_policy` would clean away still counts).
+pub(crate) fn declares_direct(exts: &Extensions<GroupContext>) -> bool {
+    exts.unknown(leaf::EXT_POLICY)
+        .and_then(|u| serde_json::from_slice::<serde_json::Value>(&u.0).ok())
+        .and_then(|v| v.get("direct").map(|d| !d.is_null()))
+        .unwrap_or(false)
+}
+
 /// How a leaf's binding stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingStatus {

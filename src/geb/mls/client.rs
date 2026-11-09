@@ -73,6 +73,10 @@ pub struct MlsConfig {
     pub peers: Vec<String>,
     /// KeyPackages per stock, 1-16.
     pub stock_size: usize,
+    /// Tests only: join a direct room anyway, to exercise the commit rules
+    /// that apply inside one. Never set in production code.
+    #[cfg(test)]
+    pub(crate) allow_direct_for_test: bool,
 }
 
 impl MlsConfig {
@@ -82,6 +86,8 @@ impl MlsConfig {
             room_id: room_id.to_string(),
             peers,
             stock_size: DEFAULT_STOCK,
+            #[cfg(test)]
+            allow_direct_for_test: false,
         }
     }
 }
@@ -703,6 +709,23 @@ impl MlsGroupClient {
         if ctx.extensions().unknown(leaf::EXT_POLICY).is_none() {
             return Err(Error::Wire("welcome group has no 0xF001 policy".into()));
         }
+        // Round 3 section 9: a direct room (policy `direct:[lo, hi]`) seats only
+        // devices of its two persons, judged from persona cards we do not
+        // hold; a third-party bridge is not one of them. Refuse before the
+        // group is stored: nothing of this Welcome is kept. `Refused` stops
+        // the link (persisted halt); the leaf the adder made for us stays in
+        // that room, since leaving is not built.
+        #[cfg(test)]
+        let allow_direct = self.cfg.allow_direct_for_test;
+        #[cfg(not(test))]
+        let allow_direct = false;
+        if !allow_direct && super::commit::declares_direct(ctx.extensions()) {
+            return Err(Error::Refused(
+                "this is a direct room (policy `direct`); a bridge cannot sit in a direct room \
+                 (Geb round 3 section 9). Remove this link: `link remove`"
+                    .into(),
+            ));
+        }
         let ctx_policy = super::commit::policy_of(ctx.extensions());
         if ctx_policy != header_policy {
             tracing::warn!(
@@ -824,6 +847,8 @@ impl GebGroup for MlsGroupClient {
                                 self.persist_state(&g)?;
                                 return Ok(JoinState::Seated);
                             }
+                            // A refusal of the room itself stops the link.
+                            Err(e @ Error::Refused(_)) => return Err(e),
                             Err(e) => tracing::warn!(error = %e, "ignoring a welcome"),
                         }
                     }

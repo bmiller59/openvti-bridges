@@ -62,6 +62,14 @@ struct World {
 impl World {
     /// A (root, founder) and B in a room; our client built but not yet seated.
     fn build(inputs: Arc<dyn CommitCheckInputs>, extra_policy: &str) -> World {
+        Self::build_with(inputs, extra_policy, false)
+    }
+
+    fn build_with(
+        inputs: Arc<dyn CommitCheckInputs>,
+        extra_policy: &str,
+        allow_direct: bool,
+    ) -> World {
         let relay = Arc::new(FakeRelay::new());
         let relay_dyn: Arc<dyn GebRelay> = relay.clone();
         let bus = Bus::new();
@@ -83,9 +91,11 @@ impl World {
             our_dev.clone(),
         ));
         let dyad = MemDyad::new(&our_did, &bus);
+        let mut mc = MlsConfig::new(ROOM, vec![a.did.clone()]);
+        mc.allow_direct_for_test = allow_direct;
         let client = Arc::new(
             MlsGroupClient::new(
-                MlsConfig::new(ROOM, vec![a.did.clone()]),
+                mc,
                 device.clone(),
                 dyad.clone(),
                 inputs,
@@ -1399,9 +1409,12 @@ async fn a_lower_hash_undecidable_commit_blocks_even_when_a_higher_one_is_fine()
 async fn adds_to_a_direct_room_are_undecidable_without_persona_cards() {
     // Sim::new is deterministic, so the two persons' DIDs are known up front.
     let (lo, hi) = (Sim::new(1).did, Sim::new(2).did);
-    let mut w = World::build(
+    // (A real client refuses a Welcome into a direct room, round 3 section 9;
+    // the test switch lets it in so the commit rule itself is still pinned.)
+    let mut w = World::build_with(
         Arc::new(NoLocalKnowledge),
         &format!(r#","direct":["{lo}","{hi}"]"#),
+        true,
     );
     w.seat().await;
     let newbie = Sim::new(13);
@@ -1958,4 +1971,40 @@ async fn seat_check_is_answered_with_the_minimal_rs_when_seated_and_not_otherwis
     );
     w.poll().await.unwrap();
     assert!(w.bus.take(&w.our_did, &w.a.did).is_empty());
+}
+
+// ---- bridges refuse direct rooms (round 3 section 9) -----------------------
+
+#[tokio::test]
+async fn a_welcome_into_a_direct_room_is_refused_and_nothing_is_kept() {
+    let probe = World::build(Arc::new(NoLocalKnowledge), "");
+    let (lo, hi) = {
+        let mut p = [probe.a.did.clone(), probe.b.did.clone()];
+        p.sort();
+        (p[0].clone(), p[1].clone())
+    };
+    for direct in [
+        format!(r#","direct":["{lo}","{hi}"]"#),
+        // Read raw: even a pair parse_policy would clean away still counts.
+        r#","direct":["not-a-did"]"#.to_string(),
+    ] {
+        let mut w = World::build(Arc::new(NoLocalKnowledge), &direct);
+        assert_eq!(w.room.join().await.unwrap(), JoinState::Pending);
+        let stock = w.bus.take(&w.our_did, &w.a.did);
+        let Some(Frame::Group(GroupOp::KpStock { kps, .. })) = stock.first().cloned() else {
+            panic!("no kp-stock")
+        };
+        let (_commit, welcome) = w.a.stage_add(parse_kp(&kps[0]));
+        w.a.merge_pending();
+        w.bus.put(
+            &w.a.did,
+            &w.our_did,
+            welcome_frame(ROOM, &w.a.did, &w.policy, &welcome),
+        );
+        let e = w.room.join().await.unwrap_err();
+        assert!(matches!(e, Error::Refused(_)), "{e:?}");
+        assert!(e.to_string().contains("direct room"), "{e}");
+        assert_eq!(w.client.epoch(), None, "not seated, no group kept");
+        assert!(w.client.members().is_empty());
+    }
 }
