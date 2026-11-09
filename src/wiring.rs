@@ -66,10 +66,11 @@ pub struct LinkInputs {
     pub host: HostDelivery,
     /// Milliseconds.
     pub clock: Clock,
-    /// What the MLS group knows of persona cards and signed leaves. `None`
-    /// is production: [`NoLocalKnowledge`], which merges only an Add-only
-    /// commit and stops on anything else. Tests inject a fake to reach the
-    /// merge paths.
+    /// What the MLS group knows of persona cards. `None` is production:
+    /// [`NoLocalKnowledge`] (no persona store; the signed leaves the client
+    /// takes are added on top), which decides every commit except the
+    /// card-dependent Remove (see `geb::policy::valid_commit`) and halts on
+    /// that one. Tests inject a fake to reach the other paths.
     pub commit_inputs: Option<Arc<dyn CommitCheckInputs>>,
 }
 

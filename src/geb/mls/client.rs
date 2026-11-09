@@ -1020,8 +1020,12 @@ impl GebGroup for MlsGroupClient {
                     // Not logged here: the pump persists the halt and raises
                     // the one alert (logging per tick is what this avoids).
                     return Err(Error::UndecidableCommit(format!(
-                        "epoch {epoch}, commit {}: {reason}; needs persona cards or signed \
-                         leaves to evaluate, stopping instead of forking the epoch",
+                        "epoch {epoch}, commit {}: {reason}. This bridge holds no persona \
+                         store (persona cards are not built) and no signed leave covers the \
+                         removed leaves. Geb itself would refuse such a commit and carry on, \
+                         but a Geb device holding a persona card that links the two DIDs would \
+                         merge it and we cannot know; stopping is a deliberate bridge-side \
+                         choice, the honest alternative to silently forking the epoch",
                         hex::encode(hash)
                     )));
                 }

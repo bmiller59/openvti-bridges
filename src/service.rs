@@ -187,9 +187,11 @@ pub async fn clear_halt(
             println!("{id}: HALTED ({r})");
             if matches!(r, crate::halt::HaltReason::UndecidableCommit { .. }) {
                 println!(
-                    "  This is a commit the bridge cannot decide without persona cards or signed \
-                     leaves. Clearing makes the link read it again; it halts again at once if \
-                     nothing has changed."
+                    "  This is a Remove of another DID that the bridge cannot decide: it holds no \
+                     persona cards and no signed leave covers it. Geb itself would refuse it \
+                     and carry on; the bridge halts instead of risking a silent fork (a \
+                     deliberate choice). Clearing makes the link read it again; it halts again \
+                     at once if nothing has changed."
                 );
             }
         }

@@ -24,8 +24,9 @@ pub enum Error {
     /// error (see [`crate::foreign::JoinState::Pending`]).
     #[error("refused: {0}")]
     Refused(String),
-    /// A Geb commit that can be neither merged nor skipped without local
-    /// knowledge this device lacks (persona cards, signed leaves). The link
+    /// A Geb commit that can be neither merged nor skipped without a persona
+    /// card this bridge cannot hold (a deliberate bridge-side halt; Geb
+    /// itself refuses such a commit and goes on). The link
     /// halts (persisted) and stays halted until an operator clears it; the
     /// text names the commit's epoch and hash. Not retried: re-reading the
     /// same commit decides nothing new.

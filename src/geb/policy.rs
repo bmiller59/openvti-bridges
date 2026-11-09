@@ -24,35 +24,34 @@
 //! - the first Commit that passes is merged, on every device that reaches the
 //!   same verdict;
 //! - all refused: nothing settles and the epoch stays;
-//! - …
-//!   … `failed`, the read cursor stays before it, the device sends its
-//!   room status `{k:"g", op:"rs"}` which starts fork repair.
+//! - … branch, a
+//!   standalone Proposal): recorded `failed` and SKIPPED like a refusal (the
+//!   walk never stops, answers round 4 Q1). Only if nothing merged does the
+//!   cursor stay before it and one `rs` go out.
 //!
-//! `validCommit`  fails a Commit when
+//! `validCommit` (answers round 4 Q2 and Q6) passes a
+//! Remove when ANY of: every removed DID is the sender's person (`same`; with
+//! no persona store, the sender's own DID); …
+//! … we hold, with no adds and no policy change; …
+//! … set with no policy change (re-seat); the sender
+//! is root or an admin (EXACT DID compare), or the room's policy is v1
+//! (`p.v !== 2`). It needs a sender whose leaf is bound before the commit,
+//! except `selfHeal`. A policy change comes from `root`, is v2 and keeps
+//! `committer` / `settleWindowMs`; a direct room seats only its two persons'
+//! devices. Adds otherwise pass.
 //!
-//! - …
-//!   …
-//! - …
-//!   …
-//!   …
-//!   …
-//!   … change);
-//! - …
-//!   …
+//! Anything else …
 //!
-//! …
-//!
-//! **Two inputs are local knowledge**: …
-//! … holds (persona code), and "signed leave" from the signed
-//! leaves it has taken (`leave code:33-60`, `{t:"lv", at, ls}` in the
-//! room). A bridge lacking them refuses …
-//! … **forks the epoch**. So it never merges (nor skips) such
-//! a commit; with the default group `GebRoom::poll` still stops on any `mc`
-//! envelope; [`valid_commit`] is the check, and [`CommitCheckInputs::can_evaluate`]
-//! is the gate. Production has only [`NoLocalKnowledge`]; since round 2 only a
-//! Remove of a different DID by a non-root, non-admin sender and a direct-room
-//! Add of a non-exact DID need them, and those stop the bridge and alert; see
-//! `geb::mls` for what is merged.
+//! **Two inputs are local knowledge**: "same person" (persona cards, which
+//! the bridge does NOT hold: no persona-card intake is built) and "signed
+//! leave" (`{t:"lv"}` room lines and dyad `leave` frames, which the bridge
+//! takes: `geb::leave`). The only commits that remain card-dependent are a
+//! Remove of another DID by a non-root, non-admin sender in a v2 room with no
+//! signed leave and not a re-seat (and a direct-room Add of a non-exact DID).
+//! A Geb device holding a card linking the DIDs would merge it and we cannot
+//! know, so [`valid_commit`] answers [`CommitVerdict::Undecidable`] and the
+//! bridge HALTS (persisted) rather than silently fork. That halt is a
+//! deliberate bridge-side choice; Geb itself refuses and continues.
 
 use serde_json::Value;
 
@@ -257,6 +256,13 @@ pub enum CommitVerdict {
     Undecidable(String),
 }
 
+/// `roleOf` : root and admin are an **exact** DID compare,
+/// never widened by persona cards (answers round 4, Q4: …
+/// … Geb).
+fn is_root_or_admin(policy: &RoomPolicy, who: &str) -> bool {
+    policy.root.as_deref() == Some(who) || policy.admins.iter().any(|a| a == who)
+}
+
 /// `selfHeal` (used at; answers round 4, Q2):
 /// the one way an UNBOUND sender may commit a Remove. All of: …
 /// …
@@ -273,30 +279,27 @@ fn self_heal(facts: &CommitFacts) -> bool {
         && facts.unbound_adds.is_empty()
 }
 
-fn is_root_or_admin(policy: &RoomPolicy, who: &str, inputs: &dyn CommitCheckInputs) -> bool {
-    let is = |d: &String| d == who || inputs.same_person(who, d);
-    policy.root.iter().any(is) || policy.admins.iter().any(is)
-}
-
 /// Geb's `validCommit` (answer 9), pure over the facts, the
 /// policy read from the **group context** and the local-knowledge inputs.
 ///
-/// Without local knowledge ([`CommitCheckInputs::can_evaluate`] false) every
-/// commit Geb decides without persona cards or signed leaves is decided here
-/// (round 2 section 7): ordinary adds, exact-DID root or admin removes, a
-/// sender removing or re-seating its own DID, other re-seats, root policy
-/// changes, an exact member of a direct pair added, and every 0.5.15 bound-leaf
-/// refusal. Only a Remove of a different DID by a sender who is neither root
-/// nor admin, and a direct-room Add of a DID that is not exactly one of the
-/// pair, are [`CommitVerdict::Undecidable`] (a card or signed leave could
-/// rescue them, and a wrong answer forks the epoch); a card-free refusal
+/// Without a persona store ([`CommitCheckInputs::can_evaluate`] false) every
+/// commit Geb decides without persona cards is decided here: adds, removes by
+/// the exact-DID root or an admin or in a v1 room, a Remove of the sender's own
+/// DID, a Remove covered by a held signed leave, re-seats, root policy
+/// changes, an exact member of a direct pair added, and every 0.5.15
+/// bound-leaf refusal. Geb itself REFUSES anything else and goes on; it never
+/// halts. The ONE residue this bridge cannot decide, and where it halts instead
+/// (a deliberate bridge-side choice, the honest alternative to silently
+/// forking): a Remove of another DID by a non-root, non-admin sender in a v2
+/// room with no signed leave we hold and not a re-seat, which a Geb device
+/// holding a persona card linking the two DIDs would merge. Also a direct-room
+/// Add of a DID that is not exactly one of the pair. A card-free refusal
 /// elsewhere in the same commit still wins.
 ///
-/// UNVERIFIED: the answers state the rules, not these details. Sender and
-/// removed leaves are compared as device DIDs (exactly, else `same_person`);
-/// "not v2" is read on the NEW policy; a re-seat compares removed and added
-/// DIDs as sets; a v1 policy has no root, so nobody passes the root test; an
-/// admin may change nothing but removes.
+/// UNVERIFIED: the answers state the rules, not these details. A re-seat
+/// compares removed and added DIDs as sets; `p.v !== 2` is read on the room's
+/// CURRENT policy (before the commit); an admin may change nothing but
+/// removes.
 pub fn valid_commit(
     policy: &RoomPolicy,
     facts: &CommitFacts,
@@ -312,8 +315,8 @@ pub fn valid_commit(
     // unboundClaim: an unbound leaf that names the root, an admin or a DID
     // already seated is never seated. (A re-seat's added leaf names a DID that
     // is still seated when the commit is made, so an unbound re-seat leaf is
-    // refused too. UNVERIFIED: whether Geb counts the DID being removed in the
-    // same commit as seated.)
+    // refused too: confirmed, answers round 4 Q5, `seated` is the list before
+    // the commit and nothing exempts a DID the same commit removes.)
     for d in &facts.unbound_adds {
         if policy.root.as_deref() == Some(d.as_str())
             || policy.admins.contains(d)
@@ -369,14 +372,23 @@ pub fn valid_commit(
             return Invalid("a policy change alters direct".into());
         }
     }
-    if !facts.removes.is_empty() && !is_root_or_admin(policy, &facts.sender, inputs) {
-        // Not (exactly) root or an admin: valid only as …
-        // … person: with no cards, the sender's own
-        // DID), a signed-out remove, or a re-seat.
+    if !facts.removes.is_empty() {
+        // Geb's exact `validCommit` for removes (answers
+        // round 4, Q6). A Remove passes when ANY of:
+        //  1. …
+        //     `same(a, b) = a === b || personOf(a).includes(b)`. With no
+        //     persona store only `a === b` can be decided;
+        //  2. … we
+        //     hold, … change;
+        //  3. re-seat (`isReseat`): …
+        //     … change;
+        //  4. the sender is root or an admin (exact), …
+        //     … || ...`).
+        // Anything else …
         let leave = facts
             .removes
             .iter()
-            .all(|r| r == &facts.sender || inputs.same_person(r, &facts.sender));
+            .all(|r| r == &facts.sender || inputs.same_person(&facts.sender, r));
         let signed_out = facts.adds.is_empty()
             && facts.policy_change.is_none()
             && facts.removes.iter().all(|r| inputs.has_signed_leave(r));
@@ -388,25 +400,20 @@ pub fn valid_commit(
             r.dedup();
             !r.is_empty() && a == r && facts.policy_change.is_none()
         };
-        if !(leave || signed_out || reseat)
+        let may_remove = policy.v != 2 || is_root_or_admin(policy, &facts.sender);
+        if !(leave || signed_out || reseat || may_remove)
             && let Some(v) = needs_cards(
-                "a Remove of a different DID from someone who is neither root, admin, leaving, signed out nor re-seating",
+                "a Remove of a different DID from someone who is neither root, admin, leaving, \
+                 signed out nor re-seating",
             )
         {
             return v;
         }
     }
     if let Some(new) = &facts.policy_change {
-        // UNVERIFIED: without cards the root test is an exact DID compare
-        // (round 2 section 7: "removes by root or an admin ... …
-        // … cards"). If Geb's test also
-        // accepts a root's sibling device through `same`, a commit from one
-        // is refused here and merged by Geb: a fork (open question 2).
-        let root = policy
-            .root
-            .as_ref()
-            .is_some_and(|r| r == &facts.sender || inputs.same_person(&facts.sender, r));
-        if !root {
+        // Exact DID compare, confirmed (answers round 4, Q4: `roleOf`,
+        // `mayChangePolicy`); persona cards never widen it.
+        if policy.root.as_deref() != Some(facts.sender.as_str()) {
             return Invalid("only root may change the policy".into());
         }
         if new.v != 2 {
@@ -570,7 +577,7 @@ mod tests {
             matches!(valid_commit(p, f, i), CommitVerdict::Invalid(_))
         };
         assert!(inv(&pol(""), &f, &Fake::default()));
-        // root, admin, and root's other device
+        // root and admin
         for who in ["did:root", "did:adm"] {
             f.sender = who.into();
             assert_eq!(
@@ -578,9 +585,11 @@ mod tests {
                 CommitVerdict::Valid
             );
         }
+        // Root and admin are an EXACT DID compare (round 4 Q4): a root's
+        // sibling device, known to the persona store, has no root rights.
         f.sender = "did:root2".into();
         let fake = Fake::default().dev("did:root2", "did:root");
-        assert_eq!(valid_commit(&pol(""), &f, &fake), CommitVerdict::Valid);
+        assert!(inv(&pol(""), &f, &fake));
         // leave: …
         let mut l = facts("did:m1");
         l.removes = s(&["did:m1", "did:m2"]);
@@ -824,10 +833,24 @@ mod tests {
         assert!(ok(&pol(""), &own));
     }
 
-    // ---- round 4 Q2: selfHeal
+    // ---- round 4: Q2 selfHeal, Q6 the four pass conditions, the residual halt
 
     fn verdict(p: &RoomPolicy, f: &CommitFacts, i: &dyn CommitCheckInputs) -> CommitVerdict {
         valid_commit(p, f, i)
+    }
+
+    /// Cards (or leaves) the bridge holds: exact only, but with signed leaves.
+    struct Leaves(HashSet<String>);
+    impl CommitCheckInputs for Leaves {
+        fn can_evaluate(&self) -> bool {
+            false
+        }
+        fn same_person(&self, _: &str, _: &str) -> bool {
+            false
+        }
+        fn has_signed_leave(&self, d: &str) -> bool {
+            self.0.contains(d)
+        }
     }
 
     #[test]
@@ -871,5 +894,79 @@ mod tests {
         let mut f = facts("did:m");
         f.sender_bound = false;
         assert_eq!(verdict(&pol(""), &f, &none), CommitVerdict::Valid);
+    }
+
+    #[test]
+    fn each_of_the_four_remove_passes_alone_without_a_persona_store() {
+        let none = NoLocalKnowledge;
+        // (1) every removed DID is the sender's own (no card needed).
+        let mut f = facts("did:m");
+        f.removes = s(&["did:m"]);
+        assert_eq!(verdict(&pol(""), &f, &none), CommitVerdict::Valid);
+        // (2) signed leave: covered, no adds, no policy change.
+        let mut f = facts("did:m");
+        f.removes = s(&["did:gone", "did:gone2"]);
+        let held = Leaves(["did:gone", "did:gone2"].map(String::from).into());
+        assert_eq!(verdict(&pol(""), &f, &held), CommitVerdict::Valid);
+        let partly = Leaves(["did:gone"].map(String::from).into());
+        assert!(matches!(
+            verdict(&pol(""), &f, &partly),
+            CommitVerdict::Undecidable(_)
+        ));
+        f.adds = s(&["did:new"]);
+        assert!(
+            matches!(verdict(&pol(""), &f, &held), CommitVerdict::Undecidable(_)),
+            "with an add it is not a signed-out remove"
+        );
+        // (3) re-seat by any bound member.
+        let mut f = facts("did:m");
+        f.removes = s(&["did:a"]);
+        f.adds = s(&["did:a"]);
+        assert_eq!(verdict(&pol(""), &f, &none), CommitVerdict::Valid);
+        // ...but not by an unbound one (the bound-sender rule comes first).
+        f.sender_bound = false;
+        assert!(matches!(
+            verdict(&pol(""), &f, &none),
+            CommitVerdict::Invalid(_)
+        ));
+        // (4) root or admin, exact.
+        for who in ["did:root", "did:adm"] {
+            let mut f = facts(who);
+            f.removes = s(&["did:x"]);
+            assert_eq!(verdict(&pol(""), &f, &none), CommitVerdict::Valid);
+        }
+        // (4) a v1 policy: any bound member may remove anyone.
+        let v1 = RoomPolicy::default();
+        let mut f = facts("did:m");
+        f.removes = s(&["did:x"]);
+        assert_eq!(verdict(&v1, &f, &none), CommitVerdict::Valid);
+        f.sender_bound = false;
+        assert!(
+            matches!(verdict(&v1, &f, &none), CommitVerdict::Invalid(_)),
+            "a v1 room still needs a bound sender"
+        );
+    }
+
+    #[test]
+    fn the_residual_halt_is_only_a_card_dependent_remove() {
+        let none = NoLocalKnowledge;
+        // Another DID, non-root non-admin, v2, no signed leave, not a re-seat.
+        let mut f = facts("did:m");
+        f.removes = s(&["did:x"]);
+        let CommitVerdict::Undecidable(why) = verdict(&pol(""), &f, &none) else {
+            panic!("must halt")
+        };
+        assert!(why.contains("persona cards or signed leaves"), "{why}");
+        // With a real persona store the same commit is refused, as in Geb.
+        assert!(matches!(
+            verdict(&pol(""), &f, &Fake::default()),
+            CommitVerdict::Invalid(_)
+        ));
+        // A different re-seat set is still a card-dependent remove.
+        f.adds = s(&["did:y"]);
+        assert!(matches!(
+            verdict(&pol(""), &f, &none),
+            CommitVerdict::Undecidable(_)
+        ));
     }
 }

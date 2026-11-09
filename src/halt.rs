@@ -8,9 +8,13 @@
 //!   commit removed our leaf. This is permanent: until an operator has seen to
 //!   it that the bridge was admitted to the room again, retrying only repeats
 //!   the refusal.
-//! - [`HaltReason::UndecidableCommit`]: a commit needs knowledge this device
-//!   does not have (persona cards, signed leaves), so it can be neither merged
-//!   nor skipped without risking a silent fork of the epoch. The record keeps
+//! - [`HaltReason::UndecidableCommit`]: a Remove of another DID by a non-root,
+//!   non-admin sender in a v2 room, with no signed leave we hold and not a
+//!   re-seat. A Geb device holding a persona card that links the two DIDs would
+//!   merge it, and this bridge holds no persona store, so it can be neither
+//!   merged nor skipped without risking a silent fork of the epoch. This halt
+//!   is a deliberate bridge-side choice: Geb itself refuses such a commit and
+//!   goes on, it never halts a room. The record keeps
 //!   the commit's epoch and hash. Clearing it makes the link read the commit
 //!   again: if it is still undecidable the link halts again at once.
 

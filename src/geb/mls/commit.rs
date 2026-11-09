@@ -13,10 +13,11 @@
 //!    makes);
 //! 2. no proposal is a kind Geb's check is not described for (Update,
 //!    PreSharedKey, ReInit, ExternalInit, SelfRemove, custom);
-//! 3. it is decidable without persona cards: since P0-d that is every commit
-//!    except a Remove of a different DID by a sender who is neither root nor
-//!    admin and a direct-room Add of a DID that is not exactly a pair member
-//!    (`geb::policy::valid_commit` has the table);
+//! 3. it is decidable without persona cards: every commit except a Remove of
+//!    another DID by a non-root, non-admin sender in a v2 room with no signed
+//!    leave and not a re-seat, and a direct-room Add of a DID that is not
+//!    exactly a pair member (`geb::policy::valid_commit` has the table; Geb
+//!    itself refuses those and goes on, we halt: a deliberate choice);
 //! 4. no added leaf carries a **forged** binding (a binding that is present
 //!    and does not verify). A missing binding passes: "seated, unverified".
 //!

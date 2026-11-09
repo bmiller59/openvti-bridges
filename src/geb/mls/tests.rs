@@ -70,13 +70,18 @@ impl World {
         extra_policy: &str,
         allow_direct: bool,
     ) -> World {
+        let pol = policy(&Sim::new(1).did, extra_policy);
+        Self::build_policy(inputs, pol, allow_direct)
+    }
+
+    /// As `build_with`, with the room's policy given whole (A founds it).
+    fn build_policy(inputs: Arc<dyn CommitCheckInputs>, pol: String, allow_direct: bool) -> World {
         let relay = Arc::new(FakeRelay::new());
         let relay_dyn: Arc<dyn GebRelay> = relay.clone();
         let bus = Bus::new();
         let clock = Arc::new(AtomicU64::new(10_000));
         let mut a = Sim::new(1);
         let mut b = Sim::new(2);
-        let pol = policy(&a.did, extra_policy);
         a.create_room(ROOM, &pol);
         let (c, w) = a.stage_add(b.key_package());
         let _ = c;
@@ -2026,4 +2031,105 @@ async fn a_welcome_into_a_direct_room_is_refused_and_nothing_is_kept() {
         assert_eq!(w.client.epoch(), None, "not seated, no group kept");
         assert!(w.client.members().is_empty());
     }
+}
+
+// ---- round 4: Q6 removes ------------------------------------------------------------
+
+/// F3 (4): a non-root, non-admin member's re-seat of someone else merges with
+/// no card (any member with a bound leaf), and in a v1 policy room any bound
+/// member's Remove merges.
+#[tokio::test]
+async fn a_member_may_re_seat_and_any_member_may_remove_in_a_v1_room() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    // B re-seats A (root) onto a fresh package of A: removes and adds are the
+    // same set, no policy change.
+    let a_did = w.a.did.clone();
+    let c = w.b.stage_reseat(&a_did, Sim::new(1).key_package());
+    w.post_mc(&w.b, &c).await;
+    w.b.merge_pending();
+    settle_posted(&w).await.unwrap();
+    assert_eq!(w.client.epoch(), Some(w.b.epoch()));
+    assert!(w.client.members().contains(&a_did));
+    assert!(w.our_keys_match(&w.b));
+
+    // v1 policy: B (no root, no admins) removes A and it merges.
+    let v1 = r#"{"v":1,"committer":"any-staged","settleWindowMs":3000}"#.to_string();
+    let mut w = World::build_policy(Arc::new(NoLocalKnowledge), v1, false);
+    w.seat().await;
+    let a_did = w.a.did.clone();
+    let c = w.b.stage_remove(&a_did);
+    w.post_mc(&w.b, &c).await;
+    w.b.merge_pending();
+    settle_posted(&w).await.unwrap();
+    assert!(!w.client.members().contains(&a_did));
+    assert!(w.our_keys_match(&w.b));
+}
+
+/// F3 (4): an admin is exact, and a v2 room's non-admin is not an admin.
+#[tokio::test]
+async fn an_admin_may_remove_in_a_v2_room_and_a_plain_member_may_not() {
+    let b = Sim::new(2);
+    let pol = format!(
+        r#"{{"v":2,"committer":"any-staged","settleWindowMs":3000,"root":"{}","admins":["{}"]}}"#,
+        Sim::new(1).did,
+        b.did
+    );
+    let mut w = World::build_policy(Arc::new(NoLocalKnowledge), pol, false);
+    w.seat().await;
+    let mut l = Sim::new(61);
+    add_member(&mut w, &mut l).await;
+    // B is an admin: its Remove of L merges.
+    let c = w.b.stage_remove(&l.did);
+    w.post_mc(&w.b, &c).await;
+    w.b.merge_pending();
+    settle_posted(&w).await.unwrap();
+    assert!(!w.client.members().contains(&l.did));
+}
+
+#[tokio::test]
+async fn without_a_signed_leave_the_healers_remove_halts_or_is_refused_by_who_holds_the_cards() {
+    // No persona store (production): the card-dependent residual halts.
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    let mut l = Sim::new(60);
+    add_member(&mut w, &mut l).await;
+    let epoch = w.client.epoch();
+    let c = w.b.stage_remove(&l.did);
+    w.post_mc(&w.b, &c).await;
+    w.b.drop_pending();
+    let t = w.now();
+    w.poll().await.unwrap();
+    w.at(t + 3000);
+    let e = w.poll().await.unwrap_err();
+    assert!(matches!(e, Error::UndecidableCommit(_)), "{e}");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("persona") && msg.contains("signed leave") && msg.contains("deliberate"),
+        "the halt says why and that it is our choice: {msg}"
+    );
+    assert_eq!(w.client.epoch(), epoch);
+
+    // A device that does hold the persona store refuses it and goes on to
+    // the next hash, as Geb does: A's ordinary commit (higher hash) merges.
+    let mut w = World::build(Arc::new(AllKnown), "");
+    w.seat().await;
+    let mut l = Sim::new(60);
+    add_member(&mut w, &mut l).await;
+    let (good, bad) = staged_pair(
+        &mut w.a,
+        &mut w.b,
+        false,
+        &|s| s.stage_self_update(),
+        &|s| s.stage_remove(&l.did),
+    );
+    w.post_mc(&w.b, &bad).await;
+    w.post_mc(&w.a, &good).await;
+    let e = w.a.epoch();
+    settle_posted(&w).await.unwrap();
+    assert_eq!(w.client.epoch(), Some(e + 1));
+    assert!(
+        w.client.members().contains(&l.did),
+        "the remove was refused"
+    );
 }
