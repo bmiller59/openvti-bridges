@@ -83,8 +83,8 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   strings are dropped, in our `kp` / `kp-stock` frames (`Frame::validate`) and
   in `geb::mls::parse_key_package`.
 - **Unknown group ops are ignored, unknown kinds are not** (`wire::parse_frame`).
-  A dyad frame `{k:"g", op:<not kp-stock|kp-req|rs|kp|welcome|kp-low|seat-check|leave>}` (Geb's `rc`,
-  `seat-ask`, or anything newer) parses as `GroupOp::Ignored`, is
+  A dyad frame `{k:"g", op:<not kp-stock|kp-req|rs|rc|seat-ask|kp|welcome|kp-low|seat-check|leave>}` (Geb's
+  `rq`, `rl`, or anything newer) parses as `GroupOp::Ignored`, is
   logged, recorded done and ACKED, and never reaches the consumer. An unknown
   frame kind `k`, a `g` frame without a string `op`, or a known op with a bad
   body still fails and is dropped unacked (a kind may carry authority).
@@ -94,8 +94,10 @@ Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
   `seat-ask` and unknown ops (Geb drops unknown ops too). **`leave` is the
   exception: it is a real op** (`GroupOp::Leave`, `{k:"g", op:"leave", room:{id},
   by, at, sig}`), handed to the group, verified, and still acked; a malformed one
-  is acked and ignored. See "Signed leaves". No reply to `rc` / `seat-ask` is
-  built.
+  is acked and ignored. See "Signed leaves". `rs`, `rc` and `seat-ask` are real
+  ops now (`GroupOp::Rs/Rc/SeatAsk`): see "Room status, catch-up and re-seat".
+  A `seat-ask` from a peer needs nothing from us (we are never the healer): acked,
+  no action.
 - **Signed leaves (receive only)** (answers round 2 section 8, round 4 Q7;
   `geb/leave.rs`). Ignoring a leave is safe only if we take the signed room
   line, or a device with …
@@ -358,9 +360,8 @@ own acceptance unconfirmed), 7 (refused). Kept below as asked.
    `leafAuth`-violating commit "refused" (next hash, cursor moves) exactly like a
    `validCommit` failure, or "failed" (cursor stays, `rs`)? We implement
    refused.
-4. `rs` / `rc` / `seat-ask` details (P1): `forkMineWins`, when a client is
-   behind long enough to `askReseat`, and whether `rc`'s `e` is the epoch it was
-   made from.
+4. (ANSWERED, round 4 Q9, built) `rs` / `rc` / `seat-ask` details: `forkMineWins`,
+   when a client `askReseat`s, `rc`'s `e` is the from-epoch.
 5. Does an unacked dyad frame block or only repeat on Geb's ratchet, and is a
    reply required to `rs` / `rc` / `leave`? (We ack and ignore unknown ops.)
 6. Does the heal need the same signature key, and does "bound sender" read the
@@ -375,8 +376,7 @@ ANSWERED by round 4: 1 (an `rs` with no valid `s` is DROPPED), 4 (`n:0` is
 valid, gen + 1), 5 (a lifetime of exactly 84 d + 1 h is not refused); 2 and 3
 only partly (relay figures now UNCONFIRMED, see "Round 4 answers").
 
-1. Does Geb accept (or silently ignore) an `rs` with no status body `s`, and is a
-   seat-check answered by anything short of a full `rs`? (We send the minimal one.)
+1. (ANSWERED, round 4 Q8: dropped; we now send the full body.)
 2. With `fc:0`, is a Welcome over 120,000 bytes really never delivered, or is
    there a fallback (a re-send in pieces, a smaller tree)? What room size is the
    practical limit?
@@ -392,11 +392,10 @@ only partly (relay figures now UNCONFIRMED, see "Round 4 answers").
 M3 remainder: persona-card intake (`geb::policy::CommitCheckInputs` has no
 persona implementation; the card-dependent Remove halts the link); SENDING a
 leave, the healer election and Remove commits (we only RECEIVE signed leaves);
-a re-seat after a fork (`rs` is sent, a replacement Welcome is not processed);
 a peer index (the dyad is driven per peer DID, peers are listed per link in
-`geb_peers`); `fc` fragments; the `rs` status body and its fork repair (`rs` is
-sent minimal, and Geb DROPS it: see "Round 4 answers"); `seat-ask` and `rc`
-handling; accepting a re-seat Welcome; dead-branch line re-post; fork choice.
+`geb_peers`); `fc` fragments; healer duty (electing, committing a re-seat or Remove, we
+only follow: see "Room status, catch-up and re-seat"); the `status` command
+does not show the recorded split (it is in the sealed MLS snapshot).
 Also not built on the room side: recovery of a sealed record left at a wrong
 version by a crash mid-race (it is reported as a typed read error).
 
@@ -449,13 +448,73 @@ checked against a live Geb; the status of each point is stated.
   device DID is a new member; a wiped store sends a `seat-ask` with a fresh bound package. Silence never
   commits.
 
+### Room status, catch-up and re-seat (built; the bridge stays a follower)
+
+Code: `geb/status.rs` (pure: body, `cleanStatus`, `compareStatus`,
+`forkMineWins`), `geb/mls/client/heal.rs` (the client side), `geb/room.rs`
+(re-read, re-post). Built strictly to Geb 0.5.15 as written; nothing assumes an
+alignment change.
+
+- **`rs` sent**: `{k:"g", op:"rs", room:{id}, s:{e, a, chain, lines?, ls?}, via?}`.
+  `e` = our MLS epoch, `a` = first 16 hex of the OpenMLS epoch authenticator,
+  `chain` = persisted settled Commits `{e: epoch the Commit MADE, h: winner
+  SHA-256 (16 hex), a: authenticator there}` (sealed snapshot field `heal`;
+  an older snapshot loads with an empty chain), newest 300 only (a dyad frame
+  must fit one event; we say `fc:0`). `lines` / `ls`: only our own lines
+  (up to 100 kept) and our join time, omitted until we hold one. Sent: after
+  joining, after each settle that applied a Commit (to member peers except a
+  newly added one), once after a Commit failed to process, at start (1.5 s and
+  8 s after the first settle pass), when a dyad answers for the first time or
+  again after an error, in answer to a status, and to a seat-check. **Minimum
+  interval per peer: 5 s for an unchanged (epoch, authenticator)**; a changed one
+  goes at once; the same answer to the same status at most once a minute; so the
+  1.5 s start send is usually absorbed by the join send.
+- **`rs` received** (from a member's exact device DID only; a non-member's is
+  dropped; no valid `s` is dropped, never a fork signal): `compare_status`:
+  equal, nothing; they lag: each Commit we hold from their epoch as `{op:"rc",
+  room, e: from-epoch, c}` (newest 64 kept, in memory only) then our status;
+  behind: re-read from the start of the relay's retention (`SettleReport.reread`,
+  at most every 30 s), our status, and the same (mine, theirs) pair seen again a
+  settle window later is `askReseat` (`seat-ask` WITHOUT `kp`, once per 600 s,
+  then our `rs` is quiet 600 s); fork: lowest common epoch with differing
+  authenticators, lower wins, adjusted by `fork_mine_wins` (Q9 rules). The split
+  is recorded (`MlsGroupClient::split()`, persisted, WARN log). A winner marks the
+  loser asked for the elected healer; a loser does NOT askReseat and waits. We
+  never commit.
+- **`rc` received**: `e` below our epoch dropped, equal judged at once, later held
+  (at most 64), all through the settle queue (`validCommit` and `leafAuth` apply).
+- **`seat-ask` with `kp`** (always a freshly minted BOUND package, backed off 600 s;
+  its keys are kept 7 days): a Welcome whose KeyPackage we no longer hold; a
+  local copy that is missing/evicted (snapshot says we were seated, group gone); a
+  `seat-check` while we hold nothing; a re-seat Welcome that has not come 120 s
+  after the re-seat Commit merged.
+- **Re-seat**: a Welcome while seated (or while `Reseating`) replaces the group:
+  only from a current member's device, after `treeRefusal`, the direct-policy
+  refusal and the other Welcome checks, and only if our own leaf names our DID,
+  is bound and carries the key we hold. The old group is deleted from storage
+  first (OpenMLS refuses `GroupAlreadyExists` otherwise); any refusal restores a
+  copy of the old store. State reset: settle queue, chain, heard epochs; relay keys
+  re-derive from the new group and the room is re-read. A merged re-seat Commit
+  that removes our leaf and adds our DID is NOT a removal: state `Reseating`
+  until its Welcome arrives.
+- **Dead-branch re-post**: our own sent text lines are kept (at most 100, 256 KiB,
+  in the sealed snapshot; never others'). After a re-seat those sent at an epoch
+  at or above the recorded split's epoch (else our old epoch) are re-posted,
+  re-signed, `{t:"l", ..., fk:1, id}` with the original `at` and the derived id,
+  directly through the group (not the pump). Our own leaf is skipped on read, so
+  nothing is re-bridged; an incoming `fk` line whose id we already hold is dropped.
+- **UNVERIFIED**: `compareStatus` exact algorithm; empty-vs-truncated chain
+  behaviour at Geb; a chain that starts at our join (no entry for the Welcome's
+  epoch); authenticator truncation; `via` meaning; `every` over an empty `others`
+  list (we read it as true); whether `fk` lines are signed over `fk`/`id`; which
+  dead-branch lines Geb expects; when Geb counts us seen; `cleanStatus` on a bad
+  chain entry (we drop the whole status).
+
 ### Open items (recorded, not built)
 
 - `fc` fragments (large-room joins fail; see Capabilities).
-- A proper `rs` status body `s:{e, a, chain, ...}` (THE NEXT TASK: Geb drops our
-  minimal `rs`, so it currently has no effect at all), `rc`, `seat-ask`, and
-  accepting a re-seat Welcome (P1). Until then our `rs` is the minimal
-  `{k:"g", op:"rs", room:{id}}`.
+- Healer duty (re-seating a fork loser, electing, committing): not built, the bridge
+  only follows. `status` does not show the recorded split.
 - Re-stocking a SEATED member every 7 days (re-seat needs it; there is no natural
   place until the dyad is driven while seated; we do read it every 30 s while
   seated for `kp-low` / `seat-check`).
@@ -481,73 +540,66 @@ usual wrapper; and, from round 3:
   relay's per-event cap is UNCONFIRMED (131,072 in the repo copy, raised to
   256 KB on 2026-11-02 per Geb's record).
 
-## Round 4 answers (2026-11-09, `Geb's path B answers, round 4`, read at `fdf804d`)
+## Round 4 answers (2026-11-09, read at `fdf804d`): summary notes
 
-Geb's word as written; none checked against a live Geb. Four of our readings
-would have forked us (Q1, Q2, Q6, Q7); all four are fixed (`git log`).
+Summary in our own words; Geb's answers are private and not reproduced. Nothing here is checked against
+a live Geb. Four of our earlier readings would have forked us (the settle walk, the heal rule, the
+removes rule and signed leaves); all four are fixed (`git log`).
 
-**Acted on.** Q1: the settle walk never stops on any candidate (refused and
-failed both skip; cursor and `rs` only if nothing merged). Q2: `selfHeal`. Q6:
-Geb's exact removes rule, with the persisted halt kept ONLY for the
-card-dependent residue (a deliberate bridge-side choice). Q7: signed leaves are
-received (room line and dyad frame) and feed rule (2).
+**Acted on.**
+- The settle walk never stops on any candidate: refused and failed both skip, and the cursor and `rs`
+  move only if nothing merged.
+- The heal rule (`selfHeal`) is implemented for an unbound sender.
+- The removes rule follows Geb's exact rule, with the persisted halt kept only for the card-dependent
+  residue (a deliberate bridge-side choice).
+- Signed leaves are received (room line and dyad frame) and feed rule (2) of the removes rule.
 
 **Confirmed (no longer UNVERIFIED).**
-- Q3: a heal needs the same DID and, if a binding is present, a valid one; the
-  new key is not compared with the old.
-- Q4: root and admin are an EXACT DID compare (`roleOf`, `mayRemove`,
-  `mayChangePolicy`, `unboundClaim`); persona cards widen only …
-  … adds. A root's sibling
-  device has no rights.
-- Q5: a DID removed in the same commit still counts as seated: an unbound
-  re-seat leaf is refused (`unboundClaim`).
-- Q7: an unacked dyad frame never blocks the ratchet; ack-and-ignore is safe for
-  `rc`, `seat-ask` and unknown ops, not for `leave`.
-- Q8: an `rs` with no valid body `s` is DROPPED (`cleanStatus`, then `return
-  null`): never a fork signal, never marks us "seen", never gets us `rc` or a
-  re-seat. **So our current minimal `rs` has no effect at all; the proper `rs`
-  status body is the next task.** An unanswered seat-check commits nothing
-  ("silence alone never commits").
-- Q9 (for the `rs`/re-seat task, not built): `rc`'s …
-  … (receivers judge at once when `e` equals theirs, keep up to 64
-  for later epochs, drop below). `forkMineWins(hashWins, mine, theirs, others)`:
-  (1) `theirs > mine` and every `other > mine`: I lose; (2) `theirs < mine` and
-  every `other > theirs`: I win; else `hashWins` (at the lowest common epoch where
-  authenticators differ, the lower authenticator wins). …
-  … when behind (same `(mine, theirs)` pair seen
-  again a settle window later) or when evicted/missing, at most once per 600 s;
-  it sends `seat-ask` with no `kp`, after which our `rs` stays quiet 600 s.
-- Q10: after a re-seat each device re-posts ITS OWN dead-branch lines (original
-  `id` and `at`, `{t:"l", ..., fk:1, id}`, at most 100, text only); we cannot
-  leave it to others. Not built.
-- Q11: an over-budget frame is sent whole to an `fc:0` peer; Geb's sender sets
-  it aside only above 258,048 bytes; no fallback route; members per room before
-  a Welcome needs fragments is not measured.
-- Q12: no fragment sample exists yet (owed).
-- Q15: a KeyPackage lifetime of exactly 84 d + 1 h is NOT refused (receivers
-  check only that now is in `[not_before, not_after]`; Geb adds no check).
-- Q16: `kp-low` with `n:0` is valid (`n` from 0 to `STOCK_N - 1`); the gen after
-  a loss is `max(last gen sent, their gen) + 1`, i.e. theirs + 1 as implemented.
-- Q17: more than 16 `kp-stock` entries: the first 16 that pass the pattern and
-  length filter are kept.
-- Q18: `ieee7012Agreed` is a required boolean whose value is never checked;
-  `false` is accepted.
-- Q19: Geb's OpenMLS 0.8.2 is stock (registry source, no `[patch]`, no `.cargo`).
+- A heal needs the same DID and, if a binding is present, a valid one; the new key is not compared with
+  the old.
+- Root and admin are an exact DID compare; persona cards widen only leave-by-own-person, the devices a
+  signed leave covers and direct-room adds. A root's sibling device has no rights.
+- A DID removed in the same commit still counts as seated, so an unbound re-seat leaf is refused.
+- An unacked dyad frame never blocks the ratchet; ack-and-ignore is safe for `rc`, `seat-ask` and
+  unknown ops, not for `leave`.
+- An `rs` without a valid status body is dropped: not a fork signal, never marks us seen, earns no `rc`
+  or re-seat. An unanswered seat-check commits nothing. (Built since: we send the proper body.)
+- `rc` carries the epoch the Commit was made from; receivers judge at once when it equals theirs, keep up
+  to 64 for later epochs and drop earlier ones. Fork choice (`fork_mine_wins`): I lose if theirs is above
+  mine and every other is above mine; I win if theirs is below mine and every other is above theirs;
+  otherwise the lower authenticator at the lowest differing common epoch wins. A fork loser waits and
+  does not ask for a re-seat; `askReseat` fires when behind or evicted, at most once per 600 s, sends
+  `seat-ask` without `kp`, and keeps our `rs` quiet for 600 s afterwards. Built.
+- After a re-seat each device re-posts its own dead-branch lines (original `id` and `at`, at most 100,
+  text only). Built; the exact `fk` shape is UNVERIFIED.
+- An over-budget frame goes whole to an `fc:0` peer and is not delivered above the relay's per-event cap;
+  there is no fallback route. No fragment sample exists yet, and the room size at which a Welcome needs
+  fragments is not measured.
+- A KeyPackage lifetime of exactly 84 days plus one hour is not refused (receivers check only that now
+  lies inside the lifetime). `kp-low` with `n:0` is valid and the gen after a loss is theirs + 1. The
+  first 16 `kp-stock` entries passing the pattern and length filter are kept. `ieee7012Agreed` is a
+  required boolean whose value is not checked, so `false` is accepted. Geb's OpenMLS is the stock registry
+  release.
 
-**Relay figures are now UNCONFIRMED (Q13, Q14).** Geb's repo copy of the strfry
-config is out of date: per-event 131,072 there, raised to 256 KB on 2026-11-02 per
-Geb's record (and); subscriptions per connection 20 there,
-raised to 200 on 2026-11-04 (round 3's "20" was stale); future `created_at`
-900 s, no change recorded; NIP-40 deletion vs hiding unconfirmed. Geb will read
-the live config. We keep planning to 120,000 bytes either way and keep our 8
-concurrent catch-up reads.
+**Relay figures are UNCONFIRMED.** Geb's own copy of its relay config is out of date; the per-event cap,
+subscriptions per connection and expiry handling may differ live, and Geb has said it will check. We plan
+to 120,000 bytes either way and keep our 8 concurrent catch-up reads.
 
-**Not decided yet (Geb, Geb's maintainers decide):** which of seven cases the compatibility
-run uses and whether test switches run on throwaway Geb nodes; a fragmented
-frame sample; publishing the live relay config; …
-… joining.
+**Decisions Geb has not made yet.** Which test cases the compatibility run uses and whether test switches
+run on throwaway nodes; a fragmented-frame sample; publishing the live relay settings; …
+… joining. The fixed transcript for the compatibility cases follows
+separately; each case can be staged from Geb's own CLI.
 
-**Q20/Q21.** The fixed transcript follows separately. Every case in Q21 can be
-staged from the `geb` CLI today (bound add, unbound add, heal with
-`GEB_TEST_NO_BINDING=1`, forced fork + re-seat, `geb group leave`, a line over
-20,000 characters, a Commit Geb refuses).
+### Remaining questions for Geb (rs / re-seat round)
+
+1. How exactly does Geb compare status chains with no common epoch, or a chain that does not reach back to
+   the peer's epoch?
+2. What does a joiner's chain hold for epochs before its join and for the epoch its Welcome gave it (we
+   send no entry, only the epoch and authenticator)?
+3. Is `a` the first 16 hex of the epoch authenticator bytes?
+4. Does a receiver cap the chain it accepts per frame (we send the newest 300)?
+5. Is a re-post signed over its fork marker and id (we sign the whole plaintext without `sg`), and is the
+   id the derived 32-hex id?
+6. Which dead-branch lines does Geb re-post (we: those sent at or after the split epoch, else at our old
+   epoch)?
+7. For the fork choice, is the "every" over an empty list of others true (we read it so)?

@@ -388,9 +388,8 @@ the first read starts at the 7-day retention floor, never unbounded.
 |---|---|---|
 | Identity, dyad, VRC v2, mailbox envelopes, ratchet | Built; vectors bind the primitives; the whole flow only against our own test relay | Interop with a live Geb is unproven |
 | MLS seating, lines, settle rule, 0.5.15 commit rules | Built behind `geb-mls`; tested only against an in-process second OpenMLS client | Wire compatibility with Geb's OpenMLS 0.8.2 is inferred, not shown |
-| `rs` status body (`s:{e, a, chain, ...}`) | Not built; we send the minimal `{k:"g", op:"rs", room:{id}}` | Geb DROPS an `rs` with no valid `s` (confirmed, round 4 Q8): ours has no effect at all, never counts as "seen", does not answer a `seat-check`; nothing worse follows (silence never commits). Fork repair through `rs` does not work. The proper body is the next task |
-| `seat-ask` and `rc` | Not built; acked and ignored | A wiped or re-keyed bridge cannot ask to be re-seated; Geb's expected reply is not sent |
-| Accepting a re-seat Welcome | Not built; a Welcome received while seated is not processed | After an epoch fork or removal the bridge cannot rejoin by itself |
+| Healer duty (electing, committing a re-seat or Remove) | Not built, deliberately: the bridge follows | A fork the bridge wins needs a Geb member to heal the loser; the bridge only marks the loser "asked". The recorded split is in the sealed MLS snapshot, not shown by `status` |
+| `rs`, `rc`, `seat-ask`, re-seat Welcome, dead-branch re-post | Built (round 2 sections 5 and 8, round 4 Q8-Q10): proper `rs` body, `compareStatus` and `forkMineWins`, `rc` both ways, `seat-ask` (no `kp` when behind, bound `kp` otherwise), group replacement from a re-seat Welcome, own-line re-post | Several details are UNVERIFIED (CLAUDE.md "Room status, catch-up and re-seat"): the exact `compareStatus`, the chain before our join (empty), authenticator truncation, the `fk` shape. Tested only against the in-process second client, never a Geb node. Commit bytes for `rc` are memory-only |
 | Signed leave, receiving (`{t:"lv", at, ls}`, dyad `leave`) | Built (`geb/leave.rs`) | Feeds `validCommit` rule (2) |
 | Signed leave, sending; healer duty; Remove commits | Not built; `leave` fails closed | The bridge cannot leave a room cleanly; the leaf stays until someone removes it. Also, a refused direct-room Welcome leaves the adder's leaf in that room |
 | Persona-card intake | Not built; only `NoLocalKnowledge` plus held signed leaves exists | One card-dependent Remove halts the link (section 8); Geb itself would refuse and continue |
@@ -468,7 +467,7 @@ The analysis is reasoning, not testing. The residual risk is bounded, not elimin
 | **Bridge compromise.** Attacker gets the exported Geb keys and the bridge's room role | One identity per link; the persona and seed never leave the VTA; at-rest encryption protects disks; revocation is removing the ACL entry | A live compromise reads everything. Key rotation is manual; `link remove` does not revoke the VTA key records. No tested wss/TLS path |
 | **Injection from Geb** into the room (prompt injection aimed at agents, misleading text, oversize or malformed input) | Records are `basis: "observed"` with a provenance block; text is fenced longer than any backtick run; control characters stripped; 80,000-byte cap; no action is triggered by bridged content; unknown kinds dropped | Whether the VTI room's existing content handling is sufficient for hostile text from a stranger-populated room was never checked. Anything that reads the room, especially an agent, must treat bridged records as untrusted |
 | **Spoofed attribution** | A Geb line's `sg` is verified against the author's device DID; the result is recorded in the provenance block; unsigned and forged lines are still bridged but labelled `UNVERIFIED`. In the other direction the quoted author is the bridge's assertion | Geb members cannot verify the quoted VTC author. A forged name can appear inside quoted text |
-| **Epoch fork** on the Geb side (a wrong commit decision silently drops the bridge from the group) | The settle rule and 0.5.15 `validCommit` rules, Geb's exact removes rule, signed leaves received; never skipping a commit silently; without `geb-mls` every commit refuses; the one card-dependent Remove (and a direct-room add of a non-exact DID) halts the link | Persona cards are not implemented (section 8); fork repair is not built. Root and admin are an exact DID compare (confirmed, round 4 Q4) |
+| **Epoch fork** on the Geb side (a wrong commit decision silently drops the bridge from the group) | The settle rule and 0.5.15 `validCommit` rules, Geb's exact removes rule, signed leaves received; never skipping a commit silently; without `geb-mls` every commit refuses; the one card-dependent Remove (and a direct-room add of a non-exact DID) halts the link; `rs` sent and compared, `rc` taken, the fork loser waits and accepts a re-seat Welcome | Persona cards are not implemented (section 8); healer duty is not built, so a split needs a Geb member to heal it. Root and admin are an exact DID compare (confirmed, round 4 Q4) |
 | **Echo loops and duplication** | Own-persona and provenance-marker skip on the VTC side; own-DID, own-leaf and `deny_list` skip on the Geb side; xref; create-only deterministic keys | A bridge not listed in `deny_list` and with a different device DID is bridged like any member |
 | **Relay availability and 7-day expiry** | Capped jittered reconnect, a startup catch-up read from the 7-day floor, relay manners from round 3 | One relay is the only resting place; no gap record; lines lost during a long outage are not noticed in the room |
 | **Unstable upstream** (no versioned spec) | Pinned to one release; unknown envelope, frame and plaintext kinds fail closed or are dropped; Geb-specific shapes sit behind `GebCodec` and the other `geb::traits` | Wire compatibility with Geb's OpenMLS 0.8.2 is inferred. Geb `wire: 2` in release metadata is not a compatibility signal; nothing reads it |
@@ -526,7 +525,7 @@ unless something changed. Both commands open the link's store, so `run` must be 
   typed read error.
 - A restart loses the settle queue (re-read from the relay; the cursor barrier holds the position)
   and the dedup window (the journal covers it).
-- After a real fork or removal, rejoining needs re-seating, which is not built (section 5).
+- After a real fork the bridge asks and waits: a Geb member must commit the re-seat (healer duty is not built). A re-seat Welcome is accepted; if it never comes the bridge asks again with a fresh bound package every 600 s.
 - An oversize outbox entry cannot come out of the mapping layer (it cuts at 20,000 bytes), but if
   one existed it would be retried every tick rather than dropped.
 
@@ -665,10 +664,10 @@ Answered and confirmed (no longer UNVERIFIED):
   Whether OpenMLS 0.8.2 itself accepts a new key in an update path is unconfirmed.
 - A DID removed in the same commit still counts as seated for `unboundClaim` (Q5).
 - An unacked frame never blocks the ratchet; ack-and-ignore is safe except for `leave` (Q7).
-- An `rs` with no valid status body is dropped (Q8): our minimal `rs` has no effect.
-- `rc`'s `e` is the from-epoch; `forkMineWins` and `askReseat` as in round 4 Q9 (for the `rs`
-  task, not built). After a re-seat each device re-posts its own dead-branch lines (Q10, not
-  built).
+- An `rs` with no valid status body is dropped (Q8); ours carries the body now.
+- `rc`'s `e` is the from-epoch; `forkMineWins` and `askReseat` as in round 4 Q9 (built). After a
+  re-seat each device re-posts its own dead-branch lines (Q10, built; the `fk` shape is
+  UNVERIFIED).
 - A KeyPackage lifetime of exactly 84 d + 1 h is not refused (Q15); `kp-low` `n:0` is valid and
   the gen after a loss is theirs + 1 (Q16); the first 16 `kp-stock` entries that pass the filter
   are kept (Q17); `ieee7012Agreed` is a required boolean, value never checked (Q18).
