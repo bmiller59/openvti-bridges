@@ -403,6 +403,33 @@ impl Sim {
         c.tls_serialize_detached().unwrap()
     }
 
+    /// A GroupContextExtensions commit that changes something other than the
+    /// policy: the room policy with the required capabilities extension dropped. Not a shape Geb's
+    /// `validCommit` is described for.
+    pub fn stage_policy_with_extra_extension(&mut self, policy_json: &str) -> Vec<u8> {
+        let exts = Extensions::<GroupContext>::from_vec(vec![
+            Extension::Unknown(
+                leaf::EXT_POLICY,
+                UnknownExtension(policy_json.as_bytes().to_vec()),
+            ),
+            Extension::ExternalSenders(vec![]),
+            Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+                &[ExtensionType::Unknown(leaf::EXT_POLICY)],
+                &[],
+                &[],
+            )),
+        ])
+        .unwrap();
+        let (p, s) = (&self.provider, &self.signer);
+        let (c, _, _) = self
+            .group
+            .as_mut()
+            .unwrap()
+            .update_group_context_extensions(p, exts, s)
+            .unwrap();
+        c.tls_serialize_detached().unwrap()
+    }
+
     pub fn merge_pending(&mut self) {
         let p = &self.provider;
         self.group

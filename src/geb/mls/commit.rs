@@ -14,7 +14,10 @@
 //!    confirmation tag, required capabilities: the same checks every member
 //!    makes);
 //! 2. no proposal is a kind Geb's check is not described for (Update,
-//!    PreSharedKey, ReInit, ExternalInit, SelfRemove, custom);
+//!    PreSharedKey, ReInit, ExternalInit, SelfRemove, custom): such a commit
+//!    is REFUSED and the walk goes on, never a halt (UNVERIFIED against Geb:
+//!    the answers do not say; refusing matches how Geb treats a commit that
+//!    fails its check, round 4 Q1);
 //! 3. it is decidable without persona cards: every commit except a Remove of
 //!    another DID by a non-root, non-admin sender in a v2 room with no signed
 //!    leave and not a re-seat, and a direct-room Add of a DID that is not

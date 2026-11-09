@@ -30,15 +30,48 @@
 //!   held commit, not at the event's `created_at`;
 //! - a commit arriving after its epoch's candidates were settled (all refused)
 //!   is a new candidate with a new window;
-//! - commits made from an epoch ahead of ours are held, never tested, and at
-//!   most [`MAX_HELD`] are kept: more than that is a hard stop, because
-//!   dropping a candidate could change the winner.
+//! - commits made from an epoch ahead of ours are held, never tested. They are
+//!   bounded because `e` is unauthenticated: more than [`MAX_EPOCHS_AHEAD`]
+//!   ahead is dropped at once, at most [`MAX_HELD_AHEAD`] ahead-of-us commits
+//!   are kept (a further one is dropped, newest first), and they never hold the
+//!   read cursor back ([`SettleQueue::barrier_secs`]). A dropped commit is
+//!   re-read from the relay, or answered by an `rc`, once we are behind enough
+//!   for `rs` to say so; Geb's answers state no such cap, so this is a
+//!   bridge-side limit and its choice (drop, never halt) is UNVERIFIED;
+//! - at most [`MAX_HELD`] commits are held in all. When full, a held commit
+//!   already recorded failed is evicted (oldest first) to make room, else the
+//!   new commit is dropped (newest first). Dropping a current-epoch candidate
+//!   could in principle change the winner, but halting the link on a count
+//!   any member can inflate is worse; the drop is logged as a security alert.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// Most commits held at once.
 pub const MAX_HELD: usize = 256;
+
+/// Most held commits made from an epoch ahead of ours.
+pub const MAX_HELD_AHEAD: usize = 64;
+
+/// How far ahead of our epoch a commit's (unauthenticated) `e` may be and
+/// still be held. A commit from further ahead cannot be judged until we have
+/// merged the epochs between, which we only learn about from the relay or an
+/// `rc` again; it is dropped at the door.
+pub const MAX_EPOCHS_AHEAD: u64 = 8;
+
+/// What [`SettleQueue::hold`] did with a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    /// Newly held.
+    New,
+    /// This exact commit is already held or was already settled as refused.
+    Duplicate,
+    /// Not held, on purpose (the reason is for the log). Never an error: the
+    /// `e` and the bytes of an `mc` are unauthenticated until it is judged, so
+    /// any member can make a queue limit bite, and a limit must not fail a
+    /// poll or stop the link.
+    Dropped(&'static str),
+}
 
 /// SHA-256 of the commit bytes: the ordering key.
 pub type CommitHash = [u8; 32];
@@ -157,22 +190,31 @@ impl SettleQueue {
         &self.failed
     }
 
-    /// The smallest `event_secs` among held and failed-held commits: the read
-    /// cursor must not pass it.
-    pub fn barrier_secs(&self) -> Option<u64> {
-        self.held.iter().map(|c| c.event_secs).min()
+    /// The smallest `event_secs` among the held commits the read cursor must
+    /// stay before: those made from `epoch` (ours). A commit from an epoch
+    /// ahead of ours is not judgeable yet and its `e` is unauthenticated, so
+    /// it never holds the cursor (it stays in memory; if the cursor passes it
+    /// and we restart, the heal path re-reads or asks for an `rc`; UNVERIFIED
+    /// against Geb, which the answers do not describe).
+    pub fn barrier_secs(&self, epoch: u64) -> Option<u64> {
+        self.held
+            .iter()
+            .filter(|c| c.parent_epoch <= epoch)
+            .map(|c| c.event_secs)
+            .min()
     }
 
-    /// Hold a commit. Returns `Ok(true)` when it is new, `Ok(false)` when this
-    /// exact commit is already held or was already settled as refused. A full
-    /// queue is an error: dropping a candidate could change the winner.
+    /// Hold a commit made from `parent_epoch` while we are at `epoch`. A
+    /// commit that cannot be held is dropped ([`Held::Dropped`]), never an
+    /// error; see the module docs for the bounds and why.
     pub fn hold(
         &mut self,
+        epoch: u64,
         parent_epoch: u64,
         bytes: Vec<u8>,
         event_secs: u64,
         now_ms: u64,
-    ) -> Result<bool, String> {
+    ) -> Held {
         let hash = commit_hash(&bytes);
         // Bounded memory: forgetting old refusals only means a re-sent refused
         // commit is tested (and refused) again.
@@ -180,10 +222,24 @@ impl SettleQueue {
             self.refused.clear();
         }
         if self.held.iter().any(|c| c.hash == hash) || self.refused.contains(&hash) {
-            return Ok(false);
+            return Held::Duplicate;
+        }
+        if parent_epoch > epoch {
+            if parent_epoch - epoch > MAX_EPOCHS_AHEAD {
+                return Held::Dropped("made from an epoch too far ahead of ours");
+            }
+            if self.held.iter().filter(|c| c.parent_epoch > epoch).count() >= MAX_HELD_AHEAD {
+                return Held::Dropped("too many commits held from epochs ahead of ours");
+            }
         }
         if self.held.len() >= MAX_HELD {
-            return Err(format!("more than {MAX_HELD} commits held"));
+            // Make room by evicting a commit already recorded failed (oldest
+            // first); otherwise the newcomer is the one dropped.
+            let Some(at) = self.held.iter().position(|c| self.failed.contains(&c.hash)) else {
+                return Held::Dropped("too many commits held for the settle window");
+            };
+            let gone = self.held.remove(at);
+            self.failed.remove(&gone.hash);
         }
         self.held.push(Candidate {
             hash,
@@ -192,7 +248,7 @@ impl SettleQueue {
             event_secs,
             bytes,
         });
-        Ok(true)
+        Held::New
     }
 
     /// Forget every held commit made from an epoch below `epoch` (they can no
@@ -349,7 +405,7 @@ mod tests {
     fn a_commit_is_held_until_the_window_runs_out() {
         let (lo, ..) = by_hash();
         let mut q = SettleQueue::new();
-        assert_eq!(q.hold(0, lo.clone(), 5, 1_000), Ok(true));
+        assert_eq!(q.hold(0, 0, lo.clone(), 5, 1_000), Held::New);
         let mut j = Script::default();
         assert_eq!(
             q.settle(0, 3000, 1_000, &mut j),
@@ -372,7 +428,7 @@ mod tests {
     fn a_zero_window_decides_at_once() {
         let (lo, ..) = by_hash();
         let mut q = SettleQueue::new();
-        q.hold(0, lo, 5, 1_000).unwrap();
+        q.hold(0, 0, lo, 5, 1_000);
         assert!(matches!(
             q.settle(0, 0, 1_000, &mut Script::default()),
             Outcome::Merged { .. }
@@ -390,7 +446,7 @@ mod tests {
         ] {
             let mut q = SettleQueue::new();
             for (i, c) in order.iter().enumerate() {
-                q.hold(4, (*c).clone(), 5, 1_000 + i as u64 * 100).unwrap();
+                q.hold(4, 4, (*c).clone(), 5, 1_000 + i as u64 * 100);
             }
             let mut j = Script::default();
             let out = q.settle(4, 3000, 5_000, &mut j);
@@ -413,8 +469,8 @@ mod tests {
     fn the_window_runs_from_the_earliest_sight() {
         let (lo, mid, _) = by_hash();
         let mut q = SettleQueue::new();
-        q.hold(0, mid, 5, 1_000).unwrap();
-        q.hold(0, lo, 5, 3_500).unwrap();
+        q.hold(0, 0, mid, 5, 1_000);
+        q.hold(0, 0, lo, 5, 3_500);
         let mut j = Script::default();
         // 3000 ms after the FIRST sighting.
         assert!(matches!(
@@ -432,7 +488,7 @@ mod tests {
         let (lo, mid, hi) = by_hash();
         let mut q = SettleQueue::new();
         for c in [&hi, &lo, &mid] {
-            q.hold(0, c.clone(), 5, 0).unwrap();
+            q.hold(0, 0, c.clone(), 5, 0);
         }
         let mut j = Script::default();
         j.verdicts.insert(lo.clone(), Verdict::Refused("x".into()));
@@ -448,7 +504,7 @@ mod tests {
         assert_eq!(j.tested, vec![lo.clone(), mid.clone()]);
         assert_eq!(j.merged, vec![mid]);
         // The refused commit coming round again is not a new candidate.
-        assert_eq!(q.hold(0, lo, 5, 9), Ok(false));
+        assert_eq!(q.hold(0, 0, lo, 5, 9), Held::Duplicate);
     }
 
     #[test]
@@ -457,7 +513,7 @@ mod tests {
         let mut q = SettleQueue::new();
         let mut j = Script::default();
         for c in [&lo, &mid, &hi] {
-            q.hold(0, c.clone(), 5, 0).unwrap();
+            q.hold(0, 0, c.clone(), 5, 0);
             j.verdicts.insert(c.clone(), Verdict::Refused("no".into()));
         }
         let out = q.settle(0, 0, 0, &mut j);
@@ -479,7 +535,7 @@ mod tests {
         let (lo, mid, hi) = by_hash();
         let mut q = SettleQueue::new();
         for c in [&hi, &lo, &mid] {
-            q.hold(0, c.clone(), 7, 0).unwrap();
+            q.hold(0, 0, c.clone(), 7, 0);
         }
         let mut j = Script::default();
         j.verdicts
@@ -498,7 +554,7 @@ mod tests {
         assert_eq!(j.merged, vec![hi]);
         // One merged: the failed candidate changes nothing (no rs, no cursor
         // barrier, nothing recorded failed).
-        assert!(q.is_empty() && q.barrier_secs().is_none());
+        assert!(q.is_empty() && q.barrier_secs(0).is_none());
         assert!(q.failed().is_empty());
     }
 
@@ -506,8 +562,8 @@ mod tests {
     fn with_no_merge_a_failed_candidate_keeps_the_cursor_and_asks_for_status_once() {
         let (lo, mid, _) = by_hash();
         let mut q = SettleQueue::new();
-        q.hold(0, lo.clone(), 7, 0).unwrap();
-        q.hold(0, mid.clone(), 9, 0).unwrap();
+        q.hold(0, 0, lo.clone(), 7, 0);
+        q.hold(0, 0, mid.clone(), 9, 0);
         let mut j = Script::default();
         j.verdicts
             .insert(lo.clone(), Verdict::Unprocessable("replay".into()));
@@ -528,7 +584,7 @@ mod tests {
         // The refused one is dropped; the failed one stays held, so the
         // cursor stays before it.
         assert_eq!(q.len(), 1);
-        assert_eq!(q.barrier_secs(), Some(7));
+        assert_eq!(q.barrier_secs(0), Some(7));
         assert!(q.failed().contains(&commit_hash(&lo)));
         // Judged again on the next settle, but the status is asked only once.
         let again = q.settle(0, 0, 10, &mut j);
@@ -545,8 +601,8 @@ mod tests {
     fn an_undecidable_candidate_blocks_and_nothing_is_merged_or_skipped() {
         let (lo, mid, _) = by_hash();
         let mut q = SettleQueue::new();
-        q.hold(0, lo.clone(), 5, 0).unwrap();
-        q.hold(0, mid.clone(), 5, 0).unwrap();
+        q.hold(0, 0, lo.clone(), 5, 0);
+        q.hold(0, 0, mid.clone(), 5, 0);
         let mut j = Script::default();
         j.verdicts
             .insert(lo.clone(), Verdict::Undecidable("needs persona".into()));
@@ -564,7 +620,7 @@ mod tests {
         let (lo2, mid2, hi2) = by_hash();
         let mut q = SettleQueue::new();
         for c in [&lo2, &mid2, &hi2] {
-            q.hold(0, c.clone(), 5, 0).unwrap();
+            q.hold(0, 0, c.clone(), 5, 0);
         }
         let mut j = Script::default();
         j.verdicts.insert(lo2.clone(), Verdict::Refused("r".into()));
@@ -579,7 +635,7 @@ mod tests {
     fn a_failed_merge_is_recorded_not_swallowed() {
         let (lo, ..) = by_hash();
         let mut q = SettleQueue::new();
-        q.hold(0, lo.clone(), 5, 0).unwrap();
+        q.hold(0, 0, lo.clone(), 5, 0);
         let mut j = Script {
             merge_fails: true,
             ..Script::default()
@@ -595,8 +651,8 @@ mod tests {
     fn only_the_current_epochs_candidates_are_tested() {
         let (lo, mid, _) = by_hash();
         let mut q = SettleQueue::new();
-        q.hold(5, lo, 5, 0).unwrap(); // from the future
-        q.hold(3, mid, 5, 0).unwrap(); // from the past
+        q.hold(5, 5, lo, 5, 0); // from the future
+        q.hold(3, 3, mid, 5, 0); // from the past
         let mut j = Script::default();
         assert_eq!(q.settle(4, 0, 0, &mut j), Outcome::Idle);
         assert!(j.tested.is_empty());
@@ -605,15 +661,80 @@ mod tests {
     }
 
     #[test]
-    fn duplicates_are_not_held_twice_and_the_queue_is_bounded() {
+    fn duplicates_are_not_held_twice_and_a_full_queue_drops_never_fails() {
         let mut q = SettleQueue::new();
-        assert_eq!(q.hold(0, vec![1], 1, 0), Ok(true));
-        assert_eq!(q.hold(0, vec![1], 1, 5), Ok(false));
+        assert_eq!(q.hold(0, 0, vec![1], 1, 0), Held::New);
+        assert_eq!(q.hold(0, 0, vec![1], 1, 5), Held::Duplicate);
         for i in 0..(MAX_HELD - 1) {
-            q.hold(0, vec![2, (i % 250) as u8, (i / 250) as u8], 1, 0)
-                .unwrap();
+            q.hold(0, 0, vec![2, (i % 250) as u8, (i / 250) as u8], 1, 0);
         }
-        assert!(q.hold(0, vec![9, 9, 9, 9], 1, 0).is_err());
+        assert_eq!(q.len(), MAX_HELD);
+        // Full: the newcomer is dropped, not an error, and nothing grows.
+        assert!(matches!(
+            q.hold(0, 0, vec![9, 9, 9, 9], 1, 0),
+            Held::Dropped(_)
+        ));
+        assert_eq!(q.len(), MAX_HELD);
+    }
+
+    #[test]
+    fn a_full_queue_evicts_a_failed_commit_oldest_first_before_dropping_a_newcomer() {
+        let mut q = SettleQueue::new();
+        let mut j = Script::default();
+        for i in 0..MAX_HELD {
+            let b = vec![3, (i % 250) as u8, (i / 250) as u8];
+            q.hold(0, 0, b.clone(), 1, 0);
+            if i < 2 {
+                j.verdicts.insert(b, Verdict::Unprocessable("x".into()));
+            } else {
+                j.verdicts.insert(b, Verdict::Refused("r".into()));
+            }
+        }
+        // Make two of them failed (the others refused and dropped by settle).
+        q.settle(0, 0, 0, &mut j);
+        assert_eq!(q.len(), 2);
+        for i in 0..(MAX_HELD - 2) {
+            q.hold(0, 0, vec![4, (i % 250) as u8, (i / 250) as u8], 1, 0);
+        }
+        assert_eq!(q.len(), MAX_HELD);
+        let failed_before = q.failed().len();
+        assert_eq!(q.hold(0, 0, vec![5, 5, 5], 1, 0), Held::New);
+        assert_eq!(q.len(), MAX_HELD);
+        assert_eq!(q.failed().len(), failed_before - 1);
+    }
+
+    #[test]
+    fn commits_from_far_or_numerous_future_epochs_are_dropped_not_errors() {
+        let mut q = SettleQueue::new();
+        // Beyond the bound: dropped at once, whatever the count.
+        assert!(matches!(
+            q.hold(5, 5 + MAX_EPOCHS_AHEAD + 1, vec![1], 1, 0),
+            Held::Dropped(_)
+        ));
+        assert!(matches!(
+            q.hold(5, u64::MAX, vec![2], 1, 0),
+            Held::Dropped(_)
+        ));
+        assert!(q.is_empty());
+        // Within the bound: held up to MAX_HELD_AHEAD, then dropped newest-first.
+        for i in 0..MAX_HELD_AHEAD {
+            let b = vec![3, i as u8];
+            assert_eq!(q.hold(5, 6, b, 1, 0), Held::New);
+        }
+        assert!(matches!(q.hold(5, 6, vec![4, 4], 1, 0), Held::Dropped(_)));
+        assert_eq!(q.len(), MAX_HELD_AHEAD);
+        // The ahead cap does not stop commits made from our own epoch.
+        assert_eq!(q.hold(5, 5, vec![6], 1, 0), Held::New);
+    }
+
+    #[test]
+    fn only_commits_from_our_epoch_or_below_hold_the_cursor() {
+        let mut q = SettleQueue::new();
+        q.hold(5, 6, vec![1], 3, 0); // ahead, older event
+        assert_eq!(q.barrier_secs(5), None, "an ahead commit never pins");
+        q.hold(5, 5, vec![2], 9, 0);
+        assert_eq!(q.barrier_secs(5), Some(9));
+        assert_eq!(q.barrier_secs(6), Some(3), "it pins once it is ours");
     }
 
     #[test]

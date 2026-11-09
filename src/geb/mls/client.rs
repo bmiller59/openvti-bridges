@@ -14,7 +14,7 @@ use crate::geb::crypto::leaf;
 use crate::geb::crypto::rendezvous::RelayKeys;
 use crate::geb::leave::LeaveBook;
 use crate::geb::policy::CommitCheckInputs;
-use crate::geb::settle::{CommitHash, Outcome, SettleQueue, Verdict};
+use crate::geb::settle::{CommitHash, Held, Outcome, SettleQueue, Verdict};
 use crate::geb::traits::{GebDyad, GebGroup, GebSigner, OpenedMessage, SettleReport};
 use crate::geb::wire::{Frame, GroupOp, RoomInfo, RoomRef};
 use crate::store::BridgeStore;
@@ -1175,12 +1175,23 @@ impl GebGroup for MlsGroupClient {
         if parent_epoch < epoch {
             return Ok(());
         }
-        g.queue
-            .hold(parent_epoch, commit.to_vec(), event_secs, now_ms)
-            .map_err(|why| {
-                tracing::error!(security_alert = true, %why, "too many commits held; stopping");
-                Error::Unsupported("too many Geb commits held for the settle window; stopping")
-            })?;
+        // The `e` and the bytes are unauthenticated until judged, so a limit
+        // on what is held drops the commit (logged) and never fails the poll.
+        match g
+            .queue
+            .hold(epoch, parent_epoch, commit.to_vec(), event_secs, now_ms)
+        {
+            Held::New | Held::Duplicate => {}
+            Held::Dropped(why) => {
+                tracing::warn!(
+                    security_alert = true,
+                    parent_epoch,
+                    epoch,
+                    why,
+                    "dropped an mc envelope instead of holding it"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1320,7 +1331,7 @@ impl GebGroup for MlsGroupClient {
                     .collect();
                 sent_to_all = true;
             }
-            let cursor_barrier_secs = queue.barrier_secs();
+            let cursor_barrier_secs = queue.barrier_secs(grp.epoch().as_u64());
             let reread = std::mem::take(&mut heal.reread);
             if epoch_changed {
                 self.persist_state(&g)?;

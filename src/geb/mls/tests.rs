@@ -2383,3 +2383,58 @@ async fn held_signed_leaves_survive_a_restart() {
 }
 
 mod heal_tests;
+
+// ---- P0-1: commit floods and unclassified commit content ----------------------
+
+/// Any member can post an `mc` whose `e` and bytes nothing has authenticated.
+/// Such a commit must never fail a poll, and one from an epoch we cannot reach
+/// must never hold the read cursor back.
+#[tokio::test]
+async fn unauthenticated_future_epoch_commits_never_fail_a_poll_or_pin_the_cursor() {
+    let mut w = World::build(Arc::new(AllKnown), "");
+    w.seat().await;
+    let keys = w.a.keys(ROOM);
+    let epoch = w.a.epoch();
+    let garbage = |i: u32| i.to_be_bytes().repeat(16);
+    // Far beyond reach, and just ahead: far more of each than are ever held.
+    for i in 0..300u32 {
+        post(&w.relay_dyn, &keys, &mc(u64::MAX, &garbage(i)), w.secs()).await;
+        post(
+            &w.relay_dyn,
+            &keys,
+            &mc(epoch + 1, &garbage(1000 + i)),
+            w.secs(),
+        )
+        .await;
+    }
+    w.at(20_000);
+    let line = w.a.seal_line(ROOM, 5, "still here", true);
+    w.post_ml(&w.a, &line).await;
+    let got = w
+        .poll()
+        .await
+        .expect("a flood of commits never fails a poll");
+    let p = got
+        .iter()
+        .find(|p| p.event.text == "still here")
+        .expect("the real line is still delivered");
+    assert_eq!(
+        p.cursor.0,
+        20u64.to_be_bytes().to_vec(),
+        "the cursor is not held back by commits that cannot be judged"
+    );
+    assert!(w.client.held_commits() <= crate::geb::settle::MAX_HELD_AHEAD);
+    // And it keeps working on the next poll.
+    w.poll().await.expect("still not failing");
+}
+
+/// A commit with content outside Geb's described `validCommit` (here a group
+/// context change beyond the policy) is refused and the walk goes on, so a
+/// member cannot halt the link with one message.
+#[tokio::test]
+async fn a_commit_with_unclassified_content_is_refused_and_the_walk_goes_on() {
+    let mut w = World::build(Arc::new(NoLocalKnowledge), "");
+    w.seat().await;
+    let pol = policy(&w.a.did, "");
+    refused_then_next_wins(&mut w, &|s| s.stage_policy_with_extra_extension(&pol)).await;
+}

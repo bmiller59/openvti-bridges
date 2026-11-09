@@ -234,8 +234,9 @@ pub struct CommitFacts {
     /// extension (`None`: no policy change).
     pub policy_change: Option<RoomPolicy>,
     /// The commit carries a proposal kind Geb's check is not described for
-    /// (Update, PreSharedKey, ReInit, ExternalInit, custom). Such a commit is
-    /// neither merged nor skipped.
+    /// (Update, PreSharedKey, ReInit, ExternalInit, SelfRemove, custom, a
+    /// group-context change beyond the policy, a non-UTF-8 identity). Such a
+    /// commit is refused and the walk goes on (UNVERIFIED against Geb).
     pub unclassified: bool,
     /// The sender's current leaf (in the tree the commit is made from) is
     /// **bound** (0.5.15, answers round 2 section 7). Default `false`: fail
@@ -310,7 +311,15 @@ pub fn valid_commit(
 ) -> CommitVerdict {
     use CommitVerdict::{Invalid, Undecidable, Valid};
     if facts.unclassified {
-        return Undecidable("commit carries a proposal type the check is not described for".into());
+        // Refused, and the walk goes on: a member must not be able to halt the
+        // link by commit content alone (round 4 Q1, Q6: Geb refuses a commit
+        // that fails its check and carries on; it never halts). UNVERIFIED:
+        // the answers do not say what Geb does with an Update, PreSharedKey,
+        // ReInit, SelfRemove, custom proposal or a group-context change beyond
+        // the policy (OpenMLS may refuse it before `validCommit`, which is
+        // also "skip"); if Geb merged such a commit we would diverge, and the
+        // fork-repair path (`rs`) is what would mend it.
+        return Invalid("commit carries a proposal type the check is not described for".into());
     }
     // 0.5.15 (answers round 2 sections 1 and 7), neither rule needs persona
     // cards, so both hold whether or not `can_evaluate`.
@@ -816,10 +825,10 @@ mod tests {
         );
         let mut u = facts("did:m");
         u.unclassified = true;
-        assert!(und(&pol(""), &u));
+        assert!(inv(&pol(""), &u), "refused and skipped, never a halt");
         assert!(matches!(
             valid_commit(&pol(""), &u, &Fake::default()),
-            CommitVerdict::Undecidable(_)
+            CommitVerdict::Invalid(_)
         ));
         // With real inputs the same commits are Invalid, not Undecidable.
         let mut r = facts("did:m");

@@ -31,6 +31,7 @@
 //!   were at when the re-seat arrived (at most 100).
 
 use super::*;
+use crate::geb::settle::Held;
 use crate::geb::status::{
     ChainEntry, Comparison, Holding, MAX_CHAIN, MAX_CHAIN_SENT, RoomStatus, compare_status,
     fork_mine_wins,
@@ -582,8 +583,9 @@ impl MlsGroupClient {
         }
         // first-seen 0: the window is already out, so it is judged at once
         // together with whatever else is held for that epoch.
-        if let Err(why) = queue.hold(e, bytes, u64::MAX, 0) {
-            tracing::warn!(%why, "could not hold an rc");
+        let epoch = grp.epoch().as_u64();
+        if let Held::Dropped(why) = queue.hold(epoch, e, bytes, u64::MAX, 0) {
+            tracing::warn!(why, "dropped an rc instead of holding it");
         }
     }
 
