@@ -1,0 +1,638 @@
+//! Pure mapping between VTC records, [`BridgeEvent`]s and what a foreign room
+//! accepts. No I/O and no foreign-system types: behaviour that depends on the
+//! room comes from [`RoomCapabilities`] only.
+
+use crate::foreign::RoomCapabilities;
+use crate::model::{AuthorCheck, BridgeEvent, EventKind, Origin};
+use crate::room::{PROVENANCE_OPEN, RecordWrite, RoomRecord};
+use crate::{Error, Result};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
+use std::collections::HashMap;
+
+/// Largest foreign text kept when writing a record (bytes). Four times Geb's
+/// 20,000-character line limit, so no honest line is cut.
+pub const MAX_INBOUND_TEXT_BYTES: usize = 80_000;
+const TRUNCATION_MARK: &str = "\n[truncated]";
+const MAX_AUTHOR_CHARS: usize = 200;
+
+/// Make an author label safe to put in a one-line quoted header.
+pub fn sanitize_label(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_AUTHOR_CHARS)
+        .collect()
+}
+
+/// Remove control characters other than newline and tab.
+pub fn strip_controls(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
+/// Cut `s` to at most `max` bytes on a char boundary, marking the cut inside
+/// the limit. Returns `s` unchanged when it already fits.
+pub fn truncate_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let room = max.saturating_sub(TRUNCATION_MARK.len());
+    let mut end = room.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    if max >= TRUNCATION_MARK.len() {
+        out.push_str(TRUNCATION_MARK);
+    }
+    out
+}
+
+/// The stable id of a record's event on the VTC side: `key|version` for
+/// content, `key|version|retract` for a tombstone.
+pub fn origin_id_for(rec: &RoomRecord) -> String {
+    if rec.retracted {
+        format!("{}|{}|retract", rec.key, rec.version)
+    } else {
+        format!("{}|{}", rec.key, rec.version)
+    }
+}
+
+/// A record as an outbound event, or `None` when it must not cross: the
+/// bridge's own writes (echo suppression), records a bridge wrote
+/// (provenance marker), records already cross-referenced and a tombstone of a
+/// key that was never bridged.
+///
+/// `prior` is the `origin_id` of the newest version of this record's KEY that
+/// was bridged before, if any. That, and only that, decides what the record
+/// is: the host's `version` is the room-wide arrival order, not a per-key
+/// counter, so `version > 1` says nothing about an edit. A key bridged before
+/// makes a content record a [`EventKind::Supersede`] of `prior` and a
+/// tombstone an [`EventKind::Retract`] of it; a key never bridged makes a
+/// content record a plain [`EventKind::Post`] (whatever its version) and a
+/// tombstone nothing.
+pub fn record_to_event(
+    rec: &RoomRecord,
+    link: &str,
+    persona: &str,
+    already_bridged: impl Fn(&str) -> bool,
+    prior: Option<&str>,
+) -> Option<BridgeEvent> {
+    if rec.author == persona || rec.is_bridged() {
+        return None;
+    }
+    let origin_id = origin_id_for(rec);
+    let (kind, record_key) = if rec.retracted {
+        let target = prior?;
+        (
+            EventKind::Retract {
+                target: target.to_string(),
+            },
+            None,
+        )
+    } else {
+        let kind = match prior {
+            Some(p) => EventKind::Supersede {
+                replaces: p.to_string(),
+            },
+            None => EventKind::Post,
+        };
+        (kind, Some(rec.key.clone()))
+    };
+    if already_bridged(&origin_id) {
+        return None;
+    }
+    Some(BridgeEvent {
+        origin: Origin::Vtc,
+        origin_id,
+        link: link.into(),
+        author: if rec.retracted && rec.author.is_empty() {
+            "a room member".into()
+        } else {
+            rec.author.clone()
+        },
+        at: rec.at,
+        title: rec.title.clone(),
+        text: rec.body.clone(),
+        kind,
+        reply_to: None,
+        record_key,
+        provenance: None,
+    })
+}
+
+/// Wording of the notice lines that stand in for an edit or a retraction the
+/// foreign room cannot express natively. `{target}` is replaced by the
+/// original post's id on the VTC side.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Notices {
+    /// For a new version of an earlier post.
+    pub update: String,
+    /// For a retraction.
+    pub retract: String,
+}
+
+impl Default for Notices {
+    fn default() -> Self {
+        Self {
+            update: "[update to earlier post {target}]".into(),
+            retract: "[retracted: earlier post {target}]".into(),
+        }
+    }
+}
+
+impl Notices {
+    /// Reject wording that could not be sent safely.
+    pub fn validate(&self) -> Result<()> {
+        for (name, t) in [("update", &self.update), ("retract", &self.retract)] {
+            if t.is_empty() || t.chars().count() > 200 || t.chars().any(char::is_control) {
+                return Err(Error::Config(format!(
+                    "notice {name}: 1-200 characters, no control characters"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn render(template: &str, target: &str) -> String {
+        template.replace("{target}", &sanitize_label(target))
+    }
+}
+
+/// Shape an event for a room with the given capabilities: choose how a
+/// supersede or retraction is expressed, add the quoted author header and fit
+/// the size limit. The result is a `Post`, unless the room can express the
+/// kind natively.
+///
+/// A retraction (and a supersede where editing is unsupported) becomes an
+/// ordinary line carrying the notice. When the room supports replies and
+/// `resolve` knows the foreign id of the original (the xref stores it for each
+/// bridged record), the line also answers that original via `reply_to`. It is
+/// never a new message kind, and never dropped.
+pub fn prepare_outbound(
+    ev: &BridgeEvent,
+    caps: &RoomCapabilities,
+    notices: &Notices,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> BridgeEvent {
+    let author = sanitize_label(&ev.author);
+    let mut body = String::new();
+    let mut kind = ev.kind.clone();
+    let mut reply_to = ev.reply_to.clone();
+    let mut flatten = |template: &str, original: &str| {
+        body.push_str(&Notices::render(template, original));
+        body.push('\n');
+        if caps.supports_replies {
+            reply_to = resolve(original).or(reply_to.take());
+        }
+        kind = EventKind::Post;
+    };
+    match &ev.kind {
+        EventKind::Post => {}
+        EventKind::Supersede { replaces } => {
+            if !caps.supports_edit {
+                flatten(&notices.update, replaces);
+            }
+        }
+        EventKind::Retract { target } => {
+            if !caps.supports_delete {
+                flatten(&notices.retract, target);
+            }
+        }
+    }
+    if let Some(t) = ev.title.as_deref().filter(|t| !t.is_empty()) {
+        body.push_str(&strip_controls(t));
+        body.push_str("\n\n");
+    }
+    body.push_str(&strip_controls(&ev.text));
+    let text = truncate_bytes(
+        &format!("> {author} wrote:\n{body}"),
+        caps.max_message_bytes,
+    );
+    BridgeEvent {
+        title: None,
+        text,
+        kind,
+        reply_to,
+        ..ev.clone()
+    }
+}
+
+/// SHA-256 of the foreign message bytes, hex: the dedup id.
+pub fn msg_hash(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Deterministic opaque record key: `HMAC(link_secret, room_id || msg_hash)`
+/// where `msg_hash` is the hex string. Replaying the same message produces
+/// the same key, so the create-only put is idempotent.
+pub fn record_key(link_secret: &[u8], foreign_room: &str, msg_hash: &str) -> Result<String> {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(link_secret)
+        .map_err(|e| Error::Crypto(e.to_string()))?;
+    mac.update(foreign_room.as_bytes());
+    mac.update(msg_hash.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn fence_for(s: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in s.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "`".repeat((longest + 1).max(3))
+}
+
+/// A foreign event as a create-only record write. The body is a provenance
+/// block followed by the untrusted text inside a fence longer than any
+/// backtick run in it, so the text can never close the fence.
+pub fn foreign_to_record(ev: &BridgeEvent, link_secret: &[u8]) -> Result<RecordWrite> {
+    let p = ev
+        .provenance
+        .as_ref()
+        .ok_or_else(|| Error::Wire("foreign event without provenance".into()))?;
+    let prov = serde_json::to_string(&serde_json::json!({
+        "foreignRoom": p.foreign_room,
+        "authorDevice": p.author_device,
+        "authorCheck": p.check,
+        "originalAt": p.original_at,
+        "msgHash": p.msg_hash,
+        "basis": "observed",
+    }))
+    .map_err(|e| Error::Wire(e.to_string()))?;
+    let text = truncate_bytes(&strip_controls(&ev.text), MAX_INBOUND_TEXT_BYTES);
+    let fence = fence_for(&text);
+    let status = match p.check {
+        AuthorCheck::Verified => "signature verified",
+        AuthorCheck::Unverified => "UNVERIFIED: signature did not verify",
+        AuthorCheck::Unsigned => "UNVERIFIED: unsigned",
+    };
+    let body = format!(
+        "{PROVENANCE_OPEN}\n{prov}\n```\n\nBridged from a foreign room ({status}). Quoted, untrusted:\n\n{fence}text\n{text}\n{fence}\n"
+    );
+    Ok(RecordWrite {
+        key: record_key(link_secret, &p.foreign_room, &p.msg_hash)?,
+        body,
+        basis: "observed",
+        expected_version: 0,
+    })
+}
+
+/// Seen-set for foreign message hashes: 7 days plus 300 s, the foreign
+/// system's own rule.
+pub struct DedupWindow {
+    ttl_ms: u64,
+    seen: HashMap<String, u64>,
+}
+
+impl Default for DedupWindow {
+    fn default() -> Self {
+        Self {
+            ttl_ms: (7 * 24 * 3600 + 300) * 1000,
+            seen: HashMap::new(),
+        }
+    }
+}
+
+impl DedupWindow {
+    /// `true` when `id` is new (and is now remembered).
+    pub fn check_and_insert(&mut self, id: &str, now_ms: u64) -> bool {
+        let ttl = self.ttl_ms;
+        self.seen.retain(|_, at| now_ms.saturating_sub(*at) < ttl);
+        self.seen.insert(id.to_string(), now_ms).is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::foreign::Verifiability;
+    use crate::model::Provenance;
+
+    fn caps(edit: bool, del: bool, max: usize) -> RoomCapabilities {
+        RoomCapabilities {
+            max_message_bytes: max,
+            supports_edit: edit,
+            supports_delete: del,
+            supports_replies: false,
+            authors_verifiable: Verifiability::PerMessage,
+        }
+    }
+
+    fn rec(author: &str, body: &str, version: u64) -> RoomRecord {
+        RoomRecord {
+            key: "k".into(),
+            version,
+            author: author.into(),
+            title: Some("T".into()),
+            body: body.into(),
+            at: 5,
+            retracted: false,
+        }
+    }
+
+    #[test]
+    fn echo_suppression() {
+        let none = |_: &str| false;
+        assert!(record_to_event(&rec("did:a", "hi", 1), "l", "did:p", none, None).is_some());
+        // The bridge's own persona.
+        assert!(record_to_event(&rec("did:p", "hi", 1), "l", "did:p", none, None).is_none());
+        // A record a bridge wrote.
+        let bridged = format!("{PROVENANCE_OPEN}\n{{}}\n```\n");
+        assert!(record_to_event(&rec("did:a", &bridged, 1), "l", "did:p", none, None).is_none());
+        // Already cross-referenced.
+        assert!(
+            record_to_event(&rec("did:a", "hi", 1), "l", "did:p", |id| id == "k|1", None).is_none()
+        );
+    }
+
+    #[test]
+    fn a_key_bridged_before_is_a_supersede_and_the_version_is_irrelevant() {
+        let e =
+            record_to_event(&rec("did:a", "v2", 2), "l", "did:p", |_| false, Some("k|1")).unwrap();
+        assert_eq!(
+            e.kind,
+            EventKind::Supersede {
+                replaces: "k|1".into()
+            }
+        );
+        assert_eq!(e.record_key.as_deref(), Some("k"));
+        // Room-wide arrival order: the edit may sit at version 40 and the
+        // earlier post at 3.
+        let e = record_to_event(
+            &rec("did:a", "v2", 40),
+            "l",
+            "did:p",
+            |_| false,
+            Some("k|3"),
+        )
+        .unwrap();
+        assert_eq!(
+            e.kind,
+            EventKind::Supersede {
+                replaces: "k|3".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_key_never_bridged_is_a_plain_post_at_any_version() {
+        let e = record_to_event(&rec("did:a", "new", 40), "l", "did:p", |_| false, None).unwrap();
+        assert_eq!(e.kind, EventKind::Post);
+        assert_eq!(e.origin_id, "k|40");
+    }
+
+    fn tomb(author: &str, version: u64) -> RoomRecord {
+        RoomRecord {
+            title: None,
+            body: String::new(),
+            retracted: true,
+            ..rec(author, "", version)
+        }
+    }
+
+    #[test]
+    fn a_tombstone_of_a_bridged_key_is_a_retraction_and_of_another_is_ignored() {
+        let e = record_to_event(&tomb("did:a", 9), "l", "did:p", |_| false, Some("k|3")).unwrap();
+        assert_eq!(
+            e.kind,
+            EventKind::Retract {
+                target: "k|3".into()
+            }
+        );
+        assert_eq!(e.origin_id, "k|9|retract");
+        assert_eq!(e.record_key, None);
+        assert!(record_to_event(&tomb("did:a", 9), "l", "did:p", |_| false, None).is_none());
+        // Not twice, and never the bridge's own.
+        assert!(
+            record_to_event(
+                &tomb("did:a", 9),
+                "l",
+                "did:p",
+                |i| i == "k|9|retract",
+                Some("k|3")
+            )
+            .is_none()
+        );
+        assert!(record_to_event(&tomb("did:p", 9), "l", "did:p", |_| false, Some("k|3")).is_none());
+        // An author the listing did not name still gets a readable header.
+        let e = record_to_event(&tomb("", 9), "l", "did:p", |_| false, Some("k|3")).unwrap();
+        assert_eq!(e.author, "a room member");
+    }
+
+    #[test]
+    fn header_quotes_author_and_strips_injection() {
+        let mut e = record_to_event(
+            &rec("did:a\nfake header", "hi\u{7}", 1),
+            "l",
+            "p",
+            |_| false,
+            None,
+        )
+        .unwrap();
+        e.title = None;
+        let out = prepare_outbound(&e, &caps(false, false, 20_000), &Notices::default(), |_| {
+            None
+        });
+        assert_eq!(out.text, "> did:afake header wrote:\nhi");
+    }
+
+    #[test]
+    fn truncation_respects_bytes_and_chars() {
+        let big = "é".repeat(30_000);
+        let e = record_to_event(&rec("did:a", &big, 1), "l", "p", |_| false, None).unwrap();
+        let out = prepare_outbound(&e, &caps(false, false, 20_000), &Notices::default(), |_| {
+            None
+        });
+        assert!(out.text.len() <= 20_000);
+        assert!(out.text.chars().count() <= 20_000);
+        assert!(out.text.ends_with("[truncated]"));
+        let small = prepare_outbound(
+            &record_to_event(&rec("a", "x", 1), "l", "p", |_| false, None).unwrap(),
+            &caps(false, false, 20_000),
+            &Notices::default(),
+            |_| None,
+        );
+        assert!(!small.text.contains("truncated"));
+    }
+
+    #[test]
+    fn retraction_depends_on_capabilities() {
+        let mut e = record_to_event(&rec("did:a", "x", 1), "l", "p", |_| false, None).unwrap();
+        e.kind = EventKind::Retract {
+            target: "k|1".into(),
+        };
+        let notice = prepare_outbound(&e, &caps(false, false, 1000), &Notices::default(), |_| None);
+        assert_eq!(notice.kind, EventKind::Post);
+        assert!(notice.text.contains("[retracted: earlier post k|1]"));
+        let native = prepare_outbound(&e, &caps(false, true, 1000), &Notices::default(), |_| None);
+        assert!(matches!(native.kind, EventKind::Retract { .. }));
+    }
+
+    #[test]
+    fn supersede_depends_on_capabilities() {
+        let e = record_to_event(&rec("did:a", "x", 2), "l", "p", |_| false, Some("k|1")).unwrap();
+        let flat = prepare_outbound(&e, &caps(false, false, 1000), &Notices::default(), |_| None);
+        assert_eq!(flat.kind, EventKind::Post);
+        assert!(flat.text.contains("[update to earlier post k|1]"));
+        assert!(matches!(
+            prepare_outbound(&e, &caps(true, false, 1000), &Notices::default(), |_| None).kind,
+            EventKind::Supersede { .. }
+        ));
+    }
+
+    fn reply_caps() -> RoomCapabilities {
+        RoomCapabilities {
+            supports_replies: true,
+            ..caps(false, false, 1000)
+        }
+    }
+
+    #[test]
+    fn a_retraction_is_an_ordinary_reply_to_the_original() {
+        let mut e = record_to_event(&rec("did:a", "x", 1), "l", "p", |_| false, None).unwrap();
+        e.kind = EventKind::Retract {
+            target: "k|1".into(),
+        };
+        let known = |id: &str| (id == "k|1").then(|| "ab".repeat(16));
+        let out = prepare_outbound(&e, &reply_caps(), &Notices::default(), known);
+        assert_eq!(out.kind, EventKind::Post);
+        assert_eq!(out.reply_to.as_deref(), Some("ab".repeat(16).as_str()));
+        assert!(out.text.contains("[retracted: earlier post k|1]"));
+        // Unknown original: still an ordinary line with the notice, no reply.
+        let out = prepare_outbound(&e, &reply_caps(), &Notices::default(), |_| None);
+        assert_eq!(out.reply_to, None);
+        assert!(out.text.contains("[retracted"));
+        // A room without replies never gets one.
+        let out = prepare_outbound(&e, &caps(false, false, 1000), &Notices::default(), known);
+        assert_eq!(out.reply_to, None);
+    }
+
+    #[test]
+    fn a_supersede_without_edit_replies_to_the_previous_version() {
+        let e = record_to_event(&rec("did:a", "v2", 2), "l", "p", |_| false, Some("k|1")).unwrap();
+        let known = |id: &str| (id == "k|1").then(|| "cd".repeat(16));
+        let out = prepare_outbound(&e, &reply_caps(), &Notices::default(), known);
+        assert_eq!(out.kind, EventKind::Post);
+        assert_eq!(out.reply_to.as_deref(), Some("cd".repeat(16).as_str()));
+    }
+
+    #[test]
+    fn notice_wording_is_configurable_and_sanitised() {
+        let n = Notices {
+            update: "edited: {target}".into(),
+            retract: "withdrawn: {target}".into(),
+        };
+        n.validate().unwrap();
+        let mut e = record_to_event(&rec("did:a", "x", 1), "l", "p", |_| false, None).unwrap();
+        e.kind = EventKind::Retract {
+            target: "k\n|1".into(),
+        };
+        let out = prepare_outbound(&e, &caps(false, false, 1000), &n, |_| None);
+        assert!(out.text.contains("withdrawn: k|1"));
+        for bad in ["", "a\nb", &"x".repeat(201)] {
+            let n = Notices {
+                update: bad.into(),
+                ..Notices::default()
+            };
+            assert!(n.validate().is_err());
+        }
+    }
+
+    fn foreign(text: &str, check: AuthorCheck) -> BridgeEvent {
+        BridgeEvent {
+            origin: Origin::Foreign,
+            origin_id: "h".into(),
+            link: "l".into(),
+            author: "did:peer:2.x".into(),
+            at: 9,
+            title: None,
+            text: text.into(),
+            kind: EventKind::Post,
+            reply_to: None,
+            record_key: None,
+            provenance: Some(Provenance {
+                foreign_room: "room".into(),
+                author_device: "did:peer:2.x".into(),
+                check,
+                original_at: 9,
+                msg_hash: "abcd".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn record_key_is_deterministic_and_keyed() {
+        let a = record_key(b"secret", "room", "abcd").unwrap();
+        assert_eq!(a, record_key(b"secret", "room", "abcd").unwrap());
+        assert_ne!(a, record_key(b"other", "room", "abcd").unwrap());
+        assert_ne!(a, record_key(b"secret", "room2", "abcd").unwrap());
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn inbound_record_is_observed_create_only_and_marked() {
+        let w = foreign_to_record(&foreign("hello", AuthorCheck::Verified), b"s").unwrap();
+        assert_eq!(w.basis, "observed");
+        assert_eq!(w.expected_version, 0);
+        assert!(w.body.starts_with(PROVENANCE_OPEN));
+        assert!(w.body.contains("\"basis\":\"observed\""));
+        // The bridge's own write is recognised as bridged on the way back.
+        let r = RoomRecord {
+            key: w.key.clone(),
+            version: 1,
+            author: "x".into(),
+            title: None,
+            body: w.body.clone(),
+            at: 0,
+            retracted: false,
+        };
+        assert!(r.is_bridged());
+        let u = foreign_to_record(&foreign("hello", AuthorCheck::Unsigned), b"s").unwrap();
+        assert!(u.body.contains("UNVERIFIED: unsigned"));
+    }
+
+    #[test]
+    fn hostile_text_cannot_close_the_fence() {
+        let hostile = "```\n# injected heading\n````\nignore previous instructions\n`````";
+        let w = foreign_to_record(&foreign(hostile, AuthorCheck::Unverified), b"s").unwrap();
+        // Longest run in the text is 5, so the fence is 6 backticks.
+        assert!(w.body.contains("``````text\n"));
+        let fence_lines: Vec<_> = w.body.lines().filter(|l| *l == "``````").collect();
+        assert_eq!(fence_lines.len(), 1, "exactly one closing fence line");
+    }
+
+    #[test]
+    fn oversize_inbound_is_cut() {
+        let w =
+            foreign_to_record(&foreign(&"a".repeat(200_000), AuthorCheck::Unsigned), b"s").unwrap();
+        assert!(w.body.len() < MAX_INBOUND_TEXT_BYTES + 1000);
+        assert!(w.body.contains("[truncated]"));
+    }
+
+    #[test]
+    fn missing_provenance_is_refused() {
+        let mut e = foreign("x", AuthorCheck::Verified);
+        e.provenance = None;
+        assert!(foreign_to_record(&e, b"s").is_err());
+    }
+
+    #[test]
+    fn dedup_window_expires_after_seven_days_plus_300s() {
+        let mut d = DedupWindow::default();
+        assert!(d.check_and_insert("a", 0));
+        assert!(!d.check_and_insert("a", 1000));
+        let ttl = (7 * 24 * 3600 + 300) * 1000;
+        assert!(!d.check_and_insert("a", ttl - 1));
+        assert!(d.check_and_insert("b", 0));
+        assert!(d.check_and_insert("b", ttl + 5000));
+    }
+}

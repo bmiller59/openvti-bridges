@@ -1,0 +1,162 @@
+[package]
+name = "vti-geb-bridge"
+description = "Experimental … foreign room (first adapter: Geb)"
+version = "0.1.0"
+edition = "2024"
+# Not published. Experimental: the Geb path-B wire has no versioned
+# specification, nothing depends on this crate, and a
+# crates.io artifact would promise an API and a stability this crate does
+# not offer. Revisit when a Geb protocol version is pinned.
+publish = false
+rust-version = "1.95.0"
+license = "Apache-2.0"
+# repository: set once this repo has a home
+
+[features]
+default = []
+# The VTC room side and the durable store: `vtc::VtcRoom` (a `RoomSide` over
+# `VtaClient`) and `fjall_store::FjallStore` (a `BridgeStore` over
+# `vti_common::store`). Off by default so the Geb core, which needs none of
+# any VTI crate, builds and tests without compiling `vta-sdk`, the generated
+# Trust Task crates or fjall. The pump never needs it: it talks to the
+# `RoomSide` and `BridgeStore` traits.
+vtc = [
+  "dep:vta-sdk",
+  "dep:vti-common",
+  "dep:vti-specs",
+  "dep:trust-tasks-rs",
+  "dep:reqwest",
+  "dep:chrono",
+  "dep:tokio",
+  "dep:vti-secrets",
+]
+
+# The live Nostr client (`geb::nostr`) and the in-process test relay
+# (`geb::test_relay`). Off by default: it pulls a websocket stack. Nothing here
+# connects anywhere by itself; the only plaintext `ws://` accepted is 127.0.0.1.
+geb-live = [
+  "dep:tokio-tungstenite",
+  "dep:futures-util",
+  "dep:url",
+  "dep:tokio",
+  "tokio/net",
+  "tokio/time",
+  "tokio/rt",
+  "tokio/macros",
+  "tokio/sync",
+]
+
+# The Geb-side MLS client (`geb::mls`, OpenMLS 0.9): the `GebGroup` that
+# replaces `UnsupportedGroup`. Off by default so the default build stays
+# fail-closed and compiles no MLS stack. Tested only against an in-process
+# second OpenMLS client; no test reaches a relay or a Geb node.
+geb-mls = [
+  "dep:openmls",
+  "dep:openmls_rust_crypto",
+  "dep:openmls_basic_credential",
+  "dep:openmls_traits",
+  "dep:tls_codec",
+]
+
+# The OS keyring as the secret store (the default for the VTA, VTC and witness).
+# The binary must register a platform store at startup; it does when built
+# with this feature. Without it, `[secrets]` must name another backend.
+keyring = ["vtc", "vti-secrets/keyring", "vta-sdk/keyring"]
+
+# The `vti-geb-bridge` binary and its library surface (`cli`, `setup`, `service`).
+# A feature, not a default.
+cli = [
+  "vtc",
+  "geb-live",
+  "geb-mls",
+  "dep:clap",
+  "dep:tracing-subscriber",
+  "vta-sdk/provision-client",
+  "vta-sdk/crypto-provider",
+]
+
+# The M1 harness: a real `room-host`, a real room fixture and a fake VTA sink,
+# in `tests/harness.rs`. Optional rather than dev-dependencies so a default
+# `cargo test` does not compile the room host.
+harness = [
+  "vtc",
+  "dep:room-host",
+  "dep:vti-rooms",
+  "dep:vti-rooms-dtg",
+  "dep:vtc-client",
+  "dep:dtg-credentials",
+  "dep:axum",
+  "dep:chrono",
+  "vta-sdk/test-loopback",
+]
+
+[[bin]]
+name = "vti-geb-bridge"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+# `room-host` is not published (a service binary), so the `harness` feature takes it by
+# git. PLACEHOLDER URL: replace with the real location of the VTI repository before use.
+# Pinned by rev; this is the VTI commit the crate was extracted at. For offline work,
+# point it at a local checkout with an uncommitted `.cargo/config.toml` `[patch]`
+# (see README, "The harness feature").
+room-host = { git = "https://example.invalid/verifiable-trust-infrastructure.git", rev = "3fb9cbc46f0769f4449938365dffb389c8ec4eb7", features = ["test-support"], optional = true }
+vti-rooms = { version = "0.32", features = ["test-support"], optional = true }
+vti-rooms-dtg = { version = "0.34", features = ["test-support"], optional = true }
+vtc-client = { version = "0.40", optional = true }
+dtg-credentials = { version = "0.13", optional = true }
+axum = { version = "0.8", optional = true }
+vta-sdk = { version = "0.85", features = ["client"], optional = true }
+vti-common = { version = "0.61", optional = true }
+vti-specs = { version = "0.10", optional = true }
+# Key custody (`custody`): the bridge's own secret store, behind the same
+# backends and feature names the VTA, VTC and witness use.
+vti-secrets = { version = "0.34", optional = true }
+trust-tasks-rs = { version = "0.37.2", default-features = false, features = ["validate"], optional = true }
+reqwest = { version = "0.13", features = ["json"], optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+tokio = { version = "1.49", optional = true, features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_json_canonicalizer = "0.4"
+toml = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+sha2 = "0.11"
+hmac = "0.13"
+hkdf = "0.13"
+aes-gcm = "0.11"
+chacha20poly1305 = "0.11"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+ed25519-dalek = "3"
+k256 = { version = "0.14", features = ["arithmetic", "schnorr"] }
+base64 = "0.23"
+multibase = "0.9"
+hex = "0.4"
+rand = "0.10"
+zeroize = "1"
+tokio-tungstenite = { version = "0.30", features = ["connect", "rustls-tls-native-roots"], optional = true }
+futures-util = { version = "0.3", optional = true }
+url = { version = "2", optional = true }
+# Own MLS stack for `geb-mls`: this crate does not depend on `vti-rooms`.
+openmls = { version = "0.9", optional = true }
+openmls_rust_crypto = { version = "0.6", optional = true }
+openmls_basic_credential = { version = "0.6", optional = true }
+openmls_traits = { version = "0.6", optional = true }
+tls_codec = { version = "0.5", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.49", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+needless_pass_by_value = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"

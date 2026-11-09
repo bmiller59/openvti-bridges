@@ -1,0 +1,15 @@
+target/
+# Local, uncommitted: points the git `room-host` dependency at a local VTI checkout for
+# offline runs of the `harness` feature (see README).
+.cargo/
+# The `room-host` git dependency is a placeholder URL, so a lock file cannot resolve
+# for everyone; keep it local until the real URL is set, then commit it.
+Cargo.lock
+# Link state, secrets and sealed files from local runs
+data/
+*.sealed
+*.armor
+setup-key*
+.DS_Store
+*.swp
+*~
