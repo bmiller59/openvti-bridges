@@ -16,7 +16,9 @@ use hkdf::Hkdf;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use vti_geb_bridge::geb::crypto::{b64_decode, b64_encode, did_peer, leaf, rendezvous, sign};
-use vti_geb_bridge::geb::settle::{Candidate, Judge, Outcome, SettleQueue, Verdict, commit_hash};
+use vti_geb_bridge::geb::settle::{
+    Candidate, Held, Judge, Outcome, SettleQueue, Verdict, commit_hash,
+};
 use vti_geb_bridge::geb::vrc;
 
 const FIXTURE: &str = include_str!("fixtures/geb-path-b-vectors-2.json");
@@ -116,7 +118,7 @@ fn commit_hash_is_over_the_decoded_bytes_never_the_base64_text() {
 fn settle_winner(parent: u64, commits: &[Vec<u8>]) -> String {
     let mut q = SettleQueue::new();
     for c in commits {
-        q.hold(parent, c.clone(), 0, 0).unwrap();
+        assert_eq!(q.hold(parent, parent, c.clone(), 0, 0), Held::New);
     }
     match q.settle(parent, 3000, 3000, &mut AlwaysValid) {
         Outcome::Merged { winner, .. } => hex::encode(winner),
