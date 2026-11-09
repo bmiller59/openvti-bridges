@@ -1,3 +1,11 @@
+> Superseded details (added 2026-11-09; see `docs/DESIGN.md` for the current state): the `src/` layout in section 3
+> is the original plan (the code has `cli.rs`, `service.rs`, `run.rs`, `wiring.rs`, `ops.rs`, `custody.rs`,
+> `atrest.rs`, `halt.rs` and a `geb/mls/` directory, and no `setup.rs`); the room tasks in sections 4 and 6 are now
+> `rooms/keys/browse/0.4`, `rooms/keys/read/0.2`, `rooms/keys/act/0.11` and `rooms/keys/seal/0.3`; section 7's "any
+> `mc` stops the poll" now holds only without `geb-mls` (with it, only the two undecidable commit kinds halt the
+> link); the event limit is 120,000 bytes, not 65,536; "gap" records (section 8) are not built; `[geb] settle_ms`
+> (section 9) is parsed but not read (the window comes from the room's policy).
+
 > Update 2026-11-08: Geb answered the open questions from its code at commit release 0.5.14, now versioned as "path B 0.1" (the pin moved to release 0.5.15, commit `fdf804d`, with round 2 on 2026-11-09)
 > (breaking changes are announced in the Geb's announcement channel first). Geb details below are pinned to it. Effects: a retraction
 > is an ordinary signed reply line, never a new kind; bridges are welcome by default with no marking; each room will later choose not
