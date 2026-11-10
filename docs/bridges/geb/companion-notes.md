@@ -1,6 +1,6 @@
 # Companion notes: Geb bridge plan
 
-Date: 2026-11-08. Author: BAM session. Plan: `geb-bridge-plan.md`.
+Date: 2026-11-08. Author: BAM session. Plan: `plan.md`.
 Paths below that are not under `src/` or `docs/` refer to the VTI repository, where this document was first written.
 These notes explain the choices, record the threat model, and list what is still open. [V] = checked in code by a
 planning agent; [I] = inferred or not yet checked. The threat analysis is reasoning, not testing.

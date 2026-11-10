@@ -27,7 +27,7 @@
 Note: this plan was written inside the VTI repository (a design note) and is kept here as a copy. References to "the workspace", "the VTI repository's root CLAUDE.md" and repository paths (vti-rooms/..., vti-witness/..., docs/...) mean the VTI repository, not this one. Requirement citations (VTI-*) are to the VTI specification.
 
 Status: draft for review. Date: 2026-11-08. Author: BAM session.
-Companion: `geb-bridge-companion-notes.md` (rationale, threat model, decisions, questions for Geb).
+Companion: `companion-notes.md` (rationale, threat model, decisions, questions for Geb).
 
 Sources: `Geb's implementer's guide (2026-11-07)` (Geb implementer's guide, code as of 2026-11-07) is the authority for Geb.
 VTI facts were checked in this repo by a planning agent. [V] = checked in code, [I] = inferred, not yet checked.

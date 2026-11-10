@@ -105,14 +105,14 @@ src/vtc/           the VTC room side and HTTPS delivery to the room host
 src/{custody,run,wiring,ops,cli,service,main}.rs   key custody, supervision, operator shell
 tests/             vectors (Geb's), geb_live, custody, cli; fixtures/ holds the vectors
 harness/           separate package: harness and e2e tests against a real room-host (manual)
-docs/              DESIGN.md, geb-bridge-plan.md, geb-bridge-companion-notes.md
+docs/              DESIGN.md, bridges/geb/plan.md, bridges/geb/companion-notes.md
 ```
 
 ## Documents
 
 - `docs/DESIGN.md`: what is being built and why, how the pieces fit, the Geb protocol as
   implemented, key custody, threat model, failure handling, operations, tests, open questions.
-- `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`: the original plan, rationale
+- `docs/bridges/geb/plan.md` and `docs/bridges/geb/companion-notes.md`: the original plan, rationale
   and threat analysis. Written inside the VTI repository ("the workspace" means that repository);
   a note at the top of the plan lists details that have since changed.
 - `CLAUDE.md`: guidance for working in this crate: boundary rules, fail-closed rules, the current

@@ -14,7 +14,7 @@ generated at release 0.5.14 (round 1) and the round 2 reading (round 2), none at
 
 Carry content both ways between a VTC data room and a foreign room, with the
 bridge signing as itself and bridged content never presented as verified.
-Plan: `docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md`.
+Plan: `docs/bridges/geb/plan.md` and `docs/bridges/geb/companion-notes.md`.
 
 ## Boundary rules
 

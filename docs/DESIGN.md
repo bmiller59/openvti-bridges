@@ -15,7 +15,7 @@ How to read the markers used here:
 
 This document explains what the crate is and why it is shaped as it is. The rules a contributor
 must follow are in `CLAUDE.md`; the original plan and its rationale are in
-`docs/geb-bridge-plan.md` and `docs/geb-bridge-companion-notes.md` (both were written inside the
+`docs/bridges/geb/plan.md` and `docs/bridges/geb/companion-notes.md` (both were written inside the
 VTI repository, and "the workspace" in them means that repository; some details in them have been
 superseded, see the note at the top of the plan and section 11 below).
 
@@ -835,7 +835,7 @@ All of these need a person or Geb. None has been done.
 
 ### Where documents here are stale
 
-- `docs/geb-bridge-plan.md` and the companion notes were written before rounds 2 and 3. Superseded
+- `docs/bridges/geb/plan.md` and the companion notes were written before rounds 2 and 3. Superseded
   details are listed in a note at the top of the plan: the file layout, the task versions
   (`browse/0.3` and `seal/0.2` are now `0.4` and `0.3`), "any `mc` stops the poll" (now only the
   undecidable cases halt, with `geb-mls`), the 65,536-byte event limit (now 120,000), and gap
