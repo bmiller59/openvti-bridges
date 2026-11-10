@@ -58,6 +58,71 @@ pub fn status_line() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Census: every `geb.*` halt code written in this crate's sources is in
+    /// [`super::HALT_CODES`], every code in the table is written where it is
+    /// raised, and the kind reports the same table to the core.
+    #[test]
+    fn census_every_halt_code_is_in_the_table() {
+        use openvti_bridge_core::adapter::BridgeKind;
+        let table: Vec<&str> = super::HALT_CODES.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            super::KIND
+                .halt_codes()
+                .iter()
+                .map(|(c, _)| *c)
+                .collect::<Vec<_>>(),
+            table
+        );
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = vec![src];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    for l in text.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                        let mut rest = l;
+                        while let Some(i) = rest.find("\"geb.") {
+                            let after = &rest[i + 1..];
+                            if let Some(j) = after.find('"') {
+                                let lit = &after[..j];
+                                if lit.len() > 4
+                                    && lit
+                                        .chars()
+                                        .all(|c| c.is_ascii_lowercase() || c == '.' || c == '-')
+                                {
+                                    seen.insert(lit.to_string());
+                                }
+                                rest = &after[j..];
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for code in &seen {
+            assert!(
+                table.contains(&code.as_str()),
+                "halt code {code:?} is written in the sources but not in HALT_CODES"
+            );
+        }
+        for code in &table {
+            assert!(
+                code.starts_with("geb."),
+                "{code}: codes are `<kind>.<reason>`"
+            );
+            assert!(
+                seen.contains(*code),
+                "{code} is in HALT_CODES but written nowhere"
+            );
+        }
+    }
+
     #[test]
     fn status_names_the_version_and_commit() {
         assert_eq!(

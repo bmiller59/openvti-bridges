@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/openvti-bridge-core",
   "crates/openvti-bridge-vtc",
+  "crates/openvti-bridge-conformance",
   "crates/openvti-bridge-geb",
   "crates/openvti-bridges",
 ]

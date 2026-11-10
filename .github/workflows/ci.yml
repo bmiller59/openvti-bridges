@@ -38,8 +38,12 @@ jobs:
       - run: cargo generate-lockfile
       # Per crate (a per-crate build compiles what feature unification hides) and the whole workspace.
       - run: cargo clippy -p openvti-bridge-core --all-targets -- -D warnings
+      - run: cargo clippy -p openvti-bridge-vtc --all-targets -- -D warnings
+      - run: cargo clippy -p openvti-bridge-conformance --all-targets -- -D warnings
       - run: cargo clippy -p openvti-bridge-geb --all-targets -- -D warnings
       - run: cargo clippy -p openvti-bridge-geb --all-targets --features "live mls" -- -D warnings
+      # The binary with Geb absent: keeps each bridge's specifics out of the others.
+      - run: cargo clippy -p openvti-bridges --no-default-features --features loopback --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --features harness -- -D warnings
 
@@ -50,11 +54,60 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
       - run: cargo generate-lockfile
       - run: cargo test -p openvti-bridge-core
+      - run: cargo test -p openvti-bridge-vtc
+      - run: cargo test -p openvti-bridges --no-default-features --features loopback
       - run: cargo test -p openvti-bridge-geb
       - run: cargo test -p openvti-bridge-geb --features "live mls"
       - run: cargo test --workspace
       # Adds the bridge crate's tests/custody.rs and tests/cli.rs (they need `vta-sdk/test-loopback`, not a room host).
       - run: cargo test --workspace --features harness
+
+  # The shared ForeignRoom suite against the loopback room, then each adapter's own
+  # `tests/conformance.rs` (ordinary tests; the job is here for visibility).
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: cargo generate-lockfile
+      - run: cargo test -p openvti-bridge-conformance
+      - run: cargo test -p openvti-bridge-geb --test conformance
+      # Every registered kind has a conformance file, and every adapter halt code is
+      # in its kind's table and documented.
+      - run: cargo test -p openvti-bridge-geb census
+
+  # Cheap, no build: a bridge's specifics must not leak into the core or into another
+  # bridge. `cargo tree` resolves the graph without compiling.
+  isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: cargo generate-lockfile
+      - name: The core names no adapter, MLS stack, websocket client or VTI client
+        run: |
+          tree="$(cargo tree -p openvti-bridge-core -e normal --prefix none)"
+          if echo "$tree" | grep -E '^(openvti-bridge-(geb|vtc)|openmls|tokio-tungstenite|vta-sdk) '; then
+            echo "the core must not depend on the above"; exit 1
+          fi
+      - name: The Geb adapter takes no VTI client
+        run: |
+          tree="$(cargo tree -p openvti-bridge-geb -e normal --prefix none --features 'live mls')"
+          if echo "$tree" | grep -E '^(openvti-bridge-vtc|vta-sdk) '; then
+            echo "the Geb adapter must not depend on the VTI side"; exit 1
+          fi
+      - name: The VTI side takes no adapter
+        run: |
+          tree="$(cargo tree -p openvti-bridge-vtc -e normal --prefix none)"
+          if echo "$tree" | grep -E '^openvti-bridge-geb '; then
+            echo "the VTI side must not depend on an adapter"; exit 1
+          fi
+      - name: The shell without Geb carries no Geb or MLS crate
+        run: |
+          tree="$(cargo tree -p openvti-bridges --no-default-features --features loopback -e normal --prefix none)"
+          if echo "$tree" | grep -E '^(openvti-bridge-geb|openmls) '; then
+            echo "the shell must build with no adapter (the websocket stack arrives with vta-sdk and is not Geb's)"; exit 1
+          fi
 
   deny:
     runs-on: ubuntu-latest
