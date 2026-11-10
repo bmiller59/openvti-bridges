@@ -78,7 +78,7 @@ pub struct LinkRuntime {
     /// Allowed flow.
     pub directions: Directions,
     /// Foreign authors whose messages are never bridged.
-    pub deny_list: Vec<String>,
+    pub deny_authors: Vec<String>,
     /// The name used in the join announcement, if any.
     pub display_name: Option<String>,
     /// Post a one-time join announcement line when seated.
@@ -90,8 +90,8 @@ pub struct LinkRuntime {
     pub retention_days: u32,
 }
 
-/// The default retention: it matches Geb's relay retention (seven days), so
-/// nothing is forgotten that the foreign relay could still replay.
+/// The default retention (seven days): long enough that nothing is forgotten
+/// that a foreign relay could still replay.
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 /// The pump prunes at most this often.
 const PRUNE_EVERY_SECS: u64 = 3_600;
@@ -106,7 +106,7 @@ impl LinkRuntime {
             persona: persona.into(),
             link_secret,
             directions,
-            deny_list: Vec::new(),
+            deny_authors: Vec::new(),
             display_name: None,
             announce: false,
             notices: Notices::default(),
@@ -654,7 +654,7 @@ impl Pump {
             }
             let mut ev = p.event;
             ev.link = self.link.id.clone();
-            let skip = ev.author == me || self.link.deny_list.contains(&ev.author);
+            let skip = ev.author == me || self.link.deny_authors.contains(&ev.author);
             if skip {
                 report.skipped += 1;
             } else {
@@ -731,7 +731,7 @@ mod tests {
 
     fn link() -> LinkRuntime {
         LinkRuntime {
-            deny_list: vec!["did:evil".into()],
+            deny_authors: vec!["did:evil".into()],
             ..LinkRuntime::new(
                 "l1",
                 "did:key:persona",

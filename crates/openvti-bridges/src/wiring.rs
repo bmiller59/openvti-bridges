@@ -159,7 +159,7 @@ pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
         i.secrets.link_secret()?.to_vec(),
         i.link.directions,
     );
-    rt.deny_list = i.geb.deny_list.clone();
+    rt.deny_authors = i.link.deny_authors.clone();
     rt.display_name = i.link.display_name.clone();
     rt.announce = i.link.announce;
     rt.notices = i.link.notices.clone();

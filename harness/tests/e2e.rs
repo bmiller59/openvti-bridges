@@ -227,6 +227,7 @@ impl Env {
             persona: world.persona().to_string(),
             geb_room_id: ROOM.into(),
             geb_peers: vec![a.sim.did.clone()],
+            deny_authors: Vec::new(),
             directions: Directions::Both,
             tier: Tier::Open,
             tier_optin: true,

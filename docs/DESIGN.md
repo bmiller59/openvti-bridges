@@ -243,7 +243,7 @@ Geb line   ---> poll (verify sg) ---> foreign_to_record ---> create-only put (ba
 - The record key is `HMAC-SHA256(link_secret, geb_room_id || msg_hash)` in hex: opaque,
   deterministic, so replay is idempotent.
 - **Echo suppression (Geb to VTC).** Events whose author is the bridge's own device DID, or whose
-  author is in `[geb] deny_list` (other bridges' device DIDs), are skipped. `GebRoom` also skips
+  author is in the link's `deny_authors` (other bridges' device DIDs), are skipped. `GebRoom` also skips
   lines from the bridge's own MLS leaf.
 - **Unknown plaintext kinds** (reactions, `wp`, anything newer) are dropped without effect, halt,
   or any log above debug. An `rl` share is never opened, so nothing in it has an effect.
@@ -485,7 +485,7 @@ The analysis is reasoning, not testing. The residual risk is bounded, not elimin
 | **Injection from Geb** into the room (prompt injection aimed at agents, misleading text, oversize or malformed input) | Records are `basis: "observed"` with a provenance block; text is fenced longer than any backtick run; control characters stripped; 80,000-byte cap; no action is triggered by bridged content; unknown kinds dropped | Whether the VTI room's existing content handling is sufficient for hostile text from a stranger-populated room was never checked. Anything that reads the room, especially an agent, must treat bridged records as untrusted |
 | **Spoofed attribution** | A Geb line's `sg` is verified against the author's device DID; the result is recorded in the provenance block; unsigned and forged lines are still bridged but labelled `UNVERIFIED`. In the other direction the quoted author is the bridge's assertion | Geb members cannot verify the quoted VTC author. A forged name can appear inside quoted text |
 | **Epoch fork** on the Geb side (a wrong commit decision silently drops the bridge from the group) | The settle rule and 0.5.15 `validCommit` rules, Geb's exact removes rule, signed leaves received; never skipping a commit silently; without `geb-mls` every commit refuses; the one card-dependent Remove (and a direct-room add of a non-exact DID) halts the link; `rs` sent and compared, `rc` taken, the fork loser waits and accepts a re-seat Welcome | Persona cards are not implemented (section 8); healer duty is not built, so a split needs a Geb member to heal it. Root and admin are an exact DID compare (confirmed, round 4 Q4) |
-| **Echo loops and duplication** | Own-persona and provenance-marker skip on the VTC side; own-DID, own-leaf and `deny_list` skip on the Geb side; xref; create-only deterministic keys | A bridge not listed in `deny_list` and with a different device DID is bridged like any member |
+| **Echo loops and duplication** | Own-persona and provenance-marker skip on the VTC side; own-DID, own-leaf and `deny_authors` skip on the Geb side; xref; create-only deterministic keys | A bridge not listed in `deny_authors` and with a different device DID is bridged like any member |
 | **Relay availability and 7-day expiry** | Capped jittered reconnect, a startup catch-up read from the 7-day floor, relay manners from round 3 | One relay is the only resting place; no gap record; lines lost during a long outage are not noticed in the room |
 | **Unstable upstream** (no versioned spec) | Pinned to one release; unknown envelope, frame and plaintext kinds fail closed or are dropped; Geb-specific shapes sit behind `GebCodec` and the other `geb::traits` | Wire compatibility with Geb's OpenMLS 0.8.2 is inferred. Geb `wire: 2` in release metadata is not a compatibility signal; nothing reads it |
 | **Metadata** (the relay sees traffic patterns; the host sees read/write timing) | One identity per link limits correlation | Does not remove it |
@@ -669,7 +669,8 @@ context = "openvti-bridges"            # default
 
 [geb]
 relay_url = "wss://nostr.myceli.al"   # default
-deny_list = []                    # device DIDs of other bridges whose lines are never bridged
+
+# per link: deny_authors = []     # foreign author ids (other bridges' device DIDs) never bridged
 
 [secrets]                         # the vti-secrets table; no seed, no config_seed
 backend = "keyring"

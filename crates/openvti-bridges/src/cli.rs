@@ -351,6 +351,7 @@ where
         persona: n.persona,
         geb_room_id: n.geb_room_id,
         geb_peers: Vec::new(),
+        deny_authors: Vec::new(),
         directions: parse_enum::<Directions>("directions", &n.directions)?,
         tier: parse_enum::<Tier>("tier", &n.tier)?,
         tier_optin: n.tier_optin,

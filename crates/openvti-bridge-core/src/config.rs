@@ -81,6 +81,11 @@ pub struct LinkConfig {
     /// Wording of the notices that stand in for edits and retractions.
     #[serde(default)]
     pub notices: crate::mapping::Notices,
+    /// Foreign author ids whose lines are never bridged (for example another
+    /// bridge's identity in the foreign room, which would otherwise loop).
+    /// Per link; what an id looks like is the foreign system's own.
+    #[serde(default)]
+    pub deny_authors: Vec<String>,
     /// Days to keep a posted outbox row, a journal row and an expiring
     /// cross-reference before pruning them. At least 1; the default (7)
     /// matches Geb's relay retention. Entries not posted are never pruned.
@@ -106,16 +111,12 @@ pub struct GebConfig {
     /// Relay URL.
     #[serde(default = "default_relay")]
     pub relay_url: String,
-    /// Device DIDs of other bridges whose lines are never bridged.
-    #[serde(default)]
-    pub deny_list: Vec<String>,
 }
 
 impl Default for GebConfig {
     fn default() -> Self {
         Self {
             relay_url: default_relay(),
-            deny_list: Vec::new(),
         }
     }
 }
@@ -465,6 +466,21 @@ tier_optin = true
                 .to_string()
                 .contains("private")
         );
+    }
+
+    #[test]
+    fn deny_authors_is_per_link_and_the_old_global_deny_list_is_refused() {
+        let c = Config::from_toml(BASE).unwrap();
+        assert!(c.links[0].deny_authors.is_empty());
+        let t = BASE.replace(
+            "tier = \"open\"",
+            "tier = \"open\"\ndeny_authors = [\"did:peer:other-bridge\"]",
+        );
+        let c = Config::from_toml(&t).unwrap();
+        assert_eq!(c.links[0].deny_authors, ["did:peer:other-bridge"]);
+        // The pre-restructure global key is not read: it is an unknown key.
+        let old = format!("{BASE}\n[geb]\ndeny_list = [\"did:peer:x\"]\n");
+        assert!(Config::from_toml(&old).is_err());
     }
 
     #[test]
