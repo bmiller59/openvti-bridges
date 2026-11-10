@@ -31,7 +31,8 @@ vtc_room = "room-1"
 host_did = "did:webvh:host.example"
 host_url = "https://host.example"
 persona = "did:key:z6Mkp1"
-geb_room_id = "geb-room-0001"
+kind = "geb"
+geb = { room_id = "geb-room-0001" }
 tier = "open"
 directions = "both"
 tier_optin = true
@@ -42,7 +43,8 @@ vtc_room = "room-2"
 host_did = "did:webvh:host.example"
 host_url = "https://host.example"
 persona = "did:key:z6Mkp2"
-geb_room_id = "geb-room-0002"
+kind = "geb"
+geb = { room_id = "geb-room-0002" }
 tier = "attributed"
 directions = "to_foreign"
 tier_optin = true
@@ -141,10 +143,18 @@ async fn link_management_edits_the_config_and_the_grant_is_narrow() {
     assert!(cli::link_set_enabled(&path, "nope", true).is_err());
     cli::add_peer(&path, "l1", "did:peer:2.peer").unwrap();
     cli::add_peer(&path, "l1", "did:peer:2.peer").unwrap();
-    assert_eq!(Config::load(&path).unwrap().links[0].geb_peers.len(), 1);
+    assert_eq!(peers(&Config::load(&path).unwrap(), 0), 1);
     let grant = cli::client_grant_hint("openvti-bridges", "did:key:zClient");
     assert!(grant.contains("--capabilities room-present,room-open"));
     assert!(!grant.contains("admin"));
+}
+
+/// How many peers link `i` records in its `[links.geb]` table.
+fn peers(cfg: &Config, i: usize) -> usize {
+    cfg.links[i].adapter["geb"]
+        .get("peers")
+        .and_then(|v| v.as_array())
+        .map_or(0, |a| a.len())
 }
 
 fn bin() -> Command {
@@ -462,7 +472,8 @@ async fn a_pause_during_link_add_survives_the_save() {
         host_did: "did:webvh:host.example".into(),
         host_url: "https://host.example".into(),
         persona: "did:key:z6Mkp3".into(),
-        geb_room_id: "geb-room-0003".into(),
+        kind: "geb".into(),
+        settings: vec![("room_id".into(), "geb-room-0003".into())],
         directions: "to_foreign".into(),
         tier: "open".into(),
         tier_optin: true,
@@ -532,5 +543,5 @@ fn concurrent_config_edits_are_not_lost() {
         h.join().unwrap();
     }
     let cfg = Config::load(&path).unwrap();
-    assert_eq!(cfg.links[0].geb_peers.len(), 12, "no peer was lost");
+    assert_eq!(peers(&cfg, 0), 12, "no peer was lost");
 }

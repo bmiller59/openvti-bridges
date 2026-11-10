@@ -12,7 +12,7 @@
 //! ratchets apart, and its dyad state under its own device DID.
 
 use crate::atrest::{AtRestKey, EncryptedState, SealedFile};
-use crate::config::{GebConfig, LinkConfig};
+use crate::config::LinkConfig;
 use crate::geb::codec::GuideCodec;
 use crate::geb::custody::GebLinkSecrets;
 use crate::geb::dyad::StatefulDyad;
@@ -20,6 +20,7 @@ use crate::geb::mls::{MlsConfig, MlsGroupClient};
 use crate::geb::policy::{CommitCheckInputs, NoLocalKnowledge};
 use crate::geb::room::{Clock, GebRoom};
 use crate::geb::traits::{GebRelay, GebSigner};
+use crate::geb::{GebConfig, GebLinkConfig};
 use crate::pause::PauseSource;
 use crate::pump::{LinkRuntime, Pump};
 use crate::secrets::LinkSecrets;
@@ -50,7 +51,7 @@ pub fn system_clock() -> Clock {
 pub struct LinkInputs {
     /// The link's configuration.
     pub link: LinkConfig,
-    /// The `[geb]` table.
+    /// The `[bridges.geb]` table.
     pub geb: GebConfig,
     /// The link's device keys and secrets.
     pub secrets: LinkSecrets,
@@ -103,6 +104,18 @@ pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
             i.link.id
         )));
     }
+    if i.link.kind != crate::geb::adapter::KIND_NAME {
+        return Err(Error::Config(format!(
+            "link {}: kind {:?} is not built by this assembly",
+            i.link.id, i.link.kind
+        )));
+    }
+    let geb_link = GebLinkConfig::from_table(
+        i.link
+            .adapter
+            .get(crate::geb::adapter::KIND_NAME)
+            .ok_or_else(|| Error::Config(format!("link {}: no [links.geb] table", i.link.id)))?,
+    )?;
     let state_key = AtRestKey::derive(&i.store_key, "state")?;
     let mls_key = AtRestKey::derive(&i.store_key, "mls")?;
     let store: Arc<dyn BridgeStore> =
@@ -128,7 +141,7 @@ pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
     );
     let group = Arc::new(
         MlsGroupClient::new(
-            MlsConfig::new(&i.link.geb_room_id, i.link.geb_peers.clone()),
+            MlsConfig::new(&geb_link.room_id, geb_link.peers.clone()),
             signer.clone(),
             dyad.clone(),
             i.commit_inputs
@@ -139,7 +152,7 @@ pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
         .with_fork_marker(store.clone(), &i.link.id),
     );
     let geb_room = Arc::new(GebRoom::new(
-        i.link.geb_room_id.clone(),
+        geb_link.room_id.clone(),
         i.relay,
         group.clone(),
         signer,

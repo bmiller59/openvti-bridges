@@ -11,12 +11,13 @@
 
 pub mod cli;
 pub mod ops;
+pub mod registry;
 pub mod service;
 pub mod wiring;
 
 pub use openvti_bridge_core::{
-    Error, Result, atrest, config, error, foreign, halt, loopback, mapping, model, pause, pump,
-    room, run, secrets, store,
+    Error, Result, adapter, atrest, config, error, foreign, halt, loopback, mapping, model, pause,
+    pump, room, run, secrets, store,
 };
 pub use openvti_bridge_geb as geb;
 pub use openvti_bridge_vtc as vtc;

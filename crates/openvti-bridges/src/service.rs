@@ -44,11 +44,12 @@ fn inputs_for(
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::Store(format!("create {}: {e}", dir.display())))?;
     let store = Arc::new(FjallStore::open(&dir.join("store"))?);
-    let relay = Arc::new(NostrRelay::new(NostrConfig::new(&cfg.geb.relay_url))?);
+    let geb = crate::geb::GebConfig::from_table(cfg.bridges.get(crate::geb::adapter::KIND_NAME))?;
+    let relay = Arc::new(NostrRelay::new(NostrConfig::new(&geb.relay_url))?);
     Ok((
         LinkInputs {
             link: link.clone(),
-            geb: cfg.geb.clone(),
+            geb,
             secrets: ls,
             store_key: secrets.store_key()?,
             dir,
@@ -112,7 +113,7 @@ async fn refuse_if_paused_or_halted(config_path: &Path, id: &str, what: &str) ->
              `link resume {id}`"
         )));
     }
-    let cfg = Config::load(config_path)?;
+    let cfg = crate::registry::load_config(config_path)?;
     let dir = link_dir(&cfg.data_dir_from(config_path), id).join("store");
     if dir.exists() {
         let store = FjallStore::open(&dir)?;
@@ -144,7 +145,7 @@ async fn offline_parts(config_path: &Path, id: &str) -> Result<(LinkParts, Arc<F
 pub async fn geb_connect(config_path: &Path, id: &str, peer: &str) -> Result<()> {
     refuse_if_paused_or_halted(config_path, id, "geb connect").await?;
     let (parts, _keep) = offline_parts(config_path, id).await?;
-    let cfg = Config::load(config_path)?;
+    let cfg = crate::registry::load_config(config_path)?;
     let name = link_of(&cfg, id)?.display_name.clone();
     let phase = crate::ops::connect(
         &parts,
@@ -171,7 +172,7 @@ pub async fn geb_stock_kps(config_path: &Path, id: &str) -> Result<()> {
 /// `run` first: the store is locked by the running process, and opening it
 /// then fails with a message that says so.
 pub async fn status(config_path: &Path, only: Option<&str>) -> Result<()> {
-    let cfg = Config::load(config_path)?;
+    let cfg = crate::registry::load_config(config_path)?;
     let data_dir = cfg.data_dir_from(config_path);
     println!("{}", crate::geb::status_line());
     for l in cfg.links.iter().filter(|l| only.is_none_or(|o| o == l.id)) {
@@ -212,7 +213,7 @@ pub async fn clear_halt(
     id: &str,
     confirm: crate::halt::ClearConfirmation,
 ) -> Result<()> {
-    let cfg = Config::load(config_path)?;
+    let cfg = crate::registry::load_config(config_path)?;
     link_of(&cfg, id)?;
     let data_dir = cfg.data_dir_from(config_path);
     let dir = link_dir(&data_dir, id).join("store");

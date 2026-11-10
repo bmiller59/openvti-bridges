@@ -30,20 +30,13 @@ use common::key_vta::KeyVta;
 use common::world::*;
 use ed25519_dalek::SigningKey;
 use openmls::prelude::*;
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tls_codec::Deserialize as _;
-use vta_sdk::client::VtaClient;
-use openvti_bridges::config::{Directions, GebConfig, LinkConfig, SecretsConfig, Tier};
+use openvti_bridges::config::{Directions, LinkConfig, SecretsConfig, Tier};
 use openvti_bridges::custody::{SecretStore, VtaKeyMinter};
-use openvti_bridges::geb::custody::mint_device_identity;
-use openvti_bridges::secrets::{BridgeSecrets, LinkSecrets};
 use openvti_bridges::fjall_store::FjallStore;
 use openvti_bridges::foreign::JoinState;
 use openvti_bridges::geb::codec::GuideCodec;
 use openvti_bridges::geb::crypto::{b64_decode, pair};
+use openvti_bridges::geb::custody::mint_device_identity;
 use openvti_bridges::geb::dyad::{GebIdentity, Phase, StatefulDyad};
 use openvti_bridges::geb::event::KIND_MAILBOX;
 use openvti_bridges::geb::mls::sim::{Sim, mc, ml, post, welcome_frame};
@@ -52,14 +45,22 @@ use openvti_bridges::geb::policy::CommitCheckInputs;
 use openvti_bridges::geb::test_relay::TestRelay;
 use openvti_bridges::geb::traits::{GebCodec, GebDyad, GebRelay, GebSigner};
 use openvti_bridges::geb::wire::{Envelope, Frame, GroupOp};
+use openvti_bridges::geb::{GebConfig, GebLinkConfig};
 use openvti_bridges::halt::{self, ClearConfirmation, Cleared, HaltReason};
 use openvti_bridges::ops;
 use openvti_bridges::pump::TickReport;
 use openvti_bridges::room::PROVENANCE_OPEN;
 use openvti_bridges::run::{End, Health, LinkTick, Timing, supervise};
+use openvti_bridges::secrets::{BridgeSecrets, LinkSecrets};
 use openvti_bridges::store::BridgeStore;
 use openvti_bridges::wiring::{LinkInputs, LinkParts, assemble};
 use openvti_bridges::{Error, Result};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tls_codec::Deserialize as _;
+use vta_sdk::client::VtaClient;
 
 const T0: u64 = 1_700_000_000;
 const ROOM: &str = "geb-room-0001";
@@ -225,8 +226,15 @@ impl Env {
             host_did: "did:key:zHost".into(),
             host_url: Some(world.host.url.clone()),
             persona: world.persona().to_string(),
-            geb_room_id: ROOM.into(),
-            geb_peers: vec![a.sim.did.clone()],
+            kind: "geb".into(),
+            adapter: std::collections::BTreeMap::from([(
+                "geb".to_string(),
+                GebLinkConfig {
+                    room_id: ROOM.into(),
+                    peers: vec![a.sim.did.clone()],
+                }
+                .to_table(),
+            )]),
             deny_authors: Vec::new(),
             directions: Directions::Both,
             tier: Tier::Open,
@@ -276,7 +284,9 @@ impl Env {
             store: store.clone(),
             relay: Arc::new(NostrRelay::new(relay_cfg(&self.relay.url()))?),
             vta: Arc::new(VtaClient::loopback(self.world.vta.clone())),
-            host: openvti_bridges::vtc::host::HostDelivery::for_loopback_tests(&self.world.host.url),
+            host: openvti_bridges::vtc::host::HostDelivery::for_loopback_tests(
+                &self.world.host.url,
+            ),
             clock: Arc::new(move || n.load(Ordering::SeqCst) * 1000),
             commit_inputs: self.inputs.clone(),
             pause: None,

@@ -34,8 +34,11 @@ pub enum Tier {
 }
 
 /// One bridged room pair.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// Not `deny_unknown_fields` (that cannot be combined with the flattened
+/// kind table); [`Config::from_toml`] refuses any table that is not the
+/// link's own kind, and a stray scalar key fails to parse as a table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkConfig {
     /// Stable id of the link.
     pub id: String,
@@ -49,12 +52,10 @@ pub struct LinkConfig {
     pub host_url: Option<String>,
     /// The bridge's persona DID in the VTC room.
     pub persona: String,
-    /// Foreign room id.
-    pub geb_room_id: String,
-    /// Geb members (device DIDs) the bridge holds a dyad with and is seated
-    /// through. Added by `geb connect`.
-    #[serde(default)]
-    pub geb_peers: Vec<String>,
+    /// The bridge kind (an adapter): `geb`, `loopback`, ... Required: absence
+    /// names nothing. Checked against the kinds the binary was built with by
+    /// [`Config::validate_kinds`].
+    pub kind: String,
     /// Allowed flow. Required: no default (absence is not "both").
     pub directions: Directions,
     /// The room's tier.
@@ -68,8 +69,8 @@ pub struct LinkConfig {
     /// Whether the link runs. Off by default.
     #[serde(default)]
     pub enabled: bool,
-    /// The name the bridge presents in the foreign room, 1-40 characters
-    /// (Geb's limit). Optional: bridges are welcome unmarked by default. Geb
+    /// The name the bridge presents in the foreign room: at least 1 character,
+    /// at most what the kind allows. Optional: bridges are welcome unmarked by default. Geb
     /// will later define room-level bridge policy (not welcome / welcome
     /// automatically / ask, and whether to show a mark) and a signed "bridge"
     /// role badge; their shapes are not shared yet and are not implemented.
@@ -86,6 +87,11 @@ pub struct LinkConfig {
     /// Per link; what an id looks like is the foreign system's own.
     #[serde(default)]
     pub deny_authors: Vec<String>,
+    /// The kind's own settings for this link, from the `[links.<kind>]` table:
+    /// at most one entry, keyed by [`LinkConfig::kind`]. The core carries it
+    /// without reading it; the kind parses it.
+    #[serde(flatten, default)]
+    pub adapter: std::collections::BTreeMap<String, toml::Table>,
     /// Days to keep a posted outbox row, a journal row and an expiring
     /// cross-reference before pruning them. At least 1; the default (7)
     /// matches Geb's relay retention. Entries not posted are never pruned.
@@ -97,32 +103,8 @@ fn default_retention_days() -> u32 {
     crate::pump::DEFAULT_RETENTION_DAYS
 }
 
-/// Longest bridge display name (Geb's limit), in characters.
-pub const MAX_DISPLAY_NAME_CHARS: usize = 40;
-
 fn default_poll_secs() -> u64 {
     10
-}
-
-/// The `[geb]` table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GebConfig {
-    /// Relay URL.
-    #[serde(default = "default_relay")]
-    pub relay_url: String,
-}
-
-impl Default for GebConfig {
-    fn default() -> Self {
-        Self {
-            relay_url: default_relay(),
-        }
-    }
-}
-
-fn default_relay() -> String {
-    "wss://nostr.myceli.al".into()
 }
 
 /// The `[vta]` table.
@@ -164,9 +146,9 @@ pub struct Config {
     /// Links.
     #[serde(default)]
     pub links: Vec<LinkConfig>,
-    /// Geb adapter settings.
+    /// Per-kind global settings, `[bridges.<kind>]`, read only by the kind.
     #[serde(default)]
-    pub geb: GebConfig,
+    pub bridges: std::collections::BTreeMap<String, toml::Table>,
     /// VTA connection.
     pub vta: VtaConfig,
     /// Secret store.
@@ -273,23 +255,22 @@ impl Config {
             .join(&self.data_dir)
     }
 
-    /// Parse and validate.
+    /// Parse and validate the rules that do not need to know the kinds. A
+    /// kind's own tables are checked by [`Config::validate_kinds`].
     pub fn from_toml(s: &str) -> Result<Self> {
         let cfg: Config = toml::from_str(s).map_err(|e| {
             let msg = e.to_string();
-            // `settle_ms` used to be accepted and was never read: the settle
-            // window is the room's own (`0xF001` policy, `settleWindowMs`).
-            // Name the key and say where the value really comes from.
             if msg.contains("missing field `directions`") {
                 Error::Config(format!(
                     "{msg}\nevery [[links]] must state `directions` (no default: absence means \
                      the most restrictive reading). Allowed values: \"to_foreign\" (VTC room to \
-                     Geb only), \"from_foreign\" (Geb to VTC room only), \"both\""
+                     the foreign room only), \"from_foreign\" (foreign room to VTC room only), \
+                     \"both\""
                 ))
-            } else if msg.contains("settle_ms") {
+            } else if msg.contains("missing field `kind`") {
                 Error::Config(format!(
-                    "{msg}\n[geb] settle_ms is no longer a setting: the commit settle window is \
-                     taken from the room's own 0xF001 policy (settleWindowMs); remove the key"
+                    "{msg}\nevery [[links]] must state `kind`, the bridge kind (for example \
+                     kind = \"geb\"), with the kind's own settings in a [links.<kind>] table"
                 ))
             } else {
                 Error::Config(msg)
@@ -299,27 +280,84 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Check the rules the type system cannot state.
+    /// Check the rules that need the kinds this binary was built with: each
+    /// link's kind is one of them, its `[links.<kind>]` table and the kind's
+    /// `[bridges.<kind>]` table are valid, `display_name` fits the kind's
+    /// limit, and one foreign room is bridged by one link.
+    pub fn validate_kinds(&self, kinds: crate::adapter::Kinds<'_>) -> Result<()> {
+        let empty = toml::Table::new();
+        for name in self.bridges.keys() {
+            let Some(k) = crate::adapter::find(kinds, name) else {
+                return Err(Error::Config(format!(
+                    "[bridges.{name}]: no bridge kind {name:?} in this build (enabled: {})",
+                    crate::adapter::names(kinds)
+                )));
+            };
+            k.validate_global(&self.bridges[name])?;
+        }
+        let mut rooms = std::collections::BTreeMap::new();
+        for l in &self.links {
+            let Some(k) = crate::adapter::find(kinds, &l.kind) else {
+                return Err(Error::Config(format!(
+                    "link {}: no bridge kind {:?} in this build (enabled: {})",
+                    l.id,
+                    l.kind,
+                    crate::adapter::names(kinds)
+                )));
+            };
+            let table = l.adapter.get(&l.kind).unwrap_or(&empty);
+            k.validate_link(table)
+                .map_err(|e| Error::Config(format!("link {}: [links.{}]: {e}", l.id, l.kind)))?;
+            if let Some(max) = k.max_display_name()
+                && let Some(n) = &l.display_name
+                && n.chars().count() > max
+            {
+                return Err(Error::Config(format!(
+                    "link {}: display_name must be 1-{max} characters for kind {}",
+                    l.id, l.kind
+                )));
+            }
+            let room = k.foreign_room_key(table)?;
+            if let Some(other) = rooms.insert((l.kind.as_str(), room.clone()), l.id.as_str()) {
+                return Err(Error::Config(format!(
+                    "link {}: {} room {room} is already bridged by link {other}",
+                    l.id, l.kind
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check the rules the type system cannot state and that do not depend on
+    /// a kind.
     pub fn validate(&self) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         let mut personas = std::collections::BTreeMap::new();
-        let mut geb_rooms = std::collections::BTreeMap::new();
         for l in &self.links {
             if !seen.insert(l.id.as_str()) {
                 return Err(Error::Config(format!("duplicate link id {}", l.id)));
             }
-            // One room persona and one Geb room per link: a shared identity
-            // correlates every room it sits in (plan section 4).
+            if l.kind.is_empty() {
+                return Err(Error::Config(format!(
+                    "link {}: kind must not be empty",
+                    l.id
+                )));
+            }
+            // A link has the settings table of its own kind and no other: a
+            // leftover table from another kind, or a typo, is an error.
+            if let Some(stray) = l.adapter.keys().find(|k| **k != l.kind) {
+                return Err(Error::Config(format!(
+                    "link {}: unknown table [links.{stray}] (this link's kind is {:?}; its \
+                     settings go in [links.{}])",
+                    l.id, l.kind, l.kind
+                )));
+            }
+            // One room persona per link: a shared identity correlates every
+            // room it sits in (plan section 4).
             if let Some(other) = personas.insert(l.persona.as_str(), l.id.as_str()) {
                 return Err(Error::Config(format!(
                     "link {}: persona {} is already used by link {other}; one persona per link",
                     l.id, l.persona
-                )));
-            }
-            if let Some(other) = geb_rooms.insert(l.geb_room_id.as_str(), l.id.as_str()) {
-                return Err(Error::Config(format!(
-                    "link {}: Geb room {} is already bridged by link {other}",
-                    l.id, l.geb_room_id
                 )));
             }
             if l.tier == Tier::Private {
@@ -343,9 +381,9 @@ impl Config {
             }
             if let Some(n) = &l.display_name {
                 let c = n.chars().count();
-                if c == 0 || c > MAX_DISPLAY_NAME_CHARS {
+                if c == 0 {
                     return Err(Error::Config(format!(
-                        "link {}: display_name must be 1-{MAX_DISPLAY_NAME_CHARS} characters",
+                        "link {}: display_name must not be empty",
                         l.id
                     )));
                 }
@@ -383,6 +421,29 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::BridgeKind;
+
+    const KINDS: crate::adapter::Kinds<'static> = &[&crate::loopback::KIND];
+
+    /// A loopback-like kind that limits the display name.
+    struct Limited(usize);
+    impl BridgeKind for Limited {
+        fn kind(&self) -> &'static str {
+            "loopback"
+        }
+        fn describe(&self) -> &'static str {
+            "limited"
+        }
+        fn validate_link(&self, _: &toml::Table) -> Result<()> {
+            Ok(())
+        }
+        fn foreign_room_key(&self, t: &toml::Table) -> Result<String> {
+            crate::loopback::KIND.foreign_room_key(t)
+        }
+        fn max_display_name(&self) -> Option<usize> {
+            Some(self.0)
+        }
+    }
 
     const BASE: &str = r#"
 [vta]
@@ -393,10 +454,11 @@ id = "l1"
 vtc_room = "room-1"
 host_did = "did:webvh:host.example"
 persona = "did:key:z6Mkpersona"
-geb_room_id = "geb-1"
 directions = "both"
 tier = "open"
 tier_optin = true
+kind = "loopback"
+loopback = { room = "room-a" }
 "#;
 
     #[test]
@@ -435,26 +497,18 @@ tier_optin = true
         assert_eq!(c.links[0].directions, Directions::Both);
         assert_eq!(c.links[0].poll_secs, 10);
         assert!(!c.links[0].enabled);
-        assert_eq!(c.geb.relay_url, "wss://nostr.myceli.al");
+        assert_eq!(c.links[0].kind, "loopback");
+        assert!(c.bridges.is_empty());
         assert_eq!(c.vta.context, "openvti-bridges");
     }
 
     #[test]
     fn unknown_keys_are_rejected() {
+        // The pre-restructure global table is not read.
         let bad = format!("{BASE}\n[geb]\nrelay = \"x\"\n");
         assert!(Config::from_toml(&bad).is_err());
         let bad = BASE.replace("tier = \"open\"", "tier = \"open\"\nextra = 1");
         assert!(Config::from_toml(&bad).is_err());
-    }
-
-    #[test]
-    fn settle_ms_is_rejected_and_the_error_says_where_the_window_comes_from() {
-        let bad = format!("{BASE}\n[geb]\nsettle_ms = 3000\n");
-        let e = Config::from_toml(&bad).unwrap_err().to_string();
-        assert!(
-            e.contains("settle_ms") && e.contains("room's own 0xF001 policy"),
-            "{e}"
-        );
     }
 
     #[test]
@@ -478,7 +532,7 @@ tier_optin = true
         );
         let c = Config::from_toml(&t).unwrap();
         assert_eq!(c.links[0].deny_authors, ["did:peer:other-bridge"]);
-        // The pre-restructure global key is not read: it is an unknown key.
+        // The pre-restructure global key is not read: it is an unknown table.
         let old = format!("{BASE}\n[geb]\ndeny_list = [\"did:peer:x\"]\n");
         assert!(Config::from_toml(&old).is_err());
     }
@@ -507,18 +561,24 @@ tier_optin = true
         let c = Config::from_toml(&named).unwrap();
         assert_eq!(c.links[0].display_name.as_deref(), Some("Ada"));
         assert!(c.links[0].announce);
-        for bad in ["", &"x".repeat(41)] {
-            let t = BASE.replace(
-                "tier = \"open\"",
-                &format!("tier = \"open\"\ndisplay_name = \"{bad}\""),
-            );
-            assert!(Config::from_toml(&t).is_err());
-        }
+        let t = BASE.replace("tier = \"open\"", "tier = \"open\"\ndisplay_name = \"\"");
+        assert!(Config::from_toml(&t).is_err());
+        // The limit is the kind's own: a kind with none accepts a long name.
+        let long = BASE.replace(
+            "tier = \"open\"",
+            &format!("tier = \"open\"\ndisplay_name = \"{}\"", "é".repeat(400)),
+        );
+        let c = Config::from_toml(&long).unwrap();
+        assert!(c.validate_kinds(KINDS).is_ok());
+        // A kind that limits it refuses a longer one, counted in characters.
+        let limited: &[&dyn BridgeKind] = &[&Limited(40)];
+        assert!(c.validate_kinds(limited).is_err());
         let ok = BASE.replace(
             "tier = \"open\"",
             &format!("tier = \"open\"\ndisplay_name = \"{}\"", "é".repeat(40)),
         );
-        assert!(Config::from_toml(&ok).is_ok());
+        let c = Config::from_toml(&ok).unwrap();
+        assert!(c.validate_kinds(limited).is_ok());
     }
 
     #[test]
@@ -544,17 +604,19 @@ tier_optin = true
     }
 
     #[test]
-    fn one_persona_and_one_geb_room_per_link() {
+    fn one_persona_and_one_foreign_room_per_link() {
         let l2 = |persona: &str, room: &str| {
             format!(
-                "{BASE}\n[[links]]\nid = \"l2\"\nvtc_room = \"room-2\"\nhost_did = \"did:webvh:host.example\"\npersona = \"{persona}\"\ngeb_room_id = \"{room}\"\ndirections = \"both\"\ntier = \"open\"\ntier_optin = true\n"
+                "{BASE}\n[[links]]\nid = \"l2\"\nvtc_room = \"room-2\"\nhost_did = \"did:webvh:host.example\"\npersona = \"{persona}\"\ndirections = \"both\"\ntier = \"open\"\ntier_optin = true\nkind = \"loopback\"\nloopback = {{ room = \"{room}\" }}\n"
             )
         };
-        assert!(Config::from_toml(&l2("did:key:z6Mkother", "geb-2")).is_ok());
-        let e = Config::from_toml(&l2("did:key:z6Mkpersona", "geb-2")).unwrap_err();
+        let ok = Config::from_toml(&l2("did:key:z6Mkother", "room-b")).unwrap();
+        assert!(ok.validate_kinds(KINDS).is_ok());
+        let e = Config::from_toml(&l2("did:key:z6Mkpersona", "room-b")).unwrap_err();
         assert!(e.to_string().contains("persona"), "{e}");
-        let e = Config::from_toml(&l2("did:key:z6Mkother", "geb-1")).unwrap_err();
-        assert!(e.to_string().contains("Geb room"), "{e}");
+        let same_room = Config::from_toml(&l2("did:key:z6Mkother", "room-a")).unwrap();
+        let e = same_room.validate_kinds(KINDS).unwrap_err();
+        assert!(e.to_string().contains("loopback room room-a"), "{e}");
     }
 
     #[test]
@@ -565,5 +627,48 @@ tier_optin = true
         assert!(Config::from_toml(&bad).is_err());
         let ok = format!("{BASE}\n[secrets]\nbackend = \"keyring\"\n");
         assert!(Config::from_toml(&ok).is_ok());
+    }
+
+    #[test]
+    fn a_link_needs_a_registered_kind_and_only_its_own_table() {
+        // No kind at all.
+        let bad = BASE.replace("kind = \"loopback\"\n", "");
+        let e = Config::from_toml(&bad).unwrap_err().to_string();
+        assert!(e.contains("kind"), "{e}");
+        // A kind this build does not have names the ones it does.
+        let c = Config::from_toml(
+            &BASE
+                .replace("kind = \"loopback\"", "kind = \"other\"")
+                .replace("loopback = {", "other = {"),
+        )
+        .unwrap();
+        let e = c.validate_kinds(KINDS).unwrap_err().to_string();
+        assert!(e.contains("\"other\"") && e.contains("loopback"), "{e}");
+        // A table of another kind on the link, or a stray scalar, is refused.
+        let bad = BASE.replace("loopback = {", "geb = { room = \"x\" }\nloopback = {");
+        let e = Config::from_toml(&bad).unwrap_err().to_string();
+        assert!(e.contains("[links.geb]"), "{e}");
+        let bad = BASE.replace("tier = \"open\"", "tier = \"open\"\nextra = 1");
+        assert!(Config::from_toml(&bad).is_err());
+        // The kind's own validation runs, with the kind's own unknown-key rule.
+        let bad = BASE.replace("{ room = \"room-a\" }", "{ room = \"a\", x = 1 }");
+        let c = Config::from_toml(&bad).unwrap();
+        assert!(c.validate_kinds(KINDS).is_err());
+        let bad = format!("{BASE}\n[bridges.loopback]\nx = 1\n");
+        let c = Config::from_toml(&bad).unwrap();
+        assert!(c.validate_kinds(KINDS).is_err());
+    }
+
+    #[test]
+    fn the_kind_table_survives_a_save_and_load() {
+        let c = Config::from_toml(BASE).unwrap();
+        let dir = std::env::temp_dir().join(format!("ovb-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+        c.save(&path).unwrap();
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back, c);
+        assert!(back.validate_kinds(KINDS).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

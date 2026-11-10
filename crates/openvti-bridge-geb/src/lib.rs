@@ -67,8 +67,10 @@ mod tests {
     }
 }
 
+pub use adapter::{GebConfig, GebKind, GebLinkConfig, KIND};
 pub use openvti_bridge_core::{Error, Result};
 
+pub mod adapter;
 #[cfg(feature = "mls")]
 mod atrest_mls;
 pub mod codec;

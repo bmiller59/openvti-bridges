@@ -142,7 +142,8 @@ id = "l1"
 vtc_room = "room-1"
 host_did = "did:webvh:host.example"
 persona = "did:key:z6Mkpersona"
-geb_room_id = "geb-1"
+kind = "loopback"
+loopback = { room = "geb-1" }
 tier = "open"
 directions = "both"
 tier_optin = true

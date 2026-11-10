@@ -22,6 +22,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Provision from the operator's VTA in two phases (contacts the VTA).
     Setup(SetupArgs),
@@ -72,8 +73,13 @@ enum LinkCmd {
         host_url: String,
         #[arg(long)]
         persona: String,
+        /// The bridge kind (see the registry), for example `geb`.
         #[arg(long)]
-        geb_room_id: String,
+        kind: String,
+        /// A setting of that kind, `key=value`; repeat for more (for Geb:
+        /// `--set room_id=<id>`).
+        #[arg(long = "set", value_parser = parse_setting)]
+        settings: Vec<(String, String)>,
         /// Which way content may flow: `to_foreign`, `from_foreign` or `both`.
         /// Required: there is no default.
         #[arg(long)]
@@ -129,6 +135,13 @@ enum GebCmd {
     },
 }
 
+fn parse_setting(s: &str) -> std::result::Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.into(), v.into())),
+        _ => Err(format!("expected key=value, got {s:?}")),
+    }
+}
+
 async fn dispatch(cli: Cli) -> Result<()> {
     let config = cli.config;
     match cli.command {
@@ -147,7 +160,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 host_did,
                 host_url,
                 persona,
-                geb_room_id,
+                kind,
+                settings,
                 directions,
                 tier,
                 tier_optin,
@@ -163,7 +177,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
                         host_did,
                         host_url,
                         persona,
-                        geb_room_id,
+                        kind,
+                        settings,
                         directions,
                         tier,
                         tier_optin,
@@ -174,7 +189,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 .await
             }
             LinkCmd::List => {
-                for line in cli::link_list(&openvti_bridges::config::Config::load(&config)?) {
+                for line in cli::link_list(&openvti_bridges::registry::load_config(&config)?) {
                     println!("{line}");
                 }
                 Ok(())

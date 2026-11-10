@@ -25,6 +25,37 @@ struct Inner {
     posted: Vec<BridgeEvent>,
 }
 
+/// The loopback kind: `kind = "loopback"` with `[links.loopback] room = "<id>"`.
+/// It has no global settings and no display-name limit.
+pub struct LoopbackKind;
+
+/// The registered loopback kind.
+pub static KIND: LoopbackKind = LoopbackKind;
+
+impl crate::adapter::BridgeKind for LoopbackKind {
+    fn kind(&self) -> &'static str {
+        "loopback"
+    }
+
+    fn describe(&self) -> &'static str {
+        "an in-memory room, for tests and development"
+    }
+
+    fn validate_link(&self, table: &toml::Table) -> Result<()> {
+        if let Some(k) = table.keys().find(|k| *k != "room") {
+            return Err(Error::Config(format!("unknown key {k:?} (allowed: room)")));
+        }
+        self.foreign_room_key(table).map(|_| ())
+    }
+
+    fn foreign_room_key(&self, table: &toml::Table) -> Result<String> {
+        match table.get("room").and_then(|v| v.as_str()) {
+            Some(r) if !r.is_empty() => Ok(r.into()),
+            _ => Err(Error::Config("room must be a non-empty string".into())),
+        }
+    }
+}
+
 /// In-memory foreign room.
 pub struct Loopback {
     id: String,

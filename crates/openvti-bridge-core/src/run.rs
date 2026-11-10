@@ -479,7 +479,7 @@ mod tests {
         let cfg_text = |enabled: bool| {
             format!(
                 "[vta]\ndid = \"did:webvh:vta.example\"\n[[links]]\nid = \"l1\"\nvtc_room = \"r\"\n\
-                 host_did = \"did:webvh:h.example\"\npersona = \"did:key:p\"\ngeb_room_id = \"g\"\n\
+                 host_did = \"did:webvh:h.example\"\npersona = \"did:key:p\"\nkind = \"loopback\"\nloopback = {{ room = \"g\" }}\n\
                  directions = \"both\"\ntier = \"open\"\ntier_optin = true\nenabled = {enabled}\n"
             )
         };

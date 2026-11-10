@@ -16,7 +16,7 @@
 //!    long-term client `did:key`, narrowed to `room-present,room-open` and
 //!    never an admin. Revoking the bridge is removing that ACL entry.
 
-use crate::config::{Config, Directions, GebConfig, LinkConfig, SecretsConfig, Tier, VtaConfig};
+use crate::config::{Config, Directions, LinkConfig, SecretsConfig, Tier, VtaConfig};
 use crate::custody::{SecretStore, VtaKeyMinter};
 use crate::geb::custody::{GebLinkSecrets, mint_device_identity};
 use crate::secrets::{BridgeSecrets, ClientCredential};
@@ -98,9 +98,9 @@ pub struct SetupInputs {
     pub context: String,
     /// The phase-1 key file whose DID was granted admin of `context`.
     pub setup_key_file: PathBuf,
-    /// The `[geb]` table.
+    /// The per-kind global tables, `[bridges.<kind>]`.
     #[serde(default)]
-    pub geb: GebConfig,
+    pub bridges: std::collections::BTreeMap<String, toml::Table>,
     /// Where the keys are kept (same table as `config.toml`'s).
     pub secrets: SecretsConfig,
     /// The links to provision.
@@ -129,7 +129,7 @@ impl SetupInputs {
         let cfg = Config {
             data_dir: self.data_dir.clone().unwrap_or_else(|| "data".into()),
             links: self.links.clone(),
-            geb: self.geb.clone(),
+            bridges: self.bridges.clone(),
             vta: VtaConfig {
                 did: self.vta_did.clone(),
                 url: Some(self.vta_url.clone()),
@@ -138,6 +138,7 @@ impl SetupInputs {
             secrets: self.secrets.clone(),
         };
         cfg.validate()?;
+        cfg.validate_kinds(crate::registry::kinds())?;
         Ok(cfg)
     }
 }
@@ -283,7 +284,7 @@ pub async fn setup_from_file(path: &Path) -> Result<()> {
 
 /// Load the config and open the secret store beside it.
 pub async fn open(config_path: &Path) -> Result<(Config, PathBuf, SecretStore)> {
-    let cfg = Config::load(config_path)?;
+    let cfg = crate::registry::load_config(config_path)?;
     let data_dir = cfg.data_dir_from(config_path);
     let store = SecretStore::open(&cfg.secrets, &data_dir)?;
     Ok((cfg, data_dir, store))
@@ -307,8 +308,11 @@ pub struct NewLink {
     pub host_url: String,
     /// Persona DID.
     pub persona: String,
-    /// Geb room id.
-    pub geb_room_id: String,
+    /// The bridge kind (`geb`).
+    pub kind: String,
+    /// The kind's own settings for this link, from repeated `--set key=value`
+    /// (stored in its `[links.<kind>]` table; values are strings).
+    pub settings: Vec<(String, String)>,
     /// `both`, `to_foreign` or `from_foreign`.
     pub directions: String,
     /// `open` or `attributed`.
@@ -349,15 +353,21 @@ where
     F: FnOnce(Config, LinkConfig) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let mut cfg = Config::load(config_path)?;
+    let mut cfg = crate::registry::load_config(config_path)?;
     let link = LinkConfig {
         id: n.id,
         vtc_room: n.vtc_room,
         host_did: n.host_did,
         host_url: Some(n.host_url),
         persona: n.persona,
-        geb_room_id: n.geb_room_id,
-        geb_peers: Vec::new(),
+        kind: n.kind.clone(),
+        adapter: std::collections::BTreeMap::from([(
+            n.kind,
+            n.settings
+                .into_iter()
+                .map(|(k, v)| (k, toml::Value::String(v)))
+                .collect::<toml::Table>(),
+        )]),
         deny_authors: Vec::new(),
         directions: parse_enum::<Directions>("directions", &n.directions)?,
         tier: parse_enum::<Tier>("tier", &n.tier)?,
@@ -371,6 +381,7 @@ where
     };
     cfg.links.push(link.clone());
     cfg.validate()?;
+    cfg.validate_kinds(crate::registry::kinds())?;
     mint(cfg, link.clone()).await?;
     // Re-read and merge: the config may have changed while `mint` ran (a
     // `link pause` is the kill switch), so only this link is added to what is
@@ -394,15 +405,35 @@ pub fn link_list(cfg: &Config) -> Vec<String> {
         .iter()
         .map(|l| {
             format!(
-                "{}\t{}\t{} <-> {}\tpeers={}",
+                "{}\t{}\t{} <-> {}\tpeers={}\tkind={}",
                 l.id,
                 if l.enabled { "running" } else { "paused" },
                 l.vtc_room,
-                l.geb_room_id,
-                l.geb_peers.len()
+                adapter_str(l, "room_id"),
+                adapter_peers(l).len(),
+                l.kind
             )
         })
         .collect()
+}
+
+/// A string setting of the link's own kind table.
+fn adapter_str<'a>(l: &'a LinkConfig, key: &str) -> &'a str {
+    l.adapter
+        .get(&l.kind)
+        .and_then(|t| t.get(key))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// The `peers` list of the link's own kind table.
+fn adapter_peers(l: &LinkConfig) -> Vec<&str> {
+    l.adapter
+        .get(&l.kind)
+        .and_then(|t| t.get("peers"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default()
 }
 
 /// How soon a running `run` honours a pause or resume: it reads the config
@@ -461,7 +492,7 @@ pub async fn link_remove(config_path: &Path, id: &str) -> Result<()> {
     })
 }
 
-/// Add a connected peer to a link's `geb_peers`.
+/// Add a connected peer to a link's `[links.geb]` `peers`.
 pub fn add_peer(config_path: &Path, id: &str, peer: &str) -> Result<()> {
     Config::modify(config_path, |cfg| {
         let l = cfg
@@ -469,8 +500,14 @@ pub fn add_peer(config_path: &Path, id: &str, peer: &str) -> Result<()> {
             .iter_mut()
             .find(|l| l.id == id)
             .ok_or_else(|| Error::Config(format!("no link {id}")))?;
-        if !l.geb_peers.iter().any(|p| p == peer) {
-            l.geb_peers.push(peer.into());
+        let table = l.adapter.entry(l.kind.clone()).or_default();
+        let peers = table
+            .entry("peers")
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        if let toml::Value::Array(a) = peers
+            && !a.iter().any(|p| p.as_str() == Some(peer))
+        {
+            a.push(toml::Value::String(peer.into()));
         }
         Ok(())
     })
