@@ -2,7 +2,7 @@
 //! ratchet chain keys, the MLS signature key and the persisted MLS group state.
 //!
 //! One 32-byte *store key* lives in the bridge's secret store
-//! ([`crate::custody::BridgeSecrets`]). [`AtRestKey::derive`] turns it into an
+//! ([`crate::secrets::BridgeSecrets`]). [`AtRestKey::derive`] turns it into an
 //! independent key per purpose with HKDF-SHA256, so a leak of one purpose's
 //! key (or a chosen-ciphertext trick across purposes) does not open another.
 //! Every record is XChaCha20-Poly1305 with a fresh random 24-byte nonce and

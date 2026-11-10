@@ -73,6 +73,7 @@ pub use openvti_bridge_core::{Error, Result};
 mod atrest_mls;
 pub mod codec;
 pub mod crypto;
+pub mod custody;
 pub mod dyad;
 pub mod event;
 pub mod fake;

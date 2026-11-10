@@ -13,8 +13,8 @@
 
 use crate::atrest::{AtRestKey, EncryptedState, SealedFile};
 use crate::config::{GebConfig, LinkConfig};
-use crate::custody::LinkSecrets;
 use crate::geb::codec::GuideCodec;
+use crate::geb::custody::GebLinkSecrets;
 use crate::geb::dyad::StatefulDyad;
 use crate::geb::mls::{MlsConfig, MlsGroupClient};
 use crate::geb::policy::{CommitCheckInputs, NoLocalKnowledge};
@@ -22,6 +22,7 @@ use crate::geb::room::{Clock, GebRoom};
 use crate::geb::traits::{GebRelay, GebSigner};
 use crate::pause::PauseSource;
 use crate::pump::{LinkRuntime, Pump};
+use crate::secrets::LinkSecrets;
 use crate::store::BridgeStore;
 use crate::vtc::host::HostDelivery;
 use crate::vtc::{VtcRoom, VtcRoomConfig};
@@ -106,7 +107,8 @@ pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
     let mls_key = AtRestKey::derive(&i.store_key, "mls")?;
     let store: Arc<dyn BridgeStore> =
         Arc::new(EncryptedState::new(i.store.clone(), state_key, &i.link.id));
-    let identity = Arc::new(i.secrets.identity()?);
+    let geb_secrets = GebLinkSecrets::from_link_secrets(&i.secrets)?;
+    let identity = Arc::new(geb_secrets.identity()?);
     let signer: Arc<dyn GebSigner> = identity.clone();
     let dyad = Arc::new(StatefulDyad::new(
         identity,
@@ -164,7 +166,7 @@ pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
     rt.announce = i.link.announce;
     rt.notices = i.link.notices.clone();
     rt.retention_days = i.link.retention_days;
-    let device_did = i.secrets.device_did.clone();
+    let device_did = geb_secrets.device_did.clone();
     let mut pump = Pump::new(rt, room, geb_room.clone(), store.clone());
     if let Some(p) = i.pause {
         pump = pump.with_pause(p);

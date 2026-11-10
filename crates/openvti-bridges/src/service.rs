@@ -4,11 +4,12 @@
 
 use crate::cli::open;
 use crate::config::{Config, LinkConfig};
-use crate::custody::{BridgeSecrets, SecretStore};
+use crate::custody::SecretStore;
 use crate::fjall_store::FjallStore;
 use crate::geb::nostr::{NostrConfig, NostrRelay};
 use crate::pause::{ConfigFilePause, PauseSource};
 use crate::run::{End, Health, LinkTick, Timing, supervise};
+use crate::secrets::BridgeSecrets;
 use crate::store::BridgeStore;
 use crate::vtc::host::HostDelivery;
 use crate::wiring::{LinkInputs, LinkParts, assemble, link_dir, system_clock};

@@ -4,7 +4,7 @@
 //! fixture, `VtcRoom` over a `VtaClient` whose VTA is the harness `TestVta`.
 //! Bridge (the production assembly, `wiring::assemble`): fjall store, sealed
 //! state, `StatefulDyad`, `MlsGroupClient`, `GebRoom`, the pump. Keys come from
-//! `custody::mint_device_identity` against the key-serving fake VTA and live in
+//! `geb::custody::mint_device_identity` against the key-serving fake VTA and live in
 //! the bridge's own secret store. Geb side: the in-process `TestRelay` over
 //! real websockets, and a Geb member played by `geb::mls::sim::Sim` (an
 //! independent OpenMLS client, written from the guide) with its own real
@@ -37,7 +37,9 @@ use std::time::Duration;
 use tls_codec::Deserialize as _;
 use vta_sdk::client::VtaClient;
 use openvti_bridges::config::{Directions, GebConfig, LinkConfig, SecretsConfig, Tier};
-use openvti_bridges::custody::{BridgeSecrets, LinkSecrets, SecretStore, mint_device_identity};
+use openvti_bridges::custody::{SecretStore, VtaKeyMinter};
+use openvti_bridges::geb::custody::mint_device_identity;
+use openvti_bridges::secrets::{BridgeSecrets, LinkSecrets};
 use openvti_bridges::fjall_store::FjallStore;
 use openvti_bridges::foreign::JoinState;
 use openvti_bridges::geb::codec::GuideCodec;
@@ -186,14 +188,12 @@ impl Env {
         // Custody: mint through the fake VTA, keep only in the secret store,
         // read it back as the process would.
         let kv = Arc::new(KeyVta::default());
-        let minted = mint_device_identity(
-            &VtaClient::loopback(kv.clone()),
-            "openvti-bridges",
-            "l1",
-            world.persona(),
-        )
-        .await
-        .unwrap();
+        let kvc = VtaClient::loopback(kv.clone());
+        let minted = mint_device_identity(&VtaKeyMinter(&kvc), "openvti-bridges", "l1")
+            .await
+            .unwrap()
+            .into_link_secrets(world.persona())
+            .unwrap();
         let mut blob = BridgeSecrets::new();
         let store_key = *blob.store_key().unwrap();
         blob.insert("l1", minted).unwrap();

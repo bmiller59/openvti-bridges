@@ -25,6 +25,7 @@ pub mod pause;
 pub mod pump;
 pub mod room;
 pub mod run;
+pub mod secrets;
 pub mod store;
 
 pub use error::{Error, Result};

@@ -20,8 +20,6 @@ harness = ["vta-sdk/test-loopback"]
 
 [dependencies]
 openvti-bridge-core = { path = "../openvti-bridge-core" }
-# TEMPORARY (removed when custody is split): custody still names Geb's identity types.
-openvti-bridge-geb = { path = "../openvti-bridge-geb" }
 vta-sdk = { version = "0.85", features = ["client"] }
 vti-common = "0.61"
 vti-specs = "0.10"

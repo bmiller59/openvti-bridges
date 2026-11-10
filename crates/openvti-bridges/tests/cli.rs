@@ -9,7 +9,8 @@ mod common;
 use common::key_vta::KeyVta;
 use openvti_bridges::cli::{self, SetupInputs};
 use openvti_bridges::config::Config;
-use openvti_bridges::custody::BridgeSecrets;
+use openvti_bridges::geb::custody::GebLinkSecrets;
+use openvti_bridges::secrets::BridgeSecrets;
 use std::process::Command;
 use std::sync::Arc;
 use vta_sdk::client::VtaClient;
@@ -86,6 +87,10 @@ async fn provision_mints_distinct_identities_and_names_orphans_on_failure() {
         .await
         .unwrap();
     let (a, b) = (secrets.link("l1").unwrap(), secrets.link("l2").unwrap());
+    let (a, b) = (
+        GebLinkSecrets::from_link_secrets(a).unwrap(),
+        GebLinkSecrets::from_link_secrets(b).unwrap(),
+    );
     assert_ne!(a.device_did, b.device_did);
     assert_eq!(
         vta.exported.lock().unwrap().len(),

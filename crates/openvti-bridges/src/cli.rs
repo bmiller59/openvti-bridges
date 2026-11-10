@@ -17,7 +17,9 @@
 //!    never an admin. Revoking the bridge is removing that ACL entry.
 
 use crate::config::{Config, Directions, GebConfig, LinkConfig, SecretsConfig, Tier, VtaConfig};
-use crate::custody::{BridgeSecrets, ClientCredential, SecretStore, mint_device_identity};
+use crate::custody::{SecretStore, VtaKeyMinter};
+use crate::geb::custody::{GebLinkSecrets, mint_device_identity};
+use crate::secrets::{BridgeSecrets, ClientCredential};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -154,9 +156,13 @@ pub async fn provision(
         if secrets.link(&l.id).is_some() {
             continue;
         }
-        match mint_device_identity(client, context, &l.id, &l.persona).await {
-            Ok(ls) => {
-                minted.push(format!("{}, {}", ls.ed_key_id, ls.x_key_id));
+        match mint_device_identity(&VtaKeyMinter(client), context, &l.id).await {
+            Ok(g) => {
+                minted.push(format!("{}, {}", g.ed_key_id, g.x_key_id));
+                let ls = match g.into_link_secrets(&l.persona) {
+                    Ok(ls) => ls,
+                    Err(e) => return Err(orphans(e, &minted)),
+                };
                 if let Err(e) = secrets.insert(&l.id, ls) {
                     return Err(orphans(e, &minted));
                 }
@@ -264,7 +270,8 @@ pub async fn setup_from_file(path: &Path) -> Result<()> {
     );
     for l in &inputs.links {
         if let Some(s) = secrets.link(&l.id) {
-            eprintln!("link {}: Geb device DID {}", l.id, s.device_did);
+            let g = GebLinkSecrets::from_link_secrets(s)?;
+            eprintln!("link {}: Geb device DID {}", l.id, g.device_did);
         }
     }
     eprintln!(
