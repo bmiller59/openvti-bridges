@@ -1449,7 +1449,7 @@ async fn without_local_knowledge_root_removes_and_policy_changes_merge_and_only_
     w.poll().await.unwrap(); // held
     w.at(t + 3000);
     let e = w.poll().await.unwrap_err();
-    assert!(matches!(e, Error::UndecidableCommit(_)), "{e}");
+    assert!(matches!(e, Error::AdapterHalt { .. }), "{e}");
     assert!(
         e.to_string().contains("epoch ") && e.to_string().contains("commit "),
         "{e}"
@@ -1460,7 +1460,7 @@ async fn without_local_knowledge_root_removes_and_policy_changes_merge_and_only_
         keys_before
     );
     // It keeps stopping: the commit is still held, never silently dropped.
-    assert!(matches!(w.poll().await, Err(Error::UndecidableCommit(_))));
+    assert!(matches!(w.poll().await, Err(Error::AdapterHalt { .. })));
     assert_eq!(w.client.held_commits(), 1);
 }
 
@@ -1510,7 +1510,7 @@ async fn adds_to_a_direct_room_are_undecidable_without_persona_cards() {
     let t = w.now();
     w.poll().await.unwrap();
     w.at(t + 3000);
-    assert!(matches!(w.poll().await, Err(Error::UndecidableCommit(_))));
+    assert!(matches!(w.poll().await, Err(Error::AdapterHalt { .. })));
     assert!(!w.client.members().contains(&newbie.did));
 }
 
@@ -2261,7 +2261,7 @@ async fn without_a_signed_leave_the_healers_remove_halts_or_is_refused_by_who_ho
     w.poll().await.unwrap();
     w.at(t + 3000);
     let e = w.poll().await.unwrap_err();
-    assert!(matches!(e, Error::UndecidableCommit(_)), "{e}");
+    assert!(matches!(e, Error::AdapterHalt { .. }), "{e}");
     let msg = e.to_string();
     assert!(
         msg.contains("persona") && msg.contains("signed leave") && msg.contains("deliberate"),
@@ -2343,7 +2343,7 @@ async fn a_forged_or_misdirected_leave_is_dropped() {
     let t = w.now();
     w.poll().await.unwrap();
     w.at(t + 3000);
-    assert!(matches!(w.poll().await, Err(Error::UndecidableCommit(_))));
+    assert!(matches!(w.poll().await, Err(Error::AdapterHalt { .. })));
 }
 
 /// The dyad `leave` frame is a real op: taken, verified like the room line,

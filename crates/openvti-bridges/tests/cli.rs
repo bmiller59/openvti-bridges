@@ -232,7 +232,7 @@ async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
         let s = FjallStore::open(&store_dir).unwrap();
         halt::write(
             &s,
-            &HaltReason::undecidable("epoch 4, commit ab12: blocked"),
+            &HaltReason::adapter("geb.undecidable-commit", "epoch 4, commit ab12: blocked"),
         )
         .await
         .unwrap();
@@ -240,7 +240,7 @@ async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
     let (ok, out, _) = run(&["status", "--link", "l1"]);
     assert!(ok);
     assert!(
-        out.contains("HALTED (undecidable commit: epoch 4, commit ab12"),
+        out.contains("HALTED (geb.undecidable-commit: epoch 4, commit ab12"),
         "{out}"
     );
     let (ok, out, err) = run(&["link", "clear-halt", "l1"]);

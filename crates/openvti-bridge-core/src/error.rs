@@ -27,18 +27,23 @@ pub enum Error {
     /// The VTI side refused the bridge: the user's VTA answered 403 or the room
     /// host answered `permissionDenied` / `actionNotHeld` / `notAMember`. The
     /// link stops like [`Error::Refused`], but the cause is the bridge's own
-    /// ACL grant or room membership, not Geb: the fix is on the VTA, and the
+    /// ACL grant or room membership, not the foreign room: the fix is on the VTA, and the
     /// halt is cleared with `--yes` alone.
     #[error("vtc refused: {0}")]
     VtcRefused(String),
-    /// A Geb commit that can be neither merged nor skipped without a persona
-    /// card this bridge cannot hold (a deliberate bridge-side halt; Geb
-    /// itself refuses such a commit and goes on). The link
-    /// halts (persisted) and stays halted until an operator clears it; the
-    /// text names the commit's epoch and hash. Not retried: re-reading the
-    /// same commit decides nothing new.
-    #[error("undecidable commit: {0}")]
-    UndecidableCommit(String),
+    /// An adapter's own reason to stop the link, which the core persists and
+    /// treats like any halt: the link halts (persisted), is never retried and
+    /// stays halted until an operator clears it. `code` is stable, lower-kebab
+    /// and `<kind>.<reason>` (for example `geb.undecidable-commit`), declared
+    /// and documented by the adapter, never reused; `detail` is for the
+    /// operator.
+    #[error("{code}: {detail}")]
+    AdapterHalt {
+        /// The adapter's stable halt code.
+        code: String,
+        /// What happened, for the operator.
+        detail: String,
+    },
     /// A typed failure from the VTC room side (the user's VTA or the room
     /// host), kept as data: `code` is what a caller matches on, never the
     /// message. A refusal that must stop the link is [`Error::Refused`]
@@ -59,6 +64,26 @@ pub enum Error {
     /// A store operation failed.
     #[error("store: {0}")]
     Store(String),
+}
+
+impl Error {
+    /// An adapter halt with the adapter's `code`.
+    pub fn adapter_halt(code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::AdapterHalt {
+            code: code.into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// Whether this failure stops the link for good (a persisted halt) rather
+    /// than ending one tick: a foreign refusal, a VTI-side refusal or an
+    /// adapter halt.
+    pub fn is_halting(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused(_) | Self::VtcRefused(_) | Self::AdapterHalt { .. }
+        )
+    }
 }
 
 /// Crate result alias.

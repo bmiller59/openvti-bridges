@@ -31,6 +31,26 @@ pub const PATH_B_VERSION: &str = "0.1";
 /// 0.5.15 rules this crate builds to, at `fdf804d`.
 pub const PATH_B_PINNED_COMMIT: &str = "fdf804d";
 
+/// The halt code of a Geb commit that can be neither merged nor skipped without
+/// a persona card this bridge cannot hold. A deliberate bridge-side halt: Geb
+/// itself refuses such a commit and goes on, but a Geb device holding a persona
+/// card that links the two DIDs would merge it. The link halts (persisted) and
+/// stays halted until an operator clears it; clearing makes it read the commit
+/// again, and it halts again at once if the commit is still undecidable. The
+/// detail names the commit's epoch and hash. Stable, never reused.
+pub const HALT_UNDECIDABLE_COMMIT: &str = "geb.undecidable-commit";
+
+/// Every halt code this adapter raises, with the operator's words for it.
+pub const HALT_CODES: &[(&str, &str)] = &[(
+    HALT_UNDECIDABLE_COMMIT,
+    "a commit cannot be merged or skipped without a persona card this bridge cannot hold",
+)];
+
+/// An [`Error::AdapterHalt`] for an undecidable commit.
+pub fn undecidable_commit(detail: impl Into<String>) -> Error {
+    Error::adapter_halt(HALT_UNDECIDABLE_COMMIT, detail)
+}
+
 /// One line for status output and logs.
 pub fn status_line() -> String {
     format!("geb path B {PATH_B_VERSION} (pinned to commit {PATH_B_PINNED_COMMIT})")

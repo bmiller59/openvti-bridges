@@ -229,18 +229,16 @@ pub async fn clear_halt(
             println!("{id}: HALTED ({r})");
             if matches!(r, crate::halt::HaltReason::VtcRefused { .. }) {
                 println!(
-                    "  The VTA or the room host refused the bridge; Geb did not. Fix the bridge's \
+                    "  The VTA or the room host refused the bridge; the foreign room did not. Fix the bridge's \
                      ACL grant or room membership at the VTA (the grant `link add` printed), then \
                      clear with --yes. --i-have-been-readmitted is not needed."
                 );
             }
-            if matches!(r, crate::halt::HaltReason::UndecidableCommit { .. }) {
+            if let crate::halt::HaltReason::Adapter { code, .. } = &r {
                 println!(
-                    "  This is a Remove of another DID that the bridge cannot decide: it holds no \
-                     persona cards and no signed leave covers it. Geb itself would refuse it \
-                     and carry on; the bridge halts instead of risking a silent fork (a \
-                     deliberate choice). Clearing makes the link read it again; it halts again \
-                     at once if nothing has changed."
+                    "  The adapter stopped this link ({code}); its design note says what the code \
+                     means. Clearing makes the link read what caused it again; it halts again at \
+                     once if nothing has changed."
                 );
             }
         }

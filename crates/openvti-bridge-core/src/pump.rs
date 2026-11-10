@@ -163,10 +163,7 @@ pub struct Pump {
 
 /// A failure that stops the link (see [`HaltReason`]) rather than one tick.
 fn is_halting(e: &Error) -> bool {
-    matches!(
-        e,
-        Error::Refused(_) | Error::VtcRefused(_) | Error::UndecidableCommit(_)
-    )
+    e.is_halting()
 }
 
 /// A failure no later try can pass: the room refused the write for good (a
@@ -242,28 +239,14 @@ impl Pump {
     /// answers every later tick from the record without raising this again).
     /// No retry; a restart stays stopped.
     async fn halt(&self, reason: HaltReason) -> Error {
-        match &reason {
-            HaltReason::Refused { detail } => tracing::error!(
-                link = %self.link.id,
-                reason = %detail,
-                security_alert = true,
-                "the Geb room refused or removed the bridge; link stopped, not retrying"
-            ),
-            HaltReason::VtcRefused { detail } => tracing::error!(
-                link = %self.link.id,
-                reason = %detail,
-                security_alert = true,
-                "the VTA or room host refused the bridge (not Geb); link stopped, not \
-                 retrying: fix the bridge's ACL grant, then `link clear-halt --yes`"
-            ),
-            HaltReason::UndecidableCommit { detail } => tracing::error!(
-                link = %self.link.id,
-                reason = %detail,
-                security_alert = true,
-                "a Geb commit cannot be decided with the knowledge this bridge has; link \
-                 stopped, not retrying (see `link clear-halt`)"
-            ),
-        }
+        tracing::error!(
+            link = %self.link.id,
+            reason = %reason,
+            code = reason.code().unwrap_or(""),
+            security_alert = true,
+            "{}",
+            reason.operator_hint()
+        );
         match crate::halt::write(self.store.as_ref(), &reason).await {
             Ok(()) => reason.raised_error(),
             Err(e) => e,
@@ -274,8 +257,8 @@ impl Pump {
         match r {
             Err(Error::Refused(why)) => Err(self.halt(HaltReason::refused(why)).await),
             Err(Error::VtcRefused(why)) => Err(self.halt(HaltReason::vtc_refused(why)).await),
-            Err(Error::UndecidableCommit(why)) => {
-                Err(self.halt(HaltReason::undecidable(why)).await)
+            Err(Error::AdapterHalt { code, detail }) => {
+                Err(self.halt(HaltReason::adapter(code, detail)).await)
             }
             other => other,
         }
@@ -1156,8 +1139,9 @@ mod tests {
         }
         async fn poll(&self, _: Option<&Cursor>) -> Result<Vec<crate::foreign::Polled>> {
             self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(Error::UndecidableCommit(
-                "epoch 7, commit ab12: blocked".into(),
+            Err(Error::adapter_halt(
+                "loopback.blocked",
+                "epoch 7, commit ab12: blocked",
             ))
         }
         async fn post(&self, e: &BridgeEvent) -> Result<crate::foreign::Posted> {
@@ -1179,28 +1163,30 @@ mod tests {
         let pump = Pump::new(link(), room.clone(), fr.clone(), store.clone());
         pump.start().await.unwrap();
         let e = pump.tick().await.unwrap_err();
-        assert!(matches!(e, Error::UndecidableCommit(_)), "{e:?}");
+        assert!(matches!(e, Error::AdapterHalt { .. }), "{e:?}");
         assert_eq!(
             pump.halted().await.unwrap(),
-            Some(HaltReason::undecidable("epoch 7, commit ab12: blocked"))
+            Some(HaltReason::adapter(
+                "loopback.blocked",
+                "epoch 7, commit ab12: blocked"
+            ))
         );
         // Every later tick answers from the record: the room is not polled
         // again (so nothing re-evaluates or re-alerts).
         for _ in 0..3 {
             let e = pump.tick().await.unwrap_err();
-            assert!(matches!(e, Error::UndecidableCommit(ref w) if w.contains("link stopped")));
+            assert!(
+                matches!(e, Error::AdapterHalt { ref detail, .. } if detail.contains("link stopped"))
+            );
         }
         assert_eq!(fr.1.load(std::sync::atomic::Ordering::SeqCst), 1);
         // A new process over the same store stays halted, from start on.
         let again = Pump::new(link(), room, fr.clone(), store.clone());
         assert!(matches!(
             again.start().await,
-            Err(Error::UndecidableCommit(_))
+            Err(Error::AdapterHalt { .. })
         ));
-        assert!(matches!(
-            again.tick().await,
-            Err(Error::UndecidableCommit(_))
-        ));
+        assert!(matches!(again.tick().await, Err(Error::AdapterHalt { .. })));
         assert_eq!(fr.1.load(std::sync::atomic::Ordering::SeqCst), 1);
         // Clearing lets it run (and poll) again.
         crate::halt::clear(
@@ -1213,10 +1199,7 @@ mod tests {
         .await
         .unwrap();
         assert!(again.halted().await.unwrap().is_none());
-        assert!(matches!(
-            again.tick().await,
-            Err(Error::UndecidableCommit(_))
-        ));
+        assert!(matches!(again.tick().await, Err(Error::AdapterHalt { .. })));
         assert_eq!(fr.1.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
@@ -1622,7 +1605,7 @@ mod tests {
             text.contains("VTA or room host") && !text.contains("foreign room"),
             "{text}"
         );
-        // Clearing needs --yes only: Geb has not removed us, so there is no
+        // Clearing needs --yes only: the foreign room has not removed us, so there is no
         // re-admission to attest to; the fix is the ACL grant.
         let e = clear(store.as_ref(), ClearConfirmation::default())
             .await
@@ -1642,10 +1625,10 @@ mod tests {
         ));
     }
 
-    /// The other side of P1-6: a Geb-side removal keeps its own reason and the
+    /// The other side of P1-6: a removal by the foreign room keeps its own reason and the
     /// re-admission flag.
     #[tokio::test]
-    async fn a_geb_side_refusal_keeps_the_readmit_requirement() {
+    async fn a_foreign_side_refusal_keeps_the_readmit_requirement() {
         use crate::halt::{ClearConfirmation, clear};
         let (room, lb, store) = parts();
         let pump = Pump::new(link(), room.clone(), lb.clone(), store.clone());
@@ -1655,7 +1638,7 @@ mod tests {
         assert!(pump.tick().await.is_err());
         let text = pump.halted().await.unwrap().unwrap().to_string();
         assert!(
-            text.contains("Geb") && text.contains("leaf removed"),
+            text.contains("foreign room") && text.contains("leaf removed"),
             "{text}"
         );
         let yes = ClearConfirmation {

@@ -11,9 +11,10 @@
 //!   session that just ended was healthy for at least `min_healthy` *and* made
 //!   a successful tick; a session that dies at once keeps the backoff growing,
 //!   so a flapping relay is not hammered.
-//! - **Halted.** `Error::Refused` (Geb refused seating or removed the leaf),
-//!   `Error::VtcRefused` (the VTA's 403 or the host's `permissionDenied` on the room
-//!   side) and `Error::UndecidableCommit` end supervision for good with
+//! - **Halted.** `Error::Refused` (the foreign room refused seating or removed
+//!   the bridge), `Error::VtcRefused` (the VTA's 403 or the host's
+//!   `permissionDenied` on the room side) and `Error::AdapterHalt` (an adapter's
+//!   own coded halt) end supervision for good with
 //!   [`End::Halted`]. The pump persists the halt, so a restart of the process
 //!   ends here too, on the first tick, without touching the foreign room.
 //! - **Paused.** The kill switch ([`crate::pause`]): while [`LinkTick::paused`]
@@ -223,7 +224,7 @@ async fn supervise_inner(
         let began = Instant::now();
         let mut ticked_ok = false;
         let failure = match link.start().await {
-            Err(e @ (Error::Refused(_) | Error::VtcRefused(_) | Error::UndecidableCommit(_))) => {
+            Err(e) if e.is_halting() => {
                 return halt(&e);
             }
             Err(e) => Some(e),
@@ -238,10 +239,7 @@ async fn supervise_inner(
                         ticked_ok = true;
                         health.ok();
                     }
-                    Err(
-                        e
-                        @ (Error::Refused(_) | Error::VtcRefused(_) | Error::UndecidableCommit(_)),
-                    ) => {
+                    Err(e) if e.is_halting() => {
                         return halt(&e);
                     }
                     Err(e) => break Some(e),
@@ -355,11 +353,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_undecidable_commit_halts_and_is_not_retried() {
+    async fn an_adapter_halt_halts_and_is_not_retried() {
         let (_tx, rx) = watch::channel(false);
         let s = Arc::new(Script::new(
             vec![],
-            vec![Err(Error::UndecidableCommit("epoch 3, commit ab".into()))],
+            vec![Err(Error::adapter_halt(
+                "loopback.blocked",
+                "epoch 3, commit ab",
+            ))],
         ));
         let end = supervise("l1", s.clone(), fast(), rx, Arc::new(Health::default())).await;
         assert!(

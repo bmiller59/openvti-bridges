@@ -1366,7 +1366,7 @@ impl GebGroup for MlsGroupClient {
                     // Merging could fork the epoch, and so could skipping.
                     // Not logged here: the pump persists the halt and raises
                     // the one alert (logging per tick is what this avoids).
-                    return Err(Error::UndecidableCommit(format!(
+                    return Err(crate::undecidable_commit(format!(
                         "epoch {epoch}, commit {}: {reason}. This bridge holds no persona \
                          store (persona cards are not built) and no signed leave covers the \
                          removed leaves. Geb itself would refuse such a commit and carry on, \

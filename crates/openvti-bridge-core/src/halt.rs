@@ -1,22 +1,21 @@
 //! Why a link is halted, and how an operator clears it.
 //!
 //! A halt is persisted (the `halt` cursor of the link's store) so a restart
-//! stays halted without touching the foreign room. There are two kinds, and
+//! stays halted without touching the foreign room. There are three kinds, and
 //! they are told apart because clearing them means different things:
 //!
 //! - [`HaltReason::Refused`]: the foreign room refused seating, or a merged
 //!   commit removed our leaf. This is permanent: until an operator has seen to
 //!   it that the bridge was admitted to the room again, retrying only repeats
 //!   the refusal.
-//! - [`HaltReason::UndecidableCommit`]: a Remove of another DID by a non-root,
-//!   non-admin sender in a v2 room, with no signed leave we hold and not a
-//!   re-seat. A Geb device holding a persona card that links the two DIDs would
-//!   merge it, and this bridge holds no persona store, so it can be neither
-//!   merged nor skipped without risking a silent fork of the epoch. This halt
-//!   is a deliberate bridge-side choice: Geb itself refuses such a commit and
-//!   goes on, it never halts a room. The record keeps
-//!   the commit's epoch and hash. Clearing it makes the link read the commit
-//!   again: if it is still undecidable the link halts again at once.
+//! - [`HaltReason::VtcRefused`]: the VTI side refused the bridge; the fix is
+//!   its ACL grant or room membership.
+//! - [`HaltReason::Adapter`]: a halt the adapter chose, named by its stable
+//!   `<kind>.<reason>` code (for example `geb.undecidable-commit`, documented
+//!   in the adapter's own design note). The core persists and gates it like any
+//!   other and never interprets the code. Clearing needs `--yes` alone;
+//!   clearing makes the link read what caused it again, so a cause that is
+//!   still there halts it again at once.
 
 use crate::store::BridgeStore;
 use crate::{Error, Result};
@@ -35,16 +34,19 @@ pub enum HaltReason {
         detail: String,
     },
     /// The VTI side refused the bridge (the VTA's 403, the room host's
-    /// `permissionDenied`, `actionNotHeld`, `notAMember`). Not Geb's doing:
-    /// the bridge's ACL grant or room membership must be fixed at the VTA.
+    /// `permissionDenied`, `actionNotHeld`, `notAMember`). Not the foreign
+    /// room's doing: the bridge's ACL grant or room membership must be fixed at
+    /// the VTA.
     VtcRefused {
         /// What the VTA or the host said.
         detail: String,
     },
-    /// A commit that cannot be decided without local knowledge. `detail`
-    /// names its epoch and hash.
-    UndecidableCommit {
-        /// Epoch, commit hash and why it cannot be decided.
+    /// The adapter stopped the link. Serialised as
+    /// `{"kind":"adapter","code":..,"detail":..}`.
+    Adapter {
+        /// The adapter's stable `<kind>.<reason>` code.
+        code: String,
+        /// What the adapter said, for the operator.
         detail: String,
     },
 }
@@ -64,9 +66,10 @@ impl HaltReason {
         }
     }
 
-    /// An undecidable commit.
-    pub fn undecidable(detail: impl Into<String>) -> Self {
-        Self::UndecidableCommit {
+    /// An adapter's halt, with its stable code.
+    pub fn adapter(code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::Adapter {
+            code: code.into(),
             detail: detail.into(),
         }
     }
@@ -76,7 +79,33 @@ impl HaltReason {
         match self {
             Self::Refused { detail }
             | Self::VtcRefused { detail }
-            | Self::UndecidableCommit { detail } => detail,
+            | Self::Adapter { detail, .. } => detail,
+        }
+    }
+
+    /// The adapter's halt code, for an [`HaltReason::Adapter`] halt.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Adapter { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// One line on what the operator does about this halt, for the log and
+    /// `link clear-halt`. It names no foreign system: an adapter's own words
+    /// are in the halt's detail.
+    pub fn operator_hint(&self) -> &'static str {
+        match self {
+            Self::Refused { .. } => {
+                "the foreign room refused or removed the bridge; link stopped, not retrying"
+            }
+            Self::VtcRefused { .. } => {
+                "the VTA or room host refused the bridge (not the foreign room); link stopped, \
+                 not retrying: fix the bridge's ACL grant, then `link clear-halt --yes`"
+            }
+            Self::Adapter { .. } => {
+                "the adapter stopped the link and it is not retrying (see `link clear-halt`)"
+            }
         }
     }
 
@@ -99,8 +128,8 @@ impl HaltReason {
         match self {
             Self::Refused { detail } => Error::Refused(format!("link stopped: {detail}")),
             Self::VtcRefused { detail } => Error::VtcRefused(format!("link stopped: {detail}")),
-            Self::UndecidableCommit { detail } => {
-                Error::UndecidableCommit(format!("link stopped: {detail}"))
+            Self::Adapter { code, detail } => {
+                Error::adapter_halt(code.clone(), format!("link stopped: {detail}"))
             }
         }
     }
@@ -110,7 +139,7 @@ impl HaltReason {
         match self {
             Self::Refused { detail } => Error::Refused(detail.clone()),
             Self::VtcRefused { detail } => Error::VtcRefused(detail.clone()),
-            Self::UndecidableCommit { detail } => Error::UndecidableCommit(detail.clone()),
+            Self::Adapter { code, detail } => Error::adapter_halt(code.clone(), detail.clone()),
         }
     }
 }
@@ -119,12 +148,18 @@ impl std::fmt::Display for HaltReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused { detail } => {
-                write!(f, "the Geb room refused or removed the bridge: {detail}")
+                write!(
+                    f,
+                    "the foreign room refused or removed the bridge: {detail}"
+                )
             }
             Self::VtcRefused { detail } => {
-                write!(f, "refused by the VTA or room host (not Geb): {detail}")
+                write!(
+                    f,
+                    "refused by the VTA or room host (not the other side): {detail}"
+                )
             }
-            Self::UndecidableCommit { detail } => write!(f, "undecidable commit: {detail}"),
+            Self::Adapter { code, detail } => write!(f, "{code}: {detail}"),
         }
     }
 }
@@ -150,8 +185,8 @@ pub struct ClearConfirmation {
     /// `--yes`: the operator has read what the halt was.
     pub yes: bool,
     /// `--i-have-been-readmitted`: needed in addition for a
-    /// [`HaltReason::Refused`] halt (a Geb-side one; a
-    /// [`HaltReason::VtcRefused`] halt needs `--yes` only). The bridge was refused or removed; the
+    /// [`HaltReason::Refused`] halt (a foreign-side one; a
+    /// [`HaltReason::VtcRefused`] or [`HaltReason::Adapter`] halt needs `--yes` only). The bridge was refused or removed; the
     /// operator states it has been admitted to the room again (re-seated by
     /// the room's members), because clearing without that only repeats it.
     pub readmitted: bool,
@@ -176,7 +211,7 @@ pub async fn clear(store: &dyn BridgeStore, confirm: ClearConfirmation) -> Resul
     };
     if !confirm.yes {
         let how = if matches!(reason, HaltReason::VtcRefused { .. }) {
-            ". Geb did not remove the bridge: fix the bridge's ACL grant or room membership at \
+            ". The foreign room did not remove the bridge: fix the bridge's ACL grant or room membership at \
              the VTA (the grant `link add` printed), then re-run with --yes to clear it"
         } else {
             ". Re-run with --yes to clear it"
@@ -210,7 +245,7 @@ mod tests {
     fn a_halt_round_trips_and_an_old_bare_reason_is_a_refusal() {
         for r in [
             HaltReason::refused("leaf removed"),
-            HaltReason::undecidable("epoch 4, commit ab12: needs persona"),
+            HaltReason::adapter("test.blocked", "epoch 4, commit ab12: needs persona"),
         ] {
             assert_eq!(HaltReason::decode(&r.encode().unwrap()), r);
         }
@@ -221,14 +256,28 @@ mod tests {
     }
 
     #[test]
-    fn the_two_kinds_stop_with_distinct_errors() {
+    fn an_adapter_halt_is_persisted_with_its_stable_code() {
+        let r = HaltReason::adapter("loopback.blocked", "epoch 1");
+        let v: serde_json::Value = serde_json::from_slice(&r.encode().unwrap()).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"kind":"adapter","code":"loopback.blocked","detail":"epoch 1"})
+        );
+        assert_eq!(r.code(), Some("loopback.blocked"));
+        assert_eq!(HaltReason::refused("x").code(), None);
+        assert_eq!(r.to_string(), "loopback.blocked: epoch 1");
+        assert!(!r.operator_hint().contains("Geb"));
+    }
+
+    #[test]
+    fn the_kinds_stop_with_distinct_errors() {
         assert!(matches!(
             HaltReason::refused("x").stopped_error(),
             Error::Refused(_)
         ));
         assert!(matches!(
-            HaltReason::undecidable("x").stopped_error(),
-            Error::UndecidableCommit(_)
+            HaltReason::adapter("test.blocked", "x").stopped_error(),
+            Error::AdapterHalt { ref code, .. } if code == "test.blocked"
         ));
     }
 
@@ -240,9 +289,12 @@ mod tests {
             Cleared::NotHalted,
             "nothing to clear"
         );
-        write(&s, &HaltReason::undecidable("epoch 9, commit ff: blocked"))
-            .await
-            .unwrap();
+        write(
+            &s,
+            &HaltReason::adapter("test.blocked", "epoch 9, commit ff: blocked"),
+        )
+        .await
+        .unwrap();
         let e = clear(&s, ClearConfirmation::default()).await.unwrap_err();
         assert!(
             e.to_string().contains("epoch 9, commit ff") && e.to_string().contains("--yes"),
@@ -255,7 +307,10 @@ mod tests {
         let c = clear(&s, yes()).await.unwrap();
         assert_eq!(
             c,
-            Cleared::Cleared(HaltReason::undecidable("epoch 9, commit ff: blocked"))
+            Cleared::Cleared(HaltReason::adapter(
+                "test.blocked",
+                "epoch 9, commit ff: blocked"
+            ))
         );
         assert_eq!(read(&s).await.unwrap(), None);
     }

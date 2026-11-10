@@ -639,7 +639,7 @@ async fn a_remove_us_commit_halts_the_link_and_stays_halted() {
 
 /// Production inputs (no persona cards, no signed leaves) cannot evaluate a
 /// commit that removes a different member from a sender who is neither root
-/// nor admin: merging or skipping could fork the epoch, so the link halts, persisted and distinct from a refusal (`UndecidableCommit`,
+/// nor admin: merging or skipping could fork the epoch, so the link halts, persisted and distinct from a refusal (`geb.undecidable-commit`,
 /// epoch and commit hash recorded), alerts once, and stays halted across a
 /// restart until an operator clears it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -696,14 +696,15 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
         env.tick();
     }
     let e: Result<TickReport> = p.parts.pump.tick().await;
-    assert!(matches!(e, Err(Error::UndecidableCommit(_))), "{e:?}");
+    assert!(matches!(e, Err(Error::AdapterHalt { .. })), "{e:?}");
     let st = ops::status(&*p.parts.store).await.unwrap();
-    let Some(HaltReason::UndecidableCommit { detail }) = st.halted else {
+    let Some(HaltReason::Adapter { code, detail }) = st.halted else {
         panic!(
             "expected a persisted undecidable-commit halt, got {:?}",
             st.halted
         )
     };
+    assert_eq!(code, "geb.undecidable-commit");
     assert!(
         detail.contains("epoch ") && detail.contains("commit "),
         "{detail}"
@@ -712,7 +713,7 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
     // Later ticks answer from the record (no re-evaluation, no new alert).
     let e = p.parts.pump.tick().await.unwrap_err();
     assert!(
-        matches!(e, Error::UndecidableCommit(ref w) if w.contains("link stopped")),
+        matches!(e, Error::AdapterHalt { ref detail, .. } if detail.contains("link stopped")),
         "{e}"
     );
 
@@ -753,7 +754,7 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
     .unwrap();
     assert!(matches!(
         cleared,
-        Cleared::Cleared(HaltReason::UndecidableCommit { .. })
+        Cleared::Cleared(HaltReason::Adapter { .. })
     ));
     assert!(ops::status(store).await.unwrap().halted.is_none());
     // Still undecidable once the commit is read again: halts again at once.
@@ -764,6 +765,6 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
         env.tick();
     }
     let e = p.parts.pump.tick().await;
-    assert!(matches!(e, Err(Error::UndecidableCommit(_))), "{e:?}");
+    assert!(matches!(e, Err(Error::AdapterHalt { .. })), "{e:?}");
     assert!(ops::status(store).await.unwrap().halted.is_some());
 }
