@@ -25,15 +25,56 @@ pub enum Verifiability {
     Transport,
 }
 
+/// What a room's message size limit counts. A foreign system counts in the
+/// unit its own platform does; the core measures and cuts text in that unit
+/// and never in one it picked for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SizeUnit {
+    /// UTF-16 code units (a JavaScript string's `length`): a character outside
+    /// the BMP counts 2, so this is neither bytes nor `char`s.
+    Utf16,
+    /// Unicode scalar values (Rust `char`s).
+    Chars,
+    /// UTF-8 bytes.
+    Bytes,
+}
+
+impl SizeUnit {
+    /// The unit's name as an operator reads it ("UTF-16 code units").
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Utf16 => "UTF-16 code units",
+            Self::Chars => "characters",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+/// A size limit: at most `max` of `unit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLimit {
+    /// What is counted.
+    pub unit: SizeUnit,
+    /// The largest count the room accepts.
+    pub max: usize,
+}
+
+impl SizeLimit {
+    /// A limit of `max` `unit`s.
+    pub const fn new(unit: SizeUnit, max: usize) -> Self {
+        Self { unit, max }
+    }
+}
+
 /// What the foreign room can do. Mapping chooses its behaviour from this, never
 /// from the adapter's identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoomCapabilities {
-    /// Largest message body the room accepts, in UTF-16 code units (a
-    /// JavaScript string's `length`: a character outside the BMP counts 2, so
-    /// this is neither bytes nor `char`s). [`crate::mapping::utf16_units`]
-    /// counts it.
-    pub max_message_units: usize,
+    /// Largest message body the room accepts, in the room's own unit
+    /// ([`crate::mapping::measure`] counts it, [`crate::mapping::truncate`]
+    /// cuts to it).
+    pub size_limit: SizeLimit,
     /// A post can be edited in place.
     pub supports_edit: bool,
     /// A post can be deleted.
@@ -51,13 +92,13 @@ pub enum JoinState {
     /// The bridge is a member and may read and post.
     Seated,
     /// Seating has been requested and is awaiting approval. Nothing is read or
-    /// posted; ask again later. (Rooms will later choose between not welcome,
+    /// posted; ask again later. (A room may later choose between not welcome,
     /// welcome automatically and ask; none of those settings exists yet.)
     Pending,
 }
 
 /// The outcome of a post: how far it got, and the foreign room's id for the
-/// line when it has one (a Geb room line's derived id), which the bridge keeps
+/// line when it has one (a derived line id, say), which the bridge keeps
 /// so a later retraction can answer it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Posted {

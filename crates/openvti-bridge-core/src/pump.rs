@@ -483,12 +483,16 @@ impl Pump {
             self.store.outbox_retire(key).await?;
             return Ok(Step::Failed);
         }
-        let limit = self.foreign.capabilities().max_message_units;
-        let units = crate::mapping::utf16_units(&ev.text);
-        if units > limit {
+        let limit = self.foreign.capabilities().size_limit;
+        let units = crate::mapping::measure(limit.unit, &ev.text);
+        if units > limit.max {
             self.fail_permanently(
                 key,
-                &format!("oversize: {units} UTF-16 code units, the room's limit is {limit}"),
+                &format!(
+                    "oversize: {units} {}, the room's limit is {}",
+                    limit.unit.name(),
+                    limit.max
+                ),
                 r,
             )
             .await?;
@@ -1448,7 +1452,7 @@ mod tests {
         }
         fn capabilities(&self) -> crate::foreign::RoomCapabilities {
             crate::foreign::RoomCapabilities {
-                max_message_units: self.1,
+                size_limit: crate::foreign::SizeLimit::new(crate::foreign::SizeUnit::Utf16, self.1),
                 ..self.0.capabilities()
             }
         }

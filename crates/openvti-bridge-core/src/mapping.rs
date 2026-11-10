@@ -2,7 +2,7 @@
 //! accepts. No I/O and no foreign-system types: behaviour that depends on the
 //! room comes from [`RoomCapabilities`] only.
 
-use crate::foreign::RoomCapabilities;
+use crate::foreign::{RoomCapabilities, SizeUnit};
 use crate::model::{AuthorCheck, BridgeEvent, EventKind, Origin};
 use crate::room::{PROVENANCE_OPEN, RecordWrite, RoomRecord};
 use crate::{Error, Result};
@@ -10,8 +10,11 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
 
-/// Largest foreign text kept when writing a record (bytes). Four times Geb's
-/// 20,000-character line limit, so no honest line is cut.
+/// Largest foreign text kept when writing a record to the VTC room (bytes): a
+/// bound the core puts on a record body, however the foreign room counts. It is
+/// above any message limit an adapter declares in characters or code units
+/// today, so an honest line is not cut. An adapter that needed more would add
+/// a capability for it; none does.
 pub const MAX_INBOUND_TEXT_BYTES: usize = 80_000;
 const TRUNCATION_MARK: &str = "\n[truncated]";
 const MAX_AUTHOR_CHARS: usize = 200;
@@ -92,15 +95,41 @@ pub fn utf16_units(s: &str) -> usize {
     s.chars().map(char::len_utf16).sum()
 }
 
-/// Cut `s` to at most `max` UTF-16 code units, on a char boundary (a surrogate
-/// pair is never split), marking the cut inside the limit. Returns `s`
-/// unchanged when it already fits. The result is never longer than `max` units:
-/// when `max` is shorter than the marker the text is cut without one.
+/// Length of `s` in `unit`s.
+pub fn measure(unit: SizeUnit, s: &str) -> usize {
+    match unit {
+        SizeUnit::Utf16 => utf16_units(s),
+        SizeUnit::Chars => s.chars().count(),
+        SizeUnit::Bytes => s.len(),
+    }
+}
+
+/// Cut `s` to at most `max` `unit`s, on a char boundary (a surrogate pair is
+/// never split), marking the cut inside the limit. Returns `s` unchanged when
+/// it already fits. The result is never longer than `max`: when `max` is
+/// shorter than the marker the text is cut without one.
+pub fn truncate(unit: SizeUnit, s: &str, max: usize) -> String {
+    match unit {
+        SizeUnit::Utf16 => truncate_utf16(s, max),
+        SizeUnit::Chars => truncate_weighted(s, max, |_| 1),
+        SizeUnit::Bytes => truncate_bytes(s, max),
+    }
+}
+
+/// Cut `s` to at most `max` UTF-16 code units (the [`SizeUnit::Utf16`] arm of
+/// [`truncate`]), on a char boundary, marking the cut inside the limit.
 pub fn truncate_utf16(s: &str, max: usize) -> String {
-    if utf16_units(s) <= max {
+    truncate_weighted(s, max, char::len_utf16)
+}
+
+/// The cut shared by the character-counting units: `weight(c)` is what `c`
+/// counts for.
+fn truncate_weighted(s: &str, max: usize, weight: fn(char) -> usize) -> String {
+    let total: usize = s.chars().map(weight).sum();
+    if total <= max {
         return s.to_string();
     }
-    let mark = utf16_units(TRUNCATION_MARK);
+    let mark: usize = TRUNCATION_MARK.chars().map(weight).sum();
     let (budget, with_mark) = if max >= mark {
         (max - mark, true)
     } else {
@@ -109,7 +138,7 @@ pub fn truncate_utf16(s: &str, max: usize) -> String {
     let mut units = 0;
     let mut end = 0;
     for (i, c) in s.char_indices() {
-        let n = c.len_utf16();
+        let n = weight(c);
         if units + n > budget {
             break;
         }
@@ -302,12 +331,13 @@ pub fn prepare_outbound(
     // The one unquoted line is the header; everything the VTC member wrote
     // (title, text, notices) is quoted line by line. The size limit applies to
     // the transformed text, quote prefixes included.
-    let text = truncate_utf16(
+    let text = truncate(
+        caps.size_limit.unit,
         &format!(
             "{author} wrote:\n{}",
             quote_lines(body.trim_end_matches('\n'))
         ),
-        caps.max_message_units,
+        caps.size_limit.max,
     );
     BridgeEvent {
         title: None,
@@ -412,12 +442,41 @@ impl DedupWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foreign::Verifiability;
+    use crate::foreign::{SizeLimit, SizeUnit, Verifiability};
     use crate::model::Provenance;
+
+    #[test]
+    fn every_unit_measures_and_cuts_within_its_limit_and_never_splits_a_char() {
+        let s = "a\u{e9}\u{65E5}\u{1F600}".repeat(50);
+        for unit in [SizeUnit::Utf16, SizeUnit::Chars, SizeUnit::Bytes] {
+            assert_eq!(
+                measure(unit, "a\u{e9}\u{65E5}\u{1F600}"),
+                match unit {
+                    SizeUnit::Utf16 => 5,
+                    SizeUnit::Chars => 4,
+                    _ => 10,
+                }
+            );
+            for max in [0usize, 5, 11, 12, 13, 40, 99] {
+                let out = truncate(unit, &s, max);
+                assert!(measure(unit, &out) <= max, "{unit:?} {max}: {out:?}");
+                if max >= 12 {
+                    assert!(out.ends_with("[truncated]"), "{unit:?} {max}");
+                }
+            }
+            // Fits: untouched, no marker.
+            assert_eq!(truncate(unit, "abc", 100), "abc");
+        }
+        // The units differ: the same text is cut at different places.
+        let cut_chars = truncate(SizeUnit::Chars, &s, 20);
+        let cut_bytes = truncate(SizeUnit::Bytes, &s, 20);
+        assert_eq!(measure(SizeUnit::Chars, &cut_chars), 20);
+        assert!(cut_bytes.len() <= 20 && cut_bytes != cut_chars);
+    }
 
     fn caps(edit: bool, del: bool, max: usize) -> RoomCapabilities {
         RoomCapabilities {
-            max_message_units: max,
+            size_limit: SizeLimit::new(SizeUnit::Utf16, max),
             supports_edit: edit,
             supports_delete: del,
             supports_replies: false,

@@ -22,7 +22,7 @@ use crate::{Error, Result};
 use async_trait::async_trait;
 use openvti_bridge_core::foreign::{
     Cursor, ForeignIdentity, ForeignRoom, JoinState, Polled, Posted, Receipt, RoomCapabilities,
-    Verifiability,
+    SizeLimit, SizeUnit, Verifiability,
 };
 use openvti_bridge_core::mapping::{DedupWindow, msg_hash};
 use openvti_bridge_core::model::{AuthorCheck, BridgeEvent, EventKind, Origin, Provenance};
@@ -340,7 +340,7 @@ impl ForeignRoom for GebRoom {
         // Geb counts a line's text in UTF-16 code units (JavaScript string
         // length) and every receiver drops a longer one (round 3 section 6):
         // refuse, never truncate. The mapping layer already cuts text to
-        // `capabilities().max_message_units`, counted in the same units.
+        // `capabilities().size_limit`, counted in the same units.
         let units = utf16_len(&event.text);
         if units > MAX_LINE_CHARS {
             return Err(Error::Foreign(format!(
@@ -452,7 +452,7 @@ impl GebRoom {
             // Geb caps a line at 20,000 UTF-16 code units, counted by the
             // mapping layer (which cuts at a char boundary, never over it).
             // `post` counts units too and refuses over the limit.
-            max_message_units: MAX_LINE_CHARS,
+            size_limit: SizeLimit::new(SizeUnit::Utf16, MAX_LINE_CHARS),
             supports_edit: false,
             supports_delete: false,
             // `re` is the derived id of the line answered (answer 10).
@@ -683,6 +683,11 @@ mod tests {
         let relay = Arc::new(FakeRelay::new());
         let (a, _, _) = room_for(&relay, 1, 1_700_000_000_000);
         let (b, _, _) = room_for(&relay, 2, 1_700_000_001_000);
+        // Geb's limit is declared to the core in UTF-16 code units.
+        assert_eq!(
+            a.capabilities().size_limit,
+            SizeLimit::new(SizeUnit::Utf16, 20_000)
+        );
         // 10,000 emoji are 20,000 units (and 40,000 bytes): at the limit.
         assert_eq!(utf16_len(&"\u{1F600}".repeat(10_000)), 20_000);
         a.post(&post_event(&"\u{1F600}".repeat(10_000)))

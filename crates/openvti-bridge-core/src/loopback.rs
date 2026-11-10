@@ -4,7 +4,7 @@
 
 use crate::foreign::{
     Cursor, ForeignIdentity, ForeignRoom, JoinState, Polled, Posted, Receipt, RoomCapabilities,
-    Verifiability,
+    SizeLimit, SizeUnit, Verifiability,
 };
 use crate::model::{AuthorCheck, BridgeEvent, EventKind, Origin, Provenance};
 use crate::{Error, Result};
@@ -169,7 +169,7 @@ impl ForeignRoom for Loopback {
     }
     fn capabilities(&self) -> RoomCapabilities {
         RoomCapabilities {
-            max_message_units: 1_000_000,
+            size_limit: SizeLimit::new(SizeUnit::Utf16, 1_000_000),
             supports_edit: true,
             supports_delete: true,
             supports_replies: true,
