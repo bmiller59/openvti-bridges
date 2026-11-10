@@ -1,19 +1,20 @@
-//! `run`, `geb connect`, `geb stock-kps` and `status` on real components
-//! (feature `cli`). Everything network-facing is built here from the config
-//! and the secret store; [`crate::wiring::assemble`] does the composing.
+//! `run`, `bridge <kind> <verb>`, `status` and `clear-halt` on real components.
+//! Everything network-facing is built here from the config and the secret
+//! store: the kind builds its foreign side ([`BridgeKind::build`]) and
+//! [`crate::wiring::assemble`] does the composing.
 
 use crate::cli::open;
-use crate::config::{Config, LinkConfig};
-use crate::custody::SecretStore;
-use crate::fjall_store::FjallStore;
-use crate::geb::nostr::{NostrConfig, NostrRelay};
-use crate::pause::{ConfigFilePause, PauseSource};
-use crate::run::{End, Health, LinkTick, Timing, supervise};
-use crate::secrets::BridgeSecrets;
-use crate::store::BridgeStore;
-use crate::vtc::host::HostDelivery;
-use crate::wiring::{LinkInputs, LinkParts, assemble, link_dir, system_clock};
+use crate::wiring::{LinkInputs, LinkParts, assemble, link_ctx, link_dir};
 use crate::{Error, Result};
+use openvti_bridge_core::adapter::{BridgeKind, LinkCtx};
+use openvti_bridge_core::config::{Config, LinkConfig};
+use openvti_bridge_core::pause::{ConfigFilePause, PauseSource};
+use openvti_bridge_core::run::{End, Health, LinkTick, Timing, supervise};
+use openvti_bridge_core::secrets::BridgeSecrets;
+use openvti_bridge_core::store::BridgeStore;
+use openvti_bridge_vtc::custody::SecretStore;
+use openvti_bridge_vtc::fjall_store::FjallStore;
+use openvti_bridge_vtc::host::HostDelivery;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,14 +25,23 @@ use vta_sdk::credentials::CredentialBundle;
 /// How long a stop waits for the links to wind down.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
-fn inputs_for(
+/// One link's parts, before the kind builds its side.
+struct Prepared {
+    kind: &'static dyn BridgeKind,
+    ctx: LinkCtx,
+    inputs: LinkInputs,
+    store: Arc<FjallStore>,
+}
+
+fn prepare(
     cfg: &Config,
     data_dir: &Path,
     secrets: &BridgeSecrets,
     link: &LinkConfig,
     vta: Arc<VtaClient>,
     pause: Option<Arc<dyn PauseSource>>,
-) -> Result<(LinkInputs, Arc<FjallStore>)> {
+) -> Result<Prepared> {
+    let kind = crate::registry::kind_of(&link.kind)?;
     let ls = secrets
         .link(&link.id)
         .ok_or_else(|| Error::Config(format!("link {}: no keys in the secret store", link.id)))?
@@ -44,25 +54,28 @@ fn inputs_for(
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::Store(format!("create {}: {e}", dir.display())))?;
     let store = Arc::new(FjallStore::open(&dir.join("store"))?);
-    let geb = crate::geb::GebConfig::from_table(cfg.bridges.get(crate::geb::adapter::KIND_NAME))?;
-    let relay = Arc::new(NostrRelay::new(NostrConfig::new(&geb.relay_url))?);
-    Ok((
-        LinkInputs {
-            link: link.clone(),
-            geb,
-            secrets: ls,
-            store_key: secrets.store_key()?,
-            dir,
-            store: store.clone(),
-            relay,
+    let global = cfg
+        .bridges
+        .get(link.kind.as_str())
+        .cloned()
+        .unwrap_or_default();
+    let ctx = link_ctx(link, global, ls, secrets.store_key()?, dir, store.clone())?;
+    Ok(Prepared {
+        kind,
+        ctx,
+        inputs: LinkInputs {
             vta,
             host: HostDelivery::new(host_url)?,
-            clock: system_clock(),
-            commit_inputs: None,
             pause,
         },
         store,
-    ))
+    })
+}
+
+/// Let the kind build its side and assemble the link.
+async fn build(p: Prepared) -> Result<(LinkParts, Arc<FjallStore>)> {
+    let built = p.kind.build(&p.ctx).await?;
+    Ok((assemble(p.inputs, &p.ctx, built)?, p.store))
 }
 
 async fn authenticated_client(cfg: &Config, secrets: &BridgeSecrets) -> Result<Arc<VtaClient>> {
@@ -101,7 +114,7 @@ fn link_of<'a>(cfg: &'a Config, id: &str) -> Result<&'a LinkConfig> {
 }
 
 /// The kill switch and the persisted halt, for the commands that post to Geb
-/// outside `run` (`geb connect`, `geb stock-kps`). The pause check is the one
+/// outside `run` (every `bridge <kind> <verb>`). The pause check is the one
 /// `run` uses ([`ConfigFilePause`]: an unreadable config counts as PAUSED), and
 /// it runs before anything else, so a paused link needs no keys and touches no
 /// network. The halt is read from the link's store when one exists.
@@ -117,11 +130,11 @@ async fn refuse_if_paused_or_halted(config_path: &Path, id: &str, what: &str) ->
     let dir = link_dir(&cfg.data_dir_from(config_path), id).join("store");
     if dir.exists() {
         let store = FjallStore::open(&dir)?;
-        if let Some(why) = crate::halt::read(&store as &dyn BridgeStore).await? {
+        if let Some(why) = openvti_bridge_core::halt::read(&store as &dyn BridgeStore).await? {
             return Err(Error::Config(format!(
-                "link {id} is halted ({why}), so `{what}` will not post to Geb. See `status`, \
+                "link {id} is halted ({why}), so `{what}` will not post to the foreign room. See `status`, \
                  fix the cause, then run `link clear-halt {id} --yes` (add \
-                 `--i-have-been-readmitted` only if Geb removed the bridge)"
+                 `--i-have-been-readmitted` only if the foreign room removed the bridge)"
             )));
         }
     }
@@ -137,35 +150,67 @@ async fn offline_parts(config_path: &Path, id: &str) -> Result<(LinkParts, Arc<F
     let vta = Arc::new(VtaClient::new(
         cfg.vta.url.as_deref().unwrap_or("https://vta.invalid"),
     ));
-    let (inputs, fjall) = inputs_for(&cfg, &data_dir, &secrets, link, vta, None)?;
-    Ok((assemble(inputs)?, fjall))
+    build(prepare(&cfg, &data_dir, &secrets, link, vta, None)?).await
 }
 
-/// `geb connect`: contacts the Geb relay only; refuses a paused or halted link.
-pub async fn geb_connect(config_path: &Path, id: &str, peer: &str) -> Result<()> {
-    refuse_if_paused_or_halted(config_path, id, "geb connect").await?;
-    let (parts, _keep) = offline_parts(config_path, id).await?;
+/// `bridge <kind> <verb> --link <id> [args]`: a verb of the link's kind. The
+/// kill switch and the persisted halt are applied here, before the kind is
+/// asked anything, so no adapter has to remember to.
+pub async fn bridge_verb(
+    config_path: &Path,
+    kind: &str,
+    verb: &str,
+    id: &str,
+    args: &[String],
+) -> Result<()> {
+    refuse_if_paused_or_halted(config_path, id, &format!("{kind} {verb}")).await?;
     let cfg = crate::registry::load_config(config_path)?;
-    let name = link_of(&cfg, id)?.display_name.clone();
-    let phase = crate::ops::connect(
-        &parts,
-        peer,
-        name.as_deref(),
-        Duration::from_secs(60),
-        Duration::from_secs(3),
-    )
-    .await?;
-    println!("{peer}: {phase:?}");
-    crate::cli::add_peer(config_path, id, peer)
+    let link = link_of(&cfg, id)?;
+    let k = crate::registry::kind_of(kind)?;
+    if link.kind != k.kind() {
+        return Err(Error::Config(format!(
+            "link {id} is a {} link, not {kind}; use `bridge {} <verb> --link {id}`",
+            link.kind, link.kind
+        )));
+    }
+    if !k.verbs().iter().any(|v| v.name == verb) {
+        let known: Vec<&str> = k.verbs().iter().map(|v| v.name).collect();
+        return Err(Error::Config(format!(
+            "{kind} has no verb {verb:?} (see `bridge list`; it has: {})",
+            if known.is_empty() {
+                "none".into()
+            } else {
+                known.join(", ")
+            }
+        )));
+    }
+    let (parts, _keep) = offline_parts(config_path, id).await?;
+    let out = parts.handle.verb(verb, args).await?;
+    for line in &out.lines {
+        println!("{line}");
+    }
+    for (key, value) in &out.remember {
+        crate::cli::remember(config_path, id, key, value)?;
+    }
+    Ok(())
 }
 
-/// `geb stock-kps`: contacts the Geb relay only; refuses a paused or halted link.
-pub async fn geb_stock_kps(config_path: &Path, id: &str) -> Result<()> {
-    refuse_if_paused_or_halted(config_path, id, "geb stock-kps").await?;
-    let (parts, _keep) = offline_parts(config_path, id).await?;
-    let state = crate::ops::stock_kps(&parts).await?;
-    println!("{id}: {state:?}");
-    Ok(())
+/// `bridge list`: the kinds this build has and their verbs.
+pub fn bridge_list() -> Vec<String> {
+    let mut out = Vec::new();
+    for k in crate::registry::kinds() {
+        out.push(format!("{}\t{}", k.kind(), k.describe()));
+        for v in k.verbs() {
+            out.push(format!(
+                "  bridge {} {} --link <id> {}\t{}",
+                k.kind(),
+                v.name,
+                v.args,
+                v.help
+            ));
+        }
+    }
+    out
 }
 
 /// `status`: reads local state only, including why a link is halted. Stop
@@ -174,10 +219,13 @@ pub async fn geb_stock_kps(config_path: &Path, id: &str) -> Result<()> {
 pub async fn status(config_path: &Path, only: Option<&str>) -> Result<()> {
     let cfg = crate::registry::load_config(config_path)?;
     let data_dir = cfg.data_dir_from(config_path);
-    println!("{}", crate::geb::status_line());
+    for k in crate::registry::kinds() {
+        println!("{}: {}", k.kind(), k.pinned_reading());
+    }
     for l in cfg.links.iter().filter(|l| only.is_none_or(|o| o == l.id)) {
         let store = FjallStore::open(&link_dir(&data_dir, &l.id).join("store"))?;
-        let s = crate::ops::status(&store as &dyn BridgeStore).await?;
+        let kind = crate::registry::kind_of(&l.kind)?;
+        let s = crate::ops::status(&store as &dyn BridgeStore, kind).await?;
         println!(
             "{}: {} browse_version={} foreign_cursor={} outbox_depth={} oversize_failed={} dead_lettered={} last_relayed={} {}",
             l.id,
@@ -187,7 +235,9 @@ pub async fn status(config_path: &Path, only: Option<&str>) -> Result<()> {
                 "PAUSED (`link pause`: nothing is posted or written; resume with `link resume`)"
             },
             s.browse_version,
-            s.foreign_cursor_secs.map_or("-".into(), |v| v.to_string()),
+            s.foreign_cursor
+                .as_deref()
+                .map_or("-".into(), |v| kind.describe_cursor(v)),
             s.outbox_depth,
             s.oversize_failed,
             s.dead_lettered,
@@ -198,8 +248,8 @@ pub async fn status(config_path: &Path, only: Option<&str>) -> Result<()> {
                 None => "ok".into(),
             },
         );
-        if let Some(f) = &s.fork {
-            println!("{}:   {}", l.id, f.describe());
+        for line in &s.adapter_lines {
+            println!("{}:   {line}", l.id);
         }
     }
     Ok(())
@@ -211,7 +261,7 @@ pub async fn status(config_path: &Path, only: Option<&str>) -> Result<()> {
 pub async fn clear_halt(
     config_path: &Path,
     id: &str,
-    confirm: crate::halt::ClearConfirmation,
+    confirm: openvti_bridge_core::halt::ClearConfirmation,
 ) -> Result<()> {
     let cfg = crate::registry::load_config(config_path)?;
     link_of(&cfg, id)?;
@@ -222,21 +272,21 @@ pub async fn clear_halt(
         return Ok(());
     }
     let store = FjallStore::open(&dir)?;
-    match crate::halt::read(&store as &dyn BridgeStore).await? {
+    match openvti_bridge_core::halt::read(&store as &dyn BridgeStore).await? {
         None => {
             println!("{id}: not halted");
             return Ok(());
         }
         Some(r) => {
             println!("{id}: HALTED ({r})");
-            if matches!(r, crate::halt::HaltReason::VtcRefused { .. }) {
+            if matches!(r, openvti_bridge_core::halt::HaltReason::VtcRefused { .. }) {
                 println!(
                     "  The VTA or the room host refused the bridge; the foreign room did not. Fix the bridge's \
                      ACL grant or room membership at the VTA (the grant `link add` printed), then \
                      clear with --yes. --i-have-been-readmitted is not needed."
                 );
             }
-            if let crate::halt::HaltReason::Adapter { code, .. } = &r {
+            if let openvti_bridge_core::halt::HaltReason::Adapter { code, .. } = &r {
                 println!(
                     "  The adapter stopped this link ({code}); its design note says what the code \
                      means. Clearing makes the link read what caused it again; it halts again at \
@@ -245,11 +295,11 @@ pub async fn clear_halt(
             }
         }
     }
-    match crate::halt::clear(&store as &dyn BridgeStore, confirm).await? {
-        crate::halt::Cleared::Cleared(_) => {
+    match openvti_bridge_core::halt::clear(&store as &dyn BridgeStore, confirm).await? {
+        openvti_bridge_core::halt::Cleared::Cleared(_) => {
             println!("{id}: halt cleared. Start `run` to resume the link.");
         }
-        crate::halt::Cleared::NotHalted => println!("{id}: not halted"),
+        openvti_bridge_core::halt::Cleared::NotHalted => println!("{id}: not halted"),
     }
     Ok(())
 }
@@ -257,7 +307,7 @@ pub async fn clear_halt(
 /// `run`: supervise every link until SIGINT or SIGTERM. A link that is paused
 /// (`enabled = false`) is supervised too, idle: it sends and writes nothing
 /// until `link resume`, which the running process notices on its own (the kill
-/// switch re-reads the config, see [`crate::pause`]). Supervising paused links
+/// switch re-reads the config, see [`openvti_bridge_core::pause`]). Supervising paused links
 /// is what lets `link resume` take effect without a restart. A paused link
 /// whose parts cannot be built (no keys yet) is skipped with a warning and
 /// needs a restart after it is fixed; an enabled one still fails the run.
@@ -276,8 +326,10 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for l in &cfg.links {
         let gate: Arc<dyn PauseSource> = Arc::new(ConfigFilePause::new(config_path, &l.id));
-        let built = inputs_for(&cfg, &data_dir, &secrets, l, vta.clone(), Some(gate))
-            .and_then(|(inputs, fjall)| Ok((assemble(inputs)?, fjall)));
+        let built = match prepare(&cfg, &data_dir, &secrets, l, vta.clone(), Some(gate)) {
+            Ok(p) => build(p).await,
+            Err(e) => Err(e),
+        };
         let (parts, fjall) = match built {
             Ok(p) => p,
             Err(e) if !l.enabled => {
@@ -299,7 +351,14 @@ pub async fn run(config_path: &Path) -> Result<()> {
             (id, end)
         });
     }
-    tracing::info!(links = tasks.len(), "{}", crate::geb::status_line());
+    for k in crate::registry::kinds() {
+        tracing::info!(
+            links = tasks.len(),
+            kind = k.kind(),
+            "{}",
+            k.pinned_reading()
+        );
+    }
     shutdown_signal().await;
     tracing::info!("stopping");
     let _ = stop.send(true);

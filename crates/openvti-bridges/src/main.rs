@@ -1,5 +1,5 @@
-//! `openvti-bridges`: the … room.
-//! Experimental. Built only with `--features cli`; see `openvti_bridges::cli`.
+//! `openvti-bridges`: the … foreign room.
+//! Experimental; see `openvti_bridges::cli`.
 
 use clap::{Args, Parser, Subcommand};
 use openvti_bridges::cli::{self, DEFAULT_CONTEXT, NewLink};
@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "openvti-bridges",
     version,
-    about = "Experimental bridge between a VTC data room and a Geb room"
+    about = "Experimental bridge between a VTC data room and a foreign room"
 )]
 struct Cli {
     /// The configuration file.
@@ -29,9 +29,10 @@ enum Command {
     /// Manage links.
     #[command(subcommand)]
     Link(LinkCmd),
-    /// Geb-side operations (contact the Geb relay only).
+    /// Bridge kinds and their verbs: `bridge list`, `bridge <kind> <verb>
+    /// --link <id> [args]` (a verb contacts the foreign system only).
     #[command(subcommand)]
-    Geb(GebCmd),
+    Bridge(BridgeCmd),
     /// Show cursors, outbox depth, last relayed and halted state (local, no
     /// network). Stop `run` first.
     Status {
@@ -121,18 +122,35 @@ enum LinkCmd {
 }
 
 #[derive(Subcommand)]
-enum GebCmd {
-    /// Open a dyad with a Geb member's device DID and add it to the link.
-    Connect {
-        #[arg(long)]
-        link: String,
-        did: String,
-    },
-    /// Stock KeyPackages with the link's peers (consent to be added).
-    StockKps {
-        #[arg(long)]
-        link: String,
-    },
+enum BridgeCmd {
+    /// List the bridge kinds built into this binary and their verbs.
+    List,
+    /// `<kind> <verb> --link <id> [args...]`: run a verb of a kind (see `bridge list`).
+    #[command(external_subcommand)]
+    Verb(Vec<String>),
+}
+
+/// `[kind, verb, ...rest]` with `--link <id>` somewhere in `rest`.
+fn parse_verb(argv: Vec<String>) -> Result<(String, String, String, Vec<String>)> {
+    let usage = || {
+        openvti_bridges::Error::Config(
+            "usage: bridge <kind> <verb> --link <id> [args...] (see `bridge list`)".into(),
+        )
+    };
+    let mut it = argv.into_iter();
+    let kind = it.next().ok_or_else(usage)?;
+    let verb = it.next().ok_or_else(usage)?;
+    let (mut link, mut args) = (None, Vec::new());
+    while let Some(a) = it.next() {
+        if a == "--link" {
+            link = Some(it.next().ok_or_else(usage)?);
+        } else if let Some(v) = a.strip_prefix("--link=") {
+            link = Some(v.to_string());
+        } else {
+            args.push(a);
+        }
+    }
+    Ok((kind, verb, link.ok_or_else(usage)?, args))
 }
 
 fn parse_setting(s: &str) -> std::result::Result<(String, String), String> {
@@ -211,15 +229,21 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 service::clear_halt(
                     &config,
                     &id,
-                    openvti_bridges::halt::ClearConfirmation { yes, readmitted },
+                    openvti_bridge_core::halt::ClearConfirmation { yes, readmitted },
                 )
                 .await
             }
         },
-        Command::Geb(GebCmd::Connect { link, did }) => {
-            service::geb_connect(&config, &link, &did).await
+        Command::Bridge(BridgeCmd::List) => {
+            for line in service::bridge_list() {
+                println!("{line}");
+            }
+            Ok(())
         }
-        Command::Geb(GebCmd::StockKps { link }) => service::geb_stock_kps(&config, &link).await,
+        Command::Bridge(BridgeCmd::Verb(argv)) => {
+            let (kind, verb, link, args) = parse_verb(argv)?;
+            service::bridge_verb(&config, &kind, &verb, &link, &args).await
+        }
         Command::Status { link } => service::status(&config, link.as_deref()).await,
         Command::Run => service::run(&config).await,
     }

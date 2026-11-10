@@ -32,6 +32,29 @@ pub struct LoopbackKind;
 /// The registered loopback kind.
 pub static KIND: LoopbackKind = LoopbackKind;
 
+/// The loopback kind's one verb handle: `echo` prints its arguments.
+struct LoopbackHandle;
+
+#[async_trait]
+impl crate::adapter::AdapterHandle for LoopbackHandle {
+    async fn verb(&self, name: &str, args: &[String]) -> Result<crate::adapter::VerbResult> {
+        match name {
+            "echo" => Ok(crate::adapter::VerbResult {
+                lines: vec![args.join(" ")],
+                remember: Vec::new(),
+            }),
+            other => Err(Error::Config(format!("no such verb {other:?}"))),
+        }
+    }
+}
+
+const LOOPBACK_VERBS: &[crate::adapter::VerbSpec] = &[crate::adapter::VerbSpec {
+    name: "echo",
+    help: "print the arguments (proves the verb gate)",
+    args: "[words...]",
+}];
+
+#[async_trait]
 impl crate::adapter::BridgeKind for LoopbackKind {
     fn kind(&self) -> &'static str {
         "loopback"
@@ -46,6 +69,21 @@ impl crate::adapter::BridgeKind for LoopbackKind {
             return Err(Error::Config(format!("unknown key {k:?} (allowed: room)")));
         }
         self.foreign_room_key(table).map(|_| ())
+    }
+
+    fn verbs(&self) -> &'static [crate::adapter::VerbSpec] {
+        LOOPBACK_VERBS
+    }
+
+    async fn build(&self, ctx: &crate::adapter::LinkCtx) -> Result<crate::adapter::BuiltLink> {
+        let table = ctx.link.adapter.get("loopback").ok_or_else(|| {
+            Error::Config(format!("link {}: no [links.loopback] table", ctx.link.id))
+        })?;
+        let room = self.foreign_room_key(table)?;
+        Ok(crate::adapter::BuiltLink {
+            foreign: std::sync::Arc::new(Loopback::new(&room)),
+            handle: std::sync::Arc::new(LoopbackHandle),
+        })
     }
 
     fn foreign_room_key(&self, table: &toml::Table) -> Result<String> {

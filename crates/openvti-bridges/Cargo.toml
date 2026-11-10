@@ -9,11 +9,16 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["geb"]
+# The bridge kinds this build registers (`registry::kinds`). `geb` brings the Geb adapter
+# with its live relay client and MLS; `loopback` registers the core's in-memory kind (a
+# development kind with an `echo` verb).
+geb = ["dep:openvti-bridge-geb"]
+loopback = []
 # Test support for the tests that need no room host: `HostDelivery::for_loopback_tests`
 # and `vta-sdk`'s loopback sink for `tests/custody.rs` and `tests/cli.rs`. The tests
 # that need a real `room-host` are the separate `harness/` package.
-harness = ["openvti-bridge-vtc/harness", "openvti-bridge-geb/harness", "vta-sdk/test-loopback"]
+harness = ["openvti-bridge-vtc/harness", "openvti-bridge-geb?/harness", "vta-sdk/test-loopback"]
 # The OS keyring as the secret store. The binary registers a platform store at startup
 # when built with this feature.
 keyring = ["openvti-bridge-vtc/keyring", "vti-secrets/keyring", "vta-sdk/keyring"]
@@ -25,8 +30,7 @@ path = "src/main.rs"
 [dependencies]
 openvti-bridge-core = { path = "../openvti-bridge-core" }
 openvti-bridge-vtc = { path = "../openvti-bridge-vtc" }
-# TEMPORARY: the shell still names Geb directly; it becomes an optional, registered kind.
-openvti-bridge-geb = { path = "../openvti-bridge-geb", features = ["live", "mls"] }
+openvti-bridge-geb = { path = "../openvti-bridge-geb", features = ["live", "mls"], optional = true }
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 vta-sdk = { version = "0.85", features = ["client", "provision-client", "crypto-provider"] }

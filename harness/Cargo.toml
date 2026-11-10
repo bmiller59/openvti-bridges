@@ -23,6 +23,9 @@ license = "Apache-2.0"
 
 [dependencies]
 openvti-bridges = { path = "../crates/openvti-bridges", features = ["harness"] }
+openvti-bridge-core = { path = "../crates/openvti-bridge-core" }
+openvti-bridge-vtc = { path = "../crates/openvti-bridge-vtc", features = ["harness"] }
+openvti-bridge-geb = { path = "../crates/openvti-bridge-geb", features = ["live", "mls", "harness"] }
 
 [dev-dependencies]
 # Pinned by rev; the VTI commit the crate was extracted at.

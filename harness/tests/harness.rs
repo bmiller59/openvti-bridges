@@ -22,18 +22,18 @@ use vta_sdk::client::VtaClient;
 use vta_sdk::client::loopback::LoopbackSink;
 use vta_sdk::error::VtaError;
 use vtc_client::VtcClient;
-use openvti_bridges::fjall_store::FjallStore;
-use openvti_bridges::foreign::{
+use openvti_bridge_vtc::fjall_store::FjallStore;
+use openvti_bridge_core::foreign::{
     Cursor, ForeignIdentity, ForeignRoom, JoinState, Polled, Posted, RoomCapabilities,
 };
-use openvti_bridges::loopback::Loopback;
-use openvti_bridges::model::BridgeEvent;
-use openvti_bridges::pump::Pump;
-use openvti_bridges::room::{PROVENANCE_OPEN, PutOutcome, RecordWrite, RoomRecord, RoomSide};
-use openvti_bridges::store::BridgeStore;
-use openvti_bridges::vtc::host::HostDelivery;
-use openvti_bridges::vtc::{VtcRoom, VtcRoomConfig};
-use openvti_bridges::{Error, Result};
+use openvti_bridge_core::loopback::Loopback;
+use openvti_bridge_core::model::BridgeEvent;
+use openvti_bridge_core::pump::Pump;
+use openvti_bridge_core::room::{PROVENANCE_OPEN, PutOutcome, RecordWrite, RoomRecord, RoomSide};
+use openvti_bridge_core::store::BridgeStore;
+use openvti_bridge_vtc::host::HostDelivery;
+use openvti_bridge_vtc::{VtcRoom, VtcRoomConfig};
+use openvti_bridge_core::{Error, Result};
 
 mod common;
 use common::world::*;
@@ -98,10 +98,10 @@ impl BridgeStore for CrashStore {
     async fn outbox_insert(&self, k: &str, e: &BridgeEvent) -> Result<bool> {
         self.1.run(self.0.outbox_insert(k, e)).await
     }
-    async fn outbox_mark(&self, k: &str, r: openvti_bridges::foreign::Receipt) -> Result<()> {
+    async fn outbox_mark(&self, k: &str, r: openvti_bridge_core::foreign::Receipt) -> Result<()> {
         self.1.run(self.0.outbox_mark(k, r)).await
     }
-    async fn outbox_receipt(&self, k: &str) -> Result<Option<openvti_bridges::foreign::Receipt>> {
+    async fn outbox_receipt(&self, k: &str) -> Result<Option<openvti_bridge_core::foreign::Receipt>> {
         self.1.run(self.0.outbox_receipt(k)).await
     }
     async fn outbox_unposted(&self) -> Result<Vec<(String, BridgeEvent)>> {
@@ -262,11 +262,11 @@ async fn an_edit_is_found_by_its_key_not_by_its_version() {
     let edit = &posted[2];
     assert!(edit.text.contains("revised"));
     assert!(
-        matches!(&edit.kind, openvti_bridges::model::EventKind::Supersede { replaces } if replaces == "note/1|1"),
+        matches!(&edit.kind, openvti_bridge_core::model::EventKind::Supersede { replaces } if replaces == "note/1|1"),
         "{:?}",
         edit.kind
     );
-    assert_eq!(posted[3].kind, openvti_bridges::model::EventKind::Post);
+    assert_eq!(posted[3].kind, openvti_bridge_core::model::EventKind::Post);
     assert!(posted[3].text.contains("brand new"));
 }
 
@@ -294,7 +294,7 @@ async fn a_room_retraction_reaches_the_foreign_side_once_and_only_if_bridged() {
     let posted = foreign.inner.posted();
     assert_eq!(posted.len(), 2, "{posted:?}");
     assert!(
-        matches!(&posted[1].kind, openvti_bridges::model::EventKind::Retract { target } if target == "note/1|1"),
+        matches!(&posted[1].kind, openvti_bridge_core::model::EventKind::Retract { target } if target == "note/1|1"),
         "{:?}",
         posted[1].kind
     );

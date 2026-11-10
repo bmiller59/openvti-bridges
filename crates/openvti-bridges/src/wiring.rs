@@ -1,33 +1,26 @@
-//! Assembling one running link from its parts (features `vtc` and `geb-mls`):
-//! the VTC room side over the user's VTA, the Geb side (relay, stateful dyad,
-//! MLS group, `GebRoom`) with its state sealed at rest, and the pump between.
+//! Assembling one running link from its parts: the VTC room side over the
+//! user's VTA, the foreign side a registered kind builds ([`BridgeKind::build`]),
+//! the state sealed at rest, and the pump between.
 //!
 //! The binary and the end-to-end tests build a link through the same
 //! [`assemble`], so the test stack is the production stack with a loopback
 //! relay and a fake VTA substituted at the edges.
 //!
-//! Layout under `<data_dir>/links/<link id>/`: `store/` (fjall), `mls-state.enc`
-//! (the OpenMLS key store snapshot) and `mls-sigkey.enc` (the MLS signature
-//! key). One link per directory keeps each link's cursors, halt record and
-//! ratchets apart, and its dyad state under its own device DID.
+//! Layout under `<data_dir>/links/<link id>/`: `store/` (fjall) and whatever
+//! files the kind keeps beside it (Geb: `mls-state.enc`, `mls-sigkey.enc`). One
+//! link per directory keeps each link's cursors, halt record and adapter state
+//! apart.
 
-use crate::atrest::{AtRestKey, EncryptedState, SealedFile};
-use crate::config::LinkConfig;
-use crate::geb::codec::GuideCodec;
-use crate::geb::custody::GebLinkSecrets;
-use crate::geb::dyad::StatefulDyad;
-use crate::geb::mls::{MlsConfig, MlsGroupClient};
-use crate::geb::policy::{CommitCheckInputs, NoLocalKnowledge};
-use crate::geb::room::{Clock, GebRoom};
-use crate::geb::traits::{GebRelay, GebSigner};
-use crate::geb::{GebConfig, GebLinkConfig};
-use crate::pause::PauseSource;
-use crate::pump::{LinkRuntime, Pump};
-use crate::secrets::LinkSecrets;
-use crate::store::BridgeStore;
-use crate::vtc::host::HostDelivery;
-use crate::vtc::{VtcRoom, VtcRoomConfig};
 use crate::{Error, Result};
+use openvti_bridge_core::adapter::{AdapterHandle, BuiltLink, LinkCtx};
+use openvti_bridge_core::atrest::{AtRestKey, EncryptedState};
+use openvti_bridge_core::config::LinkConfig;
+use openvti_bridge_core::pause::PauseSource;
+use openvti_bridge_core::pump::{LinkRuntime, Pump};
+use openvti_bridge_core::secrets::LinkSecrets;
+use openvti_bridge_core::store::BridgeStore;
+use openvti_bridge_vtc::host::HostDelivery;
+use openvti_bridge_vtc::{VtcRoom, VtcRoomConfig};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vta_sdk::client::VtaClient;
@@ -37,45 +30,41 @@ pub fn link_dir(data_dir: &Path, link_id: &str) -> PathBuf {
     data_dir.join("links").join(link_id)
 }
 
-/// The wall clock in milliseconds.
-pub fn system_clock() -> Clock {
-    Arc::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+/// The context a kind builds one link from: the persona check, and the state
+/// sealed at rest over the link's durable `store`.
+pub fn link_ctx(
+    link: &LinkConfig,
+    global: toml::Table,
+    secrets: LinkSecrets,
+    store_key: zeroize::Zeroizing<[u8; 32]>,
+    dir: PathBuf,
+    store: Arc<dyn BridgeStore>,
+) -> Result<LinkCtx> {
+    if link.persona != secrets.persona {
+        return Err(Error::Config(format!(
+            "link {}: the configured persona is not the one its keys were minted for",
+            link.id
+        )));
+    }
+    let state_key = AtRestKey::derive(&store_key, "state")?;
+    let store: Arc<dyn BridgeStore> = Arc::new(EncryptedState::new(store, state_key, &link.id));
+    Ok(LinkCtx {
+        link: link.clone(),
+        global,
+        secrets,
+        store_key,
+        dir,
+        store,
     })
 }
 
-/// Everything one link is built from.
+/// What the VTI side of a link is built from.
 pub struct LinkInputs {
-    /// The link's configuration.
-    pub link: LinkConfig,
-    /// The `[bridges.geb]` table.
-    pub geb: GebConfig,
-    /// The link's device keys and secrets.
-    pub secrets: LinkSecrets,
-    /// The secret-store key at-rest keys derive from.
-    pub store_key: zeroize::Zeroizing<[u8; 32]>,
-    /// The link's directory ([`link_dir`]).
-    pub dir: PathBuf,
-    /// The link's durable store, before encryption is layered on.
-    pub store: Arc<dyn BridgeStore>,
-    /// The Nostr relay (one per device identity).
-    pub relay: Arc<dyn GebRelay>,
     /// A client for the user's VTA, in the `openvti-bridges` context.
     pub vta: Arc<VtaClient>,
     /// Delivery to the room host.
     pub host: HostDelivery,
-    /// Milliseconds.
-    pub clock: Clock,
-    /// What the MLS group knows of persona cards. `None` is production:
-    /// [`NoLocalKnowledge`] (no persona store; the signed leaves the client
-    /// takes are added on top), which decides every commit except the
-    /// card-dependent Remove (see `geb::policy::valid_commit`) and halts on
-    /// that one. Tests inject a fake to reach the other paths.
-    pub commit_inputs: Option<Arc<dyn CommitCheckInputs>>,
-    /// The kill switch the pump obeys (`link pause`, see [`crate::pause`]).
+    /// The kill switch the pump obeys (`link pause`, see [`openvti_bridge_core::pause`]).
     /// `None` is a link that never pauses (tests with no config file).
     pub pause: Option<Arc<dyn PauseSource>>,
 }
@@ -84,113 +73,42 @@ pub struct LinkInputs {
 pub struct LinkParts {
     /// Both directions.
     pub pump: Arc<Pump>,
-    /// The Geb dyad (`geb connect`, handshake progress).
-    pub dyad: Arc<StatefulDyad>,
-    /// The Geb MLS group (`geb stock-kps`, seating).
-    pub group: Arc<MlsGroupClient>,
-    /// The Geb room as a `ForeignRoom` (the pump posts through it).
-    pub foreign: Arc<GebRoom>,
     /// The store the pump uses (state records encrypted).
     pub store: Arc<dyn BridgeStore>,
-    /// The Geb device DID.
-    pub device_did: String,
+    /// The kind's operator verbs for this link.
+    pub handle: Arc<dyn AdapterHandle>,
 }
 
-/// Build the link.
-pub fn assemble(i: LinkInputs) -> Result<LinkParts> {
-    if i.link.persona != i.secrets.persona {
-        return Err(Error::Config(format!(
-            "link {}: the configured persona is not the one its keys were minted for",
-            i.link.id
-        )));
-    }
-    if i.link.kind != crate::geb::adapter::KIND_NAME {
-        return Err(Error::Config(format!(
-            "link {}: kind {:?} is not built by this assembly",
-            i.link.id, i.link.kind
-        )));
-    }
-    let geb_link = GebLinkConfig::from_table(
-        i.link
-            .adapter
-            .get(crate::geb::adapter::KIND_NAME)
-            .ok_or_else(|| Error::Config(format!("link {}: no [links.geb] table", i.link.id)))?,
-    )?;
-    let state_key = AtRestKey::derive(&i.store_key, "state")?;
-    let mls_key = AtRestKey::derive(&i.store_key, "mls")?;
-    let store: Arc<dyn BridgeStore> =
-        Arc::new(EncryptedState::new(i.store.clone(), state_key, &i.link.id));
-    let geb_secrets = GebLinkSecrets::from_link_secrets(&i.secrets)?;
-    let identity = Arc::new(geb_secrets.identity()?);
-    let signer: Arc<dyn GebSigner> = identity.clone();
-    let dyad = Arc::new(StatefulDyad::new(
-        identity,
-        i.relay.clone(),
-        store.clone(),
-        i.clock.clone(),
-    ));
-    let sigkey = SealedFile::new(
-        i.dir.join("mls-sigkey.enc"),
-        mls_key.clone(),
-        &format!("mls/{}/sigkey", i.link.id),
-    );
-    let state = SealedFile::new(
-        i.dir.join("mls-state.enc"),
-        mls_key,
-        &format!("mls/{}/state", i.link.id),
-    );
-    let group = Arc::new(
-        MlsGroupClient::new(
-            MlsConfig::new(&geb_link.room_id, geb_link.peers.clone()),
-            signer.clone(),
-            dyad.clone(),
-            i.commit_inputs
-                .unwrap_or_else(|| Arc::new(NoLocalKnowledge)),
-            &sigkey,
-        )?
-        .with_state_store(Arc::new(state))?
-        .with_fork_marker(store.clone(), &i.link.id),
-    );
-    let geb_room = Arc::new(GebRoom::new(
-        geb_link.room_id.clone(),
-        i.relay,
-        group.clone(),
-        signer,
-        Arc::new(GuideCodec),
-        i.clock,
-    ));
+/// Build the link: the VTC room, the pump over it and the kind's foreign side.
+pub fn assemble(i: LinkInputs, ctx: &LinkCtx, built: BuiltLink) -> Result<LinkParts> {
+    let link = &ctx.link;
     let room = Arc::new(VtcRoom::new(
         i.vta,
         i.host,
         VtcRoomConfig {
-            room_id: i.link.vtc_room.clone(),
-            host_did: i.link.host_did.clone(),
-            persona: i.link.persona.clone(),
+            room_id: link.vtc_room.clone(),
+            host_did: link.host_did.clone(),
+            persona: link.persona.clone(),
         },
     ));
     let mut rt = LinkRuntime::new(
-        &i.link.id,
-        &i.link.persona,
-        i.secrets.link_secret()?.to_vec(),
-        i.link.directions,
+        &link.id,
+        &link.persona,
+        ctx.secrets.link_secret()?.to_vec(),
+        link.directions,
     );
-    rt.deny_authors = i.link.deny_authors.clone();
-    rt.display_name = i.link.display_name.clone();
-    rt.announce = i.link.announce;
-    rt.notices = i.link.notices.clone();
-    rt.retention_days = i.link.retention_days;
-    let device_did = geb_secrets.device_did.clone();
-    let mut pump = Pump::new(rt, room, geb_room.clone(), store.clone());
+    rt.deny_authors = link.deny_authors.clone();
+    rt.display_name = link.display_name.clone();
+    rt.announce = link.announce;
+    rt.notices = link.notices.clone();
+    rt.retention_days = link.retention_days;
+    let mut pump = Pump::new(rt, room, built.foreign, ctx.store.clone());
     if let Some(p) = i.pause {
         pump = pump.with_pause(p);
     }
-    let pump = Arc::new(pump);
     Ok(LinkParts {
-        pump,
-        dyad,
-        group,
-        foreign: geb_room,
-        store,
-        device_did,
+        pump: Arc::new(pump),
+        store: ctx.store.clone(),
+        handle: built.handle,
     })
 }

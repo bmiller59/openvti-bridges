@@ -1,13 +1,28 @@
 //! The bridge kinds this binary was built with.
 
 use crate::Result;
-use crate::adapter::Kinds;
-use crate::config::Config;
+use openvti_bridge_core::adapter::{BridgeKind, Kinds};
+use openvti_bridge_core::config::Config;
 
-/// Every kind compiled into this build.
+/// Every kind compiled into this build (cargo features `geb`, `loopback`).
 pub fn kinds() -> Kinds<'static> {
-    static KINDS: [&dyn crate::adapter::BridgeKind; 1] = [&crate::geb::KIND];
-    &KINDS
+    static KINDS: &[&dyn BridgeKind] = &[
+        #[cfg(feature = "geb")]
+        &openvti_bridge_geb::KIND,
+        #[cfg(feature = "loopback")]
+        &openvti_bridge_core::loopback::KIND,
+    ];
+    KINDS
+}
+
+/// The kind a link names, from this build's registry.
+pub fn kind_of(name: &str) -> Result<&'static dyn BridgeKind> {
+    openvti_bridge_core::adapter::find(kinds(), name).ok_or_else(|| {
+        openvti_bridge_core::Error::Config(format!(
+            "bridge kind {name:?} is not built into this binary (built: {})",
+            openvti_bridge_core::adapter::names(kinds())
+        ))
+    })
 }
 
 /// Read a config file and check it against the kinds of this build.

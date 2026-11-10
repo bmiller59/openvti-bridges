@@ -1,5 +1,5 @@
 //! The operator surface behind `src/main.rs` (feature `cli`): two-phase setup
-//! after `vti-witness`, link management, `geb connect` / `geb stock-kps`,
+//! after `vti-witness`, link management, `bridge <kind> <verb>`,
 //! `status` and `run`. Nothing here runs at config load; each command that
 //! touches a network says so in its help.
 //!
@@ -16,11 +16,10 @@
 //!    long-term client `did:key`, narrowed to `room-present,room-open` and
 //!    never an admin. Revoking the bridge is removing that ACL entry.
 
-use crate::config::{Config, Directions, LinkConfig, SecretsConfig, Tier, VtaConfig};
-use crate::custody::{SecretStore, VtaKeyMinter};
-use crate::geb::custody::{GebLinkSecrets, mint_device_identity};
-use crate::secrets::{BridgeSecrets, ClientCredential};
 use crate::{Error, Result};
+use openvti_bridge_core::config::{Config, Directions, LinkConfig, SecretsConfig, Tier, VtaConfig};
+use openvti_bridge_core::secrets::{BridgeSecrets, ClientCredential};
+use openvti_bridge_vtc::custody::{SecretStore, VtaKeyMinter};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use vta_sdk::client::VtaClient;
@@ -35,14 +34,14 @@ pub struct BridgeMessages;
 
 impl OperatorMessages for BridgeMessages {
     fn integration_label(&self) -> &str {
-        "Geb bridge"
+        "openvti bridge"
     }
     fn integration_label_lower(&self) -> &str {
-        "geb bridge"
+        "openvti bridge"
     }
     fn pnm_admin_command_hint(&self, context_id: &str, setup_did: &str) -> String {
         format!(
-            "pnm contexts create --id {context_id} --name \"Geb bridge\" \\\n  \
+            "pnm contexts create --id {context_id} --name \"openvti bridge\" \\\n  \
              --admin-did {setup_did} --admin-expires 1h\n\n    \
              (if the context already exists:\n     \
              pnm acl create --did {setup_did} --role admin --contexts {context_id} --expires 1h)"
@@ -59,7 +58,7 @@ impl OperatorMessages for BridgeMessages {
 pub fn client_grant_hint(context: &str, client_did: &str) -> String {
     format!(
         "pnm acl create --did {client_did} --role initiator --contexts {context} \\\n    \
-         --capabilities room-present,room-open --label \"geb bridge\""
+         --capabilities room-present,room-open --label \"openvti bridge\""
     )
 }
 
@@ -157,13 +156,13 @@ pub async fn provision(
         if secrets.link(&l.id).is_some() {
             continue;
         }
-        match mint_device_identity(&VtaKeyMinter(client), context, &l.id).await {
-            Ok(g) => {
-                minted.push(format!("{}, {}", g.ed_key_id, g.x_key_id));
-                let ls = match g.into_link_secrets(&l.persona) {
-                    Ok(ls) => ls,
-                    Err(e) => return Err(orphans(e, &minted)),
-                };
+        let kind = crate::registry::kind_of(&l.kind)?;
+        match kind
+            .mint_link_secrets(&VtaKeyMinter(client), context, l)
+            .await
+        {
+            Ok(ls) => {
+                minted.push(ls.adapter_ids().join(", "));
                 if let Err(e) = secrets.insert(&l.id, ls) {
                     return Err(orphans(e, &minted));
                 }
@@ -270,9 +269,10 @@ pub async fn setup_from_file(path: &Path) -> Result<()> {
         client_grant_hint(&inputs.context, &client_key.did)
     );
     for l in &inputs.links {
-        if let Some(s) = secrets.link(&l.id) {
-            let g = GebLinkSecrets::from_link_secrets(s)?;
-            eprintln!("link {}: Geb device DID {}", l.id, g.device_did);
+        if let Some(s) = secrets.link(&l.id)
+            && let Some(line) = crate::registry::kind_of(&l.kind)?.describe_secrets(s)
+        {
+            eprintln!("link {}: {line}", l.id);
         }
     }
     eprintln!(
@@ -377,7 +377,7 @@ where
         display_name: n.display_name,
         announce: false,
         notices: Default::default(),
-        retention_days: crate::pump::DEFAULT_RETENTION_DAYS,
+        retention_days: openvti_bridge_core::pump::DEFAULT_RETENTION_DAYS,
     };
     cfg.links.push(link.clone());
     cfg.validate()?;
@@ -409,7 +409,7 @@ pub fn link_list(cfg: &Config) -> Vec<String> {
                 l.id,
                 if l.enabled { "running" } else { "paused" },
                 l.vtc_room,
-                adapter_str(l, "room_id"),
+                foreign_room(l),
                 adapter_peers(l).len(),
                 l.kind
             )
@@ -417,13 +417,13 @@ pub fn link_list(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
-/// A string setting of the link's own kind table.
-fn adapter_str<'a>(l: &'a LinkConfig, key: &str) -> &'a str {
-    l.adapter
-        .get(&l.kind)
-        .and_then(|t| t.get(key))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+/// The foreign room a link bridges, as its kind names it.
+fn foreign_room(l: &LinkConfig) -> String {
+    crate::registry::kind_of(&l.kind)
+        .ok()
+        .zip(l.adapter.get(&l.kind))
+        .and_then(|(k, t)| k.foreign_room_key(t).ok())
+        .unwrap_or_default()
 }
 
 /// The `peers` list of the link's own kind table.
@@ -492,8 +492,10 @@ pub async fn link_remove(config_path: &Path, id: &str) -> Result<()> {
     })
 }
 
-/// Add a connected peer to a link's `[links.geb]` `peers`.
-pub fn add_peer(config_path: &Path, id: &str, peer: &str) -> Result<()> {
+/// Remember `value` in the list under `key` of a link's `[links.<kind>]`
+/// table, unless it is already there (what a verb asks for in
+/// [`VerbResult::remember`](openvti_bridge_core::adapter::VerbResult)).
+pub fn remember(config_path: &Path, id: &str, key: &str, value: &str) -> Result<()> {
     Config::modify(config_path, |cfg| {
         let l = cfg
             .links
@@ -501,13 +503,13 @@ pub fn add_peer(config_path: &Path, id: &str, peer: &str) -> Result<()> {
             .find(|l| l.id == id)
             .ok_or_else(|| Error::Config(format!("no link {id}")))?;
         let table = l.adapter.entry(l.kind.clone()).or_default();
-        let peers = table
-            .entry("peers")
+        let list = table
+            .entry(key)
             .or_insert_with(|| toml::Value::Array(Vec::new()));
-        if let toml::Value::Array(a) = peers
-            && !a.iter().any(|p| p.as_str() == Some(peer))
+        if let toml::Value::Array(a) = list
+            && !a.iter().any(|p| p.as_str() == Some(value))
         {
-            a.push(toml::Value::String(peer.into()));
+            a.push(toml::Value::String(value.into()));
         }
         Ok(())
     })

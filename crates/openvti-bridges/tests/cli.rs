@@ -1,16 +1,18 @@
 //! The operator surface: setup inputs, provisioning against a fake VTA that
 //! serves key create and export, link management on a config file, and the
 //! binary itself (offline commands only: no network is reached).
+
+#![cfg(feature = "geb")]
 #![cfg(feature = "harness")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 
 use common::key_vta::KeyVta;
+use openvti_bridge_core::config::Config;
+use openvti_bridge_core::secrets::BridgeSecrets;
+use openvti_bridge_geb::custody::GebLinkSecrets;
 use openvti_bridges::cli::{self, SetupInputs};
-use openvti_bridges::config::Config;
-use openvti_bridges::geb::custody::GebLinkSecrets;
-use openvti_bridges::secrets::BridgeSecrets;
 use std::process::Command;
 use std::sync::Arc;
 use vta_sdk::client::VtaClient;
@@ -141,8 +143,8 @@ async fn link_management_edits_the_config_and_the_grant_is_narrow() {
     );
     cli::link_set_enabled(&path, "l1", false).unwrap();
     assert!(cli::link_set_enabled(&path, "nope", true).is_err());
-    cli::add_peer(&path, "l1", "did:peer:2.peer").unwrap();
-    cli::add_peer(&path, "l1", "did:peer:2.peer").unwrap();
+    cli::remember(&path, "l1", "peers", "did:peer:2.peer").unwrap();
+    cli::remember(&path, "l1", "peers", "did:peer:2.peer").unwrap();
     assert_eq!(peers(&Config::load(&path).unwrap(), 0), 1);
     let grant = cli::client_grant_hint("openvti-bridges", "did:key:zClient");
     assert!(grant.contains("--capabilities room-present,room-open"));
@@ -220,8 +222,8 @@ fn the_binary_lists_and_reports_status_offline_and_refuses_a_bad_config() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
-    use openvti_bridges::fjall_store::FjallStore;
-    use openvti_bridges::halt::{self, HaltReason};
+    use openvti_bridge_core::halt::{self, HaltReason};
+    use openvti_bridge_vtc::fjall_store::FjallStore;
     use openvti_bridges::wiring::link_dir;
 
     let dir = tempfile::tempdir().unwrap();
@@ -279,7 +281,7 @@ async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
     // A fork split: the unsealed marker is shown by `status` (and a paused
     // link reads PAUSED). No keys are needed to read it.
     {
-        use openvti_bridges::geb::forkmark::{self, ForkMarker, ForkState};
+        use openvti_bridge_geb::forkmark::{self, ForkMarker, ForkState};
         let s = FjallStore::open(&store_dir).unwrap();
         forkmark::write(
             &s,
@@ -340,9 +342,9 @@ async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
 /// P1-1: `geb connect` and `geb stock-kps` post to Geb, so they obey the kill
 /// switch and the persisted halt exactly as `run` does.
 #[tokio::test(flavor = "multi_thread")]
-async fn geb_connect_and_stock_kps_refuse_a_paused_or_halted_link() {
-    use openvti_bridges::fjall_store::FjallStore;
-    use openvti_bridges::halt::{self, HaltReason};
+async fn bridge_geb_connect_and_stock_kps_refuse_a_paused_or_halted_link() {
+    use openvti_bridge_core::halt::{self, HaltReason};
+    use openvti_bridge_vtc::fjall_store::FjallStore;
     use openvti_bridges::wiring::link_dir;
 
     let dir = tempfile::tempdir().unwrap();
@@ -366,8 +368,15 @@ async fn geb_connect_and_stock_kps_refuse_a_paused_or_halted_link() {
         )
     };
     let cmds: [&[&str]; 2] = [
-        &["geb", "connect", "--link", "l1", "did:peer:2.peer"],
-        &["geb", "stock-kps", "--link", "l1"],
+        &[
+            "bridge",
+            "geb",
+            "connect",
+            "--link",
+            "l1",
+            "did:peer:2.peer",
+        ],
+        &["bridge", "geb", "stock-kps", "--link", "l1"],
     ];
     // Paused (the SETUP default is enabled = false).
     for args in cmds {
@@ -421,8 +430,10 @@ fn directions_is_required_on_link_add_and_in_the_config() {
             "https://h.example",
             "--persona",
             "did:key:z6Mkp9",
-            "--geb-room-id",
-            "g",
+            "--kind",
+            "geb",
+            "--set",
+            "room_id=g",
             "--tier-optin",
         ])
         .output()
@@ -534,7 +545,7 @@ fn concurrent_config_edits_are_not_lost() {
         .map(|i| {
             let p = path.clone();
             std::thread::spawn(move || {
-                cli::add_peer(&p, "l1", &format!("did:peer:2.peer{i}")).unwrap();
+                cli::remember(&p, "l1", "peers", &format!("did:peer:2.peer{i}")).unwrap();
                 cli::link_set_enabled(&p, "l2", i % 2 == 0).unwrap();
             })
         })

@@ -30,31 +30,33 @@ use common::key_vta::KeyVta;
 use common::world::*;
 use ed25519_dalek::SigningKey;
 use openmls::prelude::*;
-use openvti_bridges::config::{Directions, LinkConfig, SecretsConfig, Tier};
-use openvti_bridges::custody::{SecretStore, VtaKeyMinter};
-use openvti_bridges::fjall_store::FjallStore;
-use openvti_bridges::foreign::JoinState;
-use openvti_bridges::geb::codec::GuideCodec;
-use openvti_bridges::geb::crypto::{b64_decode, pair};
-use openvti_bridges::geb::custody::mint_device_identity;
-use openvti_bridges::geb::dyad::{GebIdentity, Phase, StatefulDyad};
-use openvti_bridges::geb::event::KIND_MAILBOX;
-use openvti_bridges::geb::mls::sim::{Sim, mc, ml, post, welcome_frame};
-use openvti_bridges::geb::nostr::{NostrConfig, NostrRelay};
-use openvti_bridges::geb::policy::CommitCheckInputs;
-use openvti_bridges::geb::test_relay::TestRelay;
-use openvti_bridges::geb::traits::{GebCodec, GebDyad, GebRelay, GebSigner};
-use openvti_bridges::geb::wire::{Envelope, Frame, GroupOp};
-use openvti_bridges::geb::{GebConfig, GebLinkConfig};
-use openvti_bridges::halt::{self, ClearConfirmation, Cleared, HaltReason};
+use openvti_bridge_core::config::{Directions, LinkConfig, SecretsConfig, Tier};
+use openvti_bridge_vtc::custody::{SecretStore, VtaKeyMinter};
+use openvti_bridge_vtc::fjall_store::FjallStore;
+use openvti_bridge_core::foreign::JoinState;
+use openvti_bridge_geb::codec::GuideCodec;
+use openvti_bridge_geb::crypto::{b64_decode, pair};
+use openvti_bridge_geb::custody::mint_device_identity;
+use openvti_bridge_geb::dyad::{GebIdentity, Phase, StatefulDyad};
+use openvti_bridge_geb::event::KIND_MAILBOX;
+use openvti_bridge_geb::mls::sim::{Sim, mc, ml, post, welcome_frame};
+use openvti_bridge_geb::nostr::{NostrConfig, NostrRelay};
+use openvti_bridge_geb::policy::CommitCheckInputs;
+use openvti_bridge_geb::test_relay::TestRelay;
+use openvti_bridge_geb::traits::{GebCodec, GebDyad, GebRelay, GebSigner};
+use openvti_bridge_geb::wire::{Envelope, Frame, GroupOp};
+use openvti_bridge_geb::adapter::{GebHandle, GebParts, build_with};
+use openvti_bridge_geb::{GebLinkConfig, KIND as GEB_KIND};
+use openvti_bridge_core::halt::{self, ClearConfirmation, Cleared, HaltReason};
 use openvti_bridges::ops;
-use openvti_bridges::pump::TickReport;
-use openvti_bridges::room::PROVENANCE_OPEN;
-use openvti_bridges::run::{End, Health, LinkTick, Timing, supervise};
-use openvti_bridges::secrets::{BridgeSecrets, LinkSecrets};
-use openvti_bridges::store::BridgeStore;
-use openvti_bridges::wiring::{LinkInputs, LinkParts, assemble};
-use openvti_bridges::{Error, Result};
+use openvti_bridge_core::adapter::BuiltLink;
+use openvti_bridge_core::pump::TickReport;
+use openvti_bridge_core::room::PROVENANCE_OPEN;
+use openvti_bridge_core::run::{End, Health, LinkTick, Timing, supervise};
+use openvti_bridge_core::secrets::{BridgeSecrets, LinkSecrets};
+use openvti_bridge_core::store::BridgeStore;
+use openvti_bridges::wiring::{LinkInputs, LinkParts, assemble, link_ctx};
+use openvti_bridge_core::{Error, Result};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,7 +98,7 @@ fn member(seed: u8, relay_url: &str, now: &Arc<AtomicU64>) -> Member {
     let dyad = StatefulDyad::new(
         id,
         relay.clone(),
-        Arc::new(openvti_bridges::store::MemoryStore::new()),
+        Arc::new(openvti_bridge_core::store::MemoryStore::new()),
         Arc::new(move || n.load(Ordering::SeqCst) * 1000),
     );
     Member {
@@ -109,7 +111,7 @@ fn member(seed: u8, relay_url: &str, now: &Arc<AtomicU64>) -> Member {
 
 impl Member {
     /// Lines in the room mailbox that this member has not read yet.
-    async fn new_lines(&mut self) -> Vec<(String, openvti_bridges::geb::wire::LineBody)> {
+    async fn new_lines(&mut self) -> Vec<(String, openvti_bridge_geb::wire::LineBody)> {
         let keys = self.sim.keys(ROOM);
         let mailbox = keys.pubkey_hex().unwrap();
         let mut evs = self
@@ -175,6 +177,8 @@ struct Env {
 
 struct Proc {
     parts: LinkParts,
+    /// The Geb side's own handle (the dyad, the MLS group, the device DID).
+    handle: Arc<GebHandle>,
     store: Arc<FjallStore>,
 }
 
@@ -244,7 +248,7 @@ impl Env {
             display_name: None,
             announce: false,
             notices: Default::default(),
-            retention_days: openvti_bridges::pump::DEFAULT_RETENTION_DAYS,
+            retention_days: openvti_bridge_core::pump::DEFAULT_RETENTION_DAYS,
         };
         Env {
             world,
@@ -275,23 +279,41 @@ impl Env {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(FjallStore::open(&dir.join("store"))?);
         let n = self.now.clone();
-        let parts = assemble(LinkInputs {
-            link: self.link.clone(),
-            geb: GebConfig::default(),
-            secrets: self.secrets.clone(),
-            store_key: zeroize::Zeroizing::new(store_key),
+        let ctx = link_ctx(
+            &self.link,
+            toml::Table::new(),
+            self.secrets.clone(),
+            zeroize::Zeroizing::new(store_key),
             dir,
-            store: store.clone(),
-            relay: Arc::new(NostrRelay::new(relay_cfg(&self.relay.url()))?),
-            vta: Arc::new(VtaClient::loopback(self.world.vta.clone())),
-            host: openvti_bridges::vtc::host::HostDelivery::for_loopback_tests(
-                &self.world.host.url,
-            ),
-            clock: Arc::new(move || n.load(Ordering::SeqCst) * 1000),
-            commit_inputs: self.inputs.clone(),
-            pause: None,
-        })?;
-        Ok(Proc { parts, store })
+            store.clone(),
+        )?;
+        let (room, handle) = build_with(
+            &ctx,
+            GebParts {
+                relay: Arc::new(NostrRelay::new(relay_cfg(&self.relay.url()))?),
+                clock: Arc::new(move || n.load(Ordering::SeqCst) * 1000),
+                commit_inputs: self.inputs.clone(),
+            },
+        )?;
+        let parts = assemble(
+            LinkInputs {
+                vta: Arc::new(VtaClient::loopback(self.world.vta.clone())),
+                host: openvti_bridge_vtc::host::HostDelivery::for_loopback_tests(
+                    &self.world.host.url,
+                ),
+                pause: None,
+            },
+            &ctx,
+            BuiltLink {
+                foreign: room,
+                handle: handle.clone(),
+            },
+        )?;
+        Ok(Proc {
+            parts,
+            handle,
+            store,
+        })
     }
 
     fn boot(&self) -> Proc {
@@ -315,7 +337,7 @@ fn parse_kp(b64: &str) -> KeyPackage {
 /// Connect (ours is the inviter), driving A's side concurrently.
 async fn connect(env: &mut Env, p: &Proc) {
     let a_did = env.a.sim.did.clone();
-    let our_did = p.parts.device_did.clone();
+    let our_did = p.handle.device_did.clone();
     let now = env.now.clone();
     let driver = async {
         for _ in 0..200 {
@@ -332,8 +354,7 @@ async fn connect(env: &mut Env, p: &Proc) {
         panic!("A never connected");
     };
     let (ours, ()) = tokio::join!(
-        ops::connect(
-            &p.parts,
+        p.handle.connect(
             &a_did,
             Some("bridge"),
             Duration::from_secs(20),
@@ -344,7 +365,7 @@ async fn connect(env: &mut Env, p: &Proc) {
     assert_eq!(ours.unwrap(), Phase::Connected);
 }
 
-fn bridged_by(records: &[openvti_bridges::room::RoomRecord], persona: &str) -> usize {
+fn bridged_by(records: &[openvti_bridge_core::room::RoomRecord], persona: &str) -> usize {
     records
         .iter()
         .filter(|r| r.author == persona && r.body.starts_with(PROVENANCE_OPEN))
@@ -363,14 +384,14 @@ async fn the_whole_stack_connects_seats_relays_and_survives_restarts() {
     // --- dyad connect (Geb member <-> bridge), over real websockets.
     connect(&mut env, &p).await;
     assert_eq!(
-        p.parts.dyad.phase(&a_did).await.unwrap(),
+        p.handle.dyad.phase(&a_did).await.unwrap(),
         Some(Phase::Connected)
     );
 
     // --- KeyPackage stock; the member takes one and welcomes us.
-    assert_eq!(ops::stock_kps(&p.parts).await.unwrap(), JoinState::Pending);
+    assert_eq!(p.handle.stock_kps().await.unwrap(), JoinState::Pending);
     env.tick();
-    let frames = env.a.dyad.recv(&p.parts.device_did).await.unwrap();
+    let frames = env.a.dyad.recv(&p.handle.device_did).await.unwrap();
     let kps = frames
         .iter()
         .find_map(|f| match f {
@@ -384,7 +405,7 @@ async fn the_whole_stack_connects_seats_relays_and_survives_restarts() {
     env.a
         .dyad
         .send(
-            &p.parts.device_did,
+            &p.handle.device_did,
             &welcome_frame(ROOM, &a_did, &env.policy, &welcome),
         )
         .await
@@ -393,14 +414,14 @@ async fn the_whole_stack_connects_seats_relays_and_survives_restarts() {
 
     // --- seated via the Welcome (the pump joins).
     assert_eq!(p.parts.pump.start().await.unwrap(), JoinState::Seated);
-    assert_eq!(p.parts.group.members().len(), 2);
+    assert_eq!(p.handle.group.members().len(), 2);
 
     // --- restart 1: nothing is re-seated, nothing is sent again.
     drop(p);
     p = env.boot();
     assert_eq!(p.parts.pump.start().await.unwrap(), JoinState::Seated);
     assert!(
-        p.parts.group.epoch().is_some(),
+        p.handle.group.epoch().is_some(),
         "resumed seated from sealed state"
     );
 
@@ -413,7 +434,7 @@ async fn the_whole_stack_connects_seats_relays_and_survives_restarts() {
     let lines = env.a.new_lines().await;
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].1.text.contains("hello geb"));
-    assert_eq!(lines[0].0, p.parts.device_did);
+    assert_eq!(lines[0].0, p.handle.device_did);
     assert!(lines[0].1.sg.is_some(), "the bridge signs as itself");
     let again = p.parts.pump.tick().await.unwrap();
     assert_eq!((again.posted, again.written), (0, 0));
@@ -536,7 +557,7 @@ async fn the_whole_stack_connects_seats_relays_and_survives_restarts() {
     assert!(env.try_boot_with([9u8; 32]).is_err());
     // And the right one still does, with the cursors intact.
     let p = env.boot();
-    let st = ops::status(&*p.parts.store).await.unwrap();
+    let st = ops::status(&*p.parts.store, &GEB_KIND).await.unwrap();
     assert!(st.browse_version >= 1 && st.halted.is_none());
     assert!(st.last_relayed_secs.is_some());
     assert_eq!(st.outbox_depth, 0);
@@ -550,12 +571,12 @@ async fn a_remove_us_commit_halts_the_link_and_stays_halted() {
     let a_did = env.a.sim.did.clone();
     let p = env.boot();
     connect(&mut env, &p).await;
-    ops::stock_kps(&p.parts).await.unwrap();
+    p.handle.stock_kps().await.unwrap();
     env.tick();
     let kps = env
         .a
         .dyad
-        .recv(&p.parts.device_did)
+        .recv(&p.handle.device_did)
         .await
         .unwrap()
         .into_iter()
@@ -569,7 +590,7 @@ async fn a_remove_us_commit_halts_the_link_and_stays_halted() {
     env.a
         .dyad
         .send(
-            &p.parts.device_did,
+            &p.handle.device_did,
             &welcome_frame(ROOM, &a_did, &env.policy, &welcome),
         )
         .await
@@ -579,7 +600,7 @@ async fn a_remove_us_commit_halts_the_link_and_stays_halted() {
 
     // The founder removes us: the commit goes out under the parent epoch's
     // keys, and the settle window (3 s) passes.
-    let our_did = p.parts.device_did.clone();
+    let our_did = p.handle.device_did.clone();
     let commit = env.a.sim.stage_remove(&our_did);
     post(
         &env.a.relay,
@@ -615,7 +636,7 @@ async fn a_remove_us_commit_halts_the_link_and_stays_halted() {
         panic!("expected the link to halt, got {end:?}")
     };
     assert!(why.contains("removed"), "{why}");
-    let st = ops::status(&*p.parts.store).await.unwrap();
+    let st = ops::status(&*p.parts.store, &GEB_KIND).await.unwrap();
     assert!(
         st.halted
             .as_ref()
@@ -659,12 +680,12 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
     let a_did = env.a.sim.did.clone();
     let p = env.boot();
     connect(&mut env, &p).await;
-    ops::stock_kps(&p.parts).await.unwrap();
+    p.handle.stock_kps().await.unwrap();
     env.tick();
     let kps = env
         .a
         .dyad
-        .recv(&p.parts.device_did)
+        .recv(&p.handle.device_did)
         .await
         .unwrap()
         .into_iter()
@@ -686,14 +707,14 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
     env.a
         .dyad
         .send(
-            &p.parts.device_did,
+            &p.handle.device_did,
             &welcome_frame(ROOM, &a_did, &env.policy, &welcome),
         )
         .await
         .unwrap();
     env.tick();
     p.parts.pump.start().await.unwrap();
-    let commit = b.stage_remove(&p.parts.device_did);
+    let commit = b.stage_remove(&p.handle.device_did);
     post(
         &env.a.relay,
         &b.keys(ROOM),
@@ -708,7 +729,7 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
     }
     let e: Result<TickReport> = p.parts.pump.tick().await;
     assert!(matches!(e, Err(Error::AdapterHalt { .. })), "{e:?}");
-    let st = ops::status(&*p.parts.store).await.unwrap();
+    let st = ops::status(&*p.parts.store, &GEB_KIND).await.unwrap();
     let Some(HaltReason::Adapter { code, detail }) = st.halted else {
         panic!(
             "expected a persisted undecidable-commit halt, got {:?}",
@@ -767,7 +788,7 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
         cleared,
         Cleared::Cleared(HaltReason::Adapter { .. })
     ));
-    assert!(ops::status(store).await.unwrap().halted.is_none());
+    assert!(ops::status(store, &GEB_KIND).await.unwrap().halted.is_none());
     // Still undecidable once the commit is read again: halts again at once.
     // (The held queue does not survive a restart: the commit is read from the
     // relay again, held for the settle window, then judged again.)
@@ -777,5 +798,5 @@ async fn with_production_inputs_an_undecidable_removal_halts_persistently() {
     }
     let e = p.parts.pump.tick().await;
     assert!(matches!(e, Err(Error::AdapterHalt { .. })), "{e:?}");
-    assert!(ops::status(store).await.unwrap().halted.is_some());
+    assert!(ops::status(store, &GEB_KIND).await.unwrap().halted.is_some());
 }

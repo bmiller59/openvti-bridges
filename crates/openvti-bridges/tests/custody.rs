@@ -2,18 +2,20 @@
 //! export (plan section 4): the VTA-backed `KeyMinter` and the secret store,
 //! with the Geb adapter's minting on top. The fake is the test's own reading of
 //! the two tasks; it is not a real VTA.
+
+#![cfg(feature = "geb")]
 #![cfg(feature = "harness")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 
 use common::key_vta::KeyVta;
-use openvti_bridges::config::SecretsConfig;
-use openvti_bridges::custody::{SecretStore, VtaKeyMinter};
-use openvti_bridges::geb::crypto::did_peer;
-use openvti_bridges::geb::custody::{GebLinkSecrets, mint_device_identity};
-use openvti_bridges::geb::traits::GebSigner;
-use openvti_bridges::secrets::{BridgeSecrets, ClientCredential};
+use openvti_bridge_core::config::SecretsConfig;
+use openvti_bridge_core::secrets::{BridgeSecrets, ClientCredential};
+use openvti_bridge_geb::crypto::did_peer;
+use openvti_bridge_geb::custody::{GebLinkSecrets, mint_device_identity};
+use openvti_bridge_geb::traits::GebSigner;
+use openvti_bridge_vtc::custody::{SecretStore, VtaKeyMinter};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use vta_sdk::client::VtaClient;
@@ -27,7 +29,7 @@ async fn mint(
     vta: &Arc<KeyVta>,
     link: &str,
     persona: &str,
-) -> openvti_bridges::Result<(GebLinkSecrets, openvti_bridges::secrets::LinkSecrets)> {
+) -> openvti_bridge_core::Result<(GebLinkSecrets, openvti_bridge_core::secrets::LinkSecrets)> {
     let c = client(vta);
     let g = mint_device_identity(&VtaKeyMinter(&c), "openvti-bridges", link).await?;
     let ls = g.into_link_secrets(persona)?;

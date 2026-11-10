@@ -125,6 +125,15 @@ impl LinkSecrets {
         self
     }
 
+    /// The public identifiers of every adapter payload (what the VTA key
+    /// records and identities are named, for an orphan report).
+    pub fn adapter_ids(&self) -> Vec<String> {
+        self.adapter
+            .values()
+            .flat_map(|a| a.ids.iter().cloned())
+            .collect()
+    }
+
     /// The payload the adapter `kind` stored. Refuses a link that holds a
     /// payload for any other kind, or none for this one: a link is never
     /// started with another adapter's identity.
