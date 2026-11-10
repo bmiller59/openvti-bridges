@@ -61,7 +61,7 @@ pub struct LinkInputs {
     pub store: Arc<dyn BridgeStore>,
     /// The Nostr relay (one per device identity).
     pub relay: Arc<dyn GebRelay>,
-    /// A client for the user's VTA, in the `geb-bridge` context.
+    /// A client for the user's VTA, in the `openvti-bridges` context.
     pub vta: Arc<VtaClient>,
     /// Delivery to the room host.
     pub host: HostDelivery,

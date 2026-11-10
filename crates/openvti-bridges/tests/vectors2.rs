@@ -13,13 +13,13 @@
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use vti_geb_bridge::geb::crypto::{b64_decode, b64_encode, did_peer, leaf, rendezvous, sign};
-use vti_geb_bridge::geb::settle::{
+use openvti_bridges::geb::crypto::{b64_decode, b64_encode, did_peer, leaf, rendezvous, sign};
+use openvti_bridges::geb::settle::{
     Candidate, Held, Judge, Outcome, SettleQueue, Verdict, commit_hash,
 };
-use vti_geb_bridge::geb::vrc;
+use openvti_bridges::geb::vrc;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const FIXTURE: &str = include_str!("fixtures/geb-path-b-vectors-2.json");
 

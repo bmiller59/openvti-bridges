@@ -7,12 +7,12 @@
 mod common;
 
 use common::key_vta::KeyVta;
+use openvti_bridges::cli::{self, SetupInputs};
+use openvti_bridges::config::Config;
+use openvti_bridges::custody::BridgeSecrets;
 use std::process::Command;
 use std::sync::Arc;
 use vta_sdk::client::VtaClient;
-use vti_geb_bridge::cli::{self, SetupInputs};
-use vti_geb_bridge::config::Config;
-use vti_geb_bridge::custody::BridgeSecrets;
 
 const SETUP: &str = r#"
 config_path = "/nonexistent/config.toml"
@@ -50,7 +50,7 @@ tier_optin = true
 #[test]
 fn setup_inputs_are_strict() {
     let s = SetupInputs::from_toml_str(SETUP).unwrap();
-    assert_eq!(s.context, "geb-bridge");
+    assert_eq!(s.context, "openvti-bridges");
     assert_eq!(s.config().unwrap().links.len(), 2);
     assert!(
         SetupInputs::from_toml_str(&SETUP.replace("[secrets]", "extra = 1\n[secrets]")).is_err()
@@ -137,13 +137,13 @@ async fn link_management_edits_the_config_and_the_grant_is_narrow() {
     cli::add_peer(&path, "l1", "did:peer:2.peer").unwrap();
     cli::add_peer(&path, "l1", "did:peer:2.peer").unwrap();
     assert_eq!(Config::load(&path).unwrap().links[0].geb_peers.len(), 1);
-    let grant = cli::client_grant_hint("geb-bridge", "did:key:zClient");
+    let grant = cli::client_grant_hint("openvti-bridges", "did:key:zClient");
     assert!(grant.contains("--capabilities room-present,room-open"));
     assert!(!grant.contains("admin"));
 }
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_vti-geb-bridge"))
+    Command::new(env!("CARGO_BIN_EXE_openvti-bridges"))
 }
 
 #[test]
@@ -205,9 +205,9 @@ fn the_binary_lists_and_reports_status_offline_and_refuses_a_bad_config() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
-    use vti_geb_bridge::fjall_store::FjallStore;
-    use vti_geb_bridge::halt::{self, HaltReason};
-    use vti_geb_bridge::wiring::link_dir;
+    use openvti_bridges::fjall_store::FjallStore;
+    use openvti_bridges::halt::{self, HaltReason};
+    use openvti_bridges::wiring::link_dir;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
@@ -264,7 +264,7 @@ async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
     // A fork split: the unsealed marker is shown by `status` (and a paused
     // link reads PAUSED). No keys are needed to read it.
     {
-        use vti_geb_bridge::geb::forkmark::{self, ForkMarker, ForkState};
+        use openvti_bridges::geb::forkmark::{self, ForkMarker, ForkState};
         let s = FjallStore::open(&store_dir).unwrap();
         forkmark::write(
             &s,
@@ -326,9 +326,9 @@ async fn clear_halt_shows_the_halt_needs_yes_and_a_locked_store_says_so() {
 /// switch and the persisted halt exactly as `run` does.
 #[tokio::test(flavor = "multi_thread")]
 async fn geb_connect_and_stock_kps_refuse_a_paused_or_halted_link() {
-    use vti_geb_bridge::fjall_store::FjallStore;
-    use vti_geb_bridge::halt::{self, HaltReason};
-    use vti_geb_bridge::wiring::link_dir;
+    use openvti_bridges::fjall_store::FjallStore;
+    use openvti_bridges::halt::{self, HaltReason};
+    use openvti_bridges::wiring::link_dir;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
@@ -341,7 +341,7 @@ async fn geb_connect_and_stock_kps_refuse_a_paused_or_halted_link() {
         // Bounded: a command that does not refuse would go on to the network.
         let out = Command::new("timeout")
             .arg("20")
-            .arg(env!("CARGO_BIN_EXE_vti-geb-bridge"))
+            .arg(env!("CARGO_BIN_EXE_openvti-bridges"))
             .args(full)
             .output()
             .unwrap();
@@ -445,7 +445,7 @@ fn directions_is_required_on_link_add_and_in_the_config() {
 /// reverted when `link add` saves, and the new link is recorded.
 #[tokio::test]
 async fn a_pause_during_link_add_survives_the_save() {
-    use vti_geb_bridge::cli::NewLink;
+    use openvti_bridges::cli::NewLink;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let cfg = SetupInputs::from_toml_str(SETUP).unwrap().config().unwrap();

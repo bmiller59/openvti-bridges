@@ -7,17 +7,17 @@
 
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
+use openvti_bridges::geb::dyad::{GebIdentity, Phase, StatefulDyad};
+use openvti_bridges::geb::event::{KIND_INBOX, KIND_MAILBOX, standard_tags};
+use openvti_bridges::geb::nostr::{NostrConfig, NostrRelay};
+use openvti_bridges::geb::test_relay::TestRelay;
+use openvti_bridges::geb::traits::{GebDyad, GebRelay, RelayEvent};
+use openvti_bridges::geb::wire::Frame;
+use openvti_bridges::store::MemoryStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
-use vti_geb_bridge::geb::dyad::{GebIdentity, Phase, StatefulDyad};
-use vti_geb_bridge::geb::event::{KIND_INBOX, KIND_MAILBOX, standard_tags};
-use vti_geb_bridge::geb::nostr::{NostrConfig, NostrRelay};
-use vti_geb_bridge::geb::test_relay::TestRelay;
-use vti_geb_bridge::geb::traits::{GebDyad, GebRelay, RelayEvent};
-use vti_geb_bridge::geb::wire::Frame;
-use vti_geb_bridge::store::MemoryStore;
 
 const T0: u64 = 1_700_000_000;
 
@@ -261,10 +261,10 @@ async fn connect_when_apart_and_acked_messages_over_a_real_socket() {
 
 /// Read and consume, as a consumer that has persisted its own state does.
 async fn take(
-    d: &vti_geb_bridge::geb::dyad::StatefulDyad,
+    d: &openvti_bridges::geb::dyad::StatefulDyad,
     peer: &str,
-) -> vti_geb_bridge::Result<Vec<vti_geb_bridge::geb::wire::Frame>> {
-    use vti_geb_bridge::geb::traits::GebDyad;
+) -> openvti_bridges::Result<Vec<openvti_bridges::geb::wire::Frame>> {
+    use openvti_bridges::geb::traits::GebDyad;
     let got = d.recv_counted(peer).await?;
     let counters: Vec<u32> = got.iter().map(|(n, _)| *n).collect();
     d.commit_recv(peer, &counters).await?;

@@ -14,11 +14,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ed25519_dalek::SigningKey;
-use serde_json::Value;
-use vti_geb_bridge::geb::crypto::{
+use openvti_bridges::geb::crypto::{
     did_peer, frame_id, inbox, leaf, line_id, pair, ratchet, rendezvous, sealed, sign,
 };
-use vti_geb_bridge::geb::wire::{LineBody, signing_doc};
+use openvti_bridges::geb::wire::{LineBody, signing_doc};
+use serde_json::Value;
 
 const FIXTURE: &str = include_str!("fixtures/geb-path-b-vectors.json");
 
@@ -121,7 +121,7 @@ fn sealed_box_opens_with_bobs_secret() {
     let blob = sealed::open(&bob_secret, s(&v["output"]["content_b64"])).unwrap();
     assert_eq!(blob, s(&v["input"]["plaintext"]).as_bytes());
     // The stated layout.
-    let raw = vti_geb_bridge::geb::crypto::b64_decode(s(&v["output"]["content_b64"])).unwrap();
+    let raw = openvti_bridges::geb::crypto::b64_decode(s(&v["output"]["content_b64"])).unwrap();
     assert_eq!(hex::encode(&raw[..32]), s(&v["output"]["eph_pub_hex"]));
     assert_eq!(hex::encode(&raw[32..44]), s(&v["output"]["nonce_hex"]));
     assert_eq!(
@@ -172,7 +172,7 @@ fn mailbox_envelope_opens_with_the_given_key_and_aad() {
     let pt = pair::open(&keys, kind, s(&v["output"]["content_b64"])).unwrap();
     assert_eq!(pt, s(&i["envelope_json"]).as_bytes());
     // The nonce is the first 12 bytes.
-    let raw = vti_geb_bridge::geb::crypto::b64_decode(s(&v["output"]["content_b64"])).unwrap();
+    let raw = openvti_bridges::geb::crypto::b64_decode(s(&v["output"]["content_b64"])).unwrap();
     assert_eq!(hex::encode(&raw[..12]), s(&v["output"]["nonce_hex"]));
     // The AAD binds the kind.
     assert!(pair::open(&keys, kind + 1, s(&v["output"]["content_b64"])).is_err());
@@ -192,7 +192,7 @@ fn ratchet_frames_open_out_of_order_and_replay_fails() {
     assert_eq!(v["input"]["sender_sends_on"], "lo2hi");
 
     // Bob's view: ECDH with alice, receive on the chain alice sends on.
-    let shared = vti_geb_bridge::geb::crypto::ecdh(
+    let shared = openvti_bridges::geb::crypto::ecdh(
         &h32(&b["x25519_secret_hex"]),
         &h32(&a["x25519_pub_hex"]),
     )
@@ -204,7 +204,7 @@ fn ratchet_frames_open_out_of_order_and_replay_fails() {
     let pts = v["input"]["plaintexts"].as_array().unwrap();
     // Counters are in the frame header, and the frame ids follow frame_id().
     for (n, f) in frames.iter().enumerate() {
-        let raw = vti_geb_bridge::geb::crypto::b64_decode(s(&f["frame_b64"])).unwrap();
+        let raw = openvti_bridges::geb::crypto::b64_decode(s(&f["frame_b64"])).unwrap();
         assert_eq!(hex::encode(&raw[..4]), s(&f["counter_hex"]));
         assert_eq!(u32::from_be_bytes(raw[..4].try_into().unwrap()), n as u32);
         assert_eq!(frame_id::frame_id(s(&f["frame_b64"])), s(&f["frame_id"]));
@@ -289,7 +289,7 @@ fn room_line_signature_and_derived_id() {
 
     // The unsigned plaintext is `{t,at,text}` in that order.
     assert_eq!(
-        serde_json::to_string(&vti_geb_bridge::geb::wire::RoomPlaintext::Line(
+        serde_json::to_string(&openvti_bridges::geb::wire::RoomPlaintext::Line(
             line.clone()
         ))
         .unwrap(),

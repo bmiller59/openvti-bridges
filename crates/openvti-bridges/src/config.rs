@@ -144,7 +144,7 @@ fn default_data_dir() -> std::path::PathBuf {
 }
 
 fn default_context() -> String {
-    "geb-bridge".into()
+    "openvti-bridges".into()
 }
 
 /// The `[secrets]` table. Its shape is the shared `vti-secrets` one; it is
@@ -435,7 +435,7 @@ tier_optin = true
         assert_eq!(c.links[0].poll_secs, 10);
         assert!(!c.links[0].enabled);
         assert_eq!(c.geb.relay_url, "wss://nostr.myceli.al");
-        assert_eq!(c.vta.context, "geb-bridge");
+        assert_eq!(c.vta.context, "openvti-bridges");
     }
 
     #[test]

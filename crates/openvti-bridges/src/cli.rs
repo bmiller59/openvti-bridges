@@ -5,12 +5,12 @@
 //!
 //! # Setup, in order
 //!
-//! 1. `vti-geb-bridge setup --setup-key-out setup.key` mints an ephemeral
+//! 1. `openvti-bridges setup --setup-key-out setup.key` mints an ephemeral
 //!    `did:key`, stores it 0600 and prints the `pnm` grant that makes it admin
-//!    of the `geb-bridge` context for an hour.
+//!    of the `openvti-bridges` context for an hour.
 //! 2. The operator runs that grant at their VTA (or with the keyring tooling).
 //!    The setup key can mint and export this context's keys and nothing else.
-//! 3. `vti-geb-bridge setup --from setup.toml` authenticates as the setup key,
+//! 3. `openvti-bridges setup --from setup.toml` authenticates as the setup key,
 //!    mints and exports each link's two device keys, stores them in the secret
 //!    store, writes `config.toml` and prints the second grant: the bridge's own
 //!    long-term client `did:key`, narrowed to `room-present,room-open` and
@@ -26,7 +26,7 @@ use vta_sdk::credentials::CredentialBundle;
 use vta_sdk::provision_client::{EphemeralSetupKey, OperatorMessages};
 
 /// The VTA context the bridge's keys live in.
-pub const DEFAULT_CONTEXT: &str = "geb-bridge";
+pub const DEFAULT_CONTEXT: &str = "openvti-bridges";
 
 /// How setup names the integration, and the grant it asks the operator for.
 pub struct BridgeMessages;
@@ -64,7 +64,7 @@ pub fn client_grant_hint(context: &str, client_did: &str) -> String {
 /// Phase 1.
 pub async fn setup_phase1(out: &Path, context: &str) -> Result<()> {
     let finalise = format!(
-        "vti-geb-bridge setup --from <your-setup.toml>   (with setup_key_file = \"{}\")",
+        "openvti-bridges setup --from <your-setup.toml>   (with setup_key_file = \"{}\")",
         out.display()
     );
     vta_sdk::provision_client::driver::run_phase1_init(
@@ -91,7 +91,7 @@ pub struct SetupInputs {
     pub vta_did: String,
     /// Its REST base URL.
     pub vta_url: String,
-    /// The VTA context. Defaults to `geb-bridge`.
+    /// The VTA context. Defaults to `openvti-bridges`.
     #[serde(default = "default_context")]
     pub context: String,
     /// The phase-1 key file whose DID was granted admin of `context`.
@@ -191,7 +191,7 @@ fn setup_client(
     async move {
         let key = loaded.map_err(|e| {
             Error::Config(format!(
-                "load the setup key {}: {e}. Run `vti-geb-bridge setup --setup-key-out <path>` \
+                "load the setup key {}: {e}. Run `openvti-bridges setup --setup-key-out <path>` \
                  first and grant the DID it prints.",
                 key_file.display()
             ))

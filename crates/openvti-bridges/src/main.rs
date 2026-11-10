@@ -1,15 +1,15 @@
-//! `vti-geb-bridge`: the … room.
-//! Experimental. Built only with `--features cli`; see `vti_geb_bridge::cli`.
+//! `openvti-bridges`: the … room.
+//! Experimental. Built only with `--features cli`; see `openvti_bridges::cli`.
 
 use clap::{Args, Parser, Subcommand};
+use openvti_bridges::cli::{self, DEFAULT_CONTEXT, NewLink};
+use openvti_bridges::{Result, service};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
-use vti_geb_bridge::cli::{self, DEFAULT_CONTEXT, NewLink};
-use vti_geb_bridge::{Result, service};
 
 #[derive(Parser)]
 #[command(
-    name = "vti-geb-bridge",
+    name = "openvti-bridges",
     version,
     about = "Experimental bridge between a VTC data room and a Geb room"
 )]
@@ -135,7 +135,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Setup(a) => match (a.setup_key_out, a.from) {
             (Some(out), None) => cli::setup_phase1(&out, &a.context).await,
             (None, Some(from)) => cli::setup_from_file(&from).await,
-            _ => Err(vti_geb_bridge::Error::Config(
+            _ => Err(openvti_bridges::Error::Config(
                 "give --setup-key-out <path> (phase 1) or --from <setup.toml> (phase 2)".into(),
             )),
         },
@@ -174,7 +174,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 .await
             }
             LinkCmd::List => {
-                for line in cli::link_list(&vti_geb_bridge::config::Config::load(&config)?) {
+                for line in cli::link_list(&openvti_bridges::config::Config::load(&config)?) {
                     println!("{line}");
                 }
                 Ok(())
@@ -196,7 +196,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 service::clear_halt(
                     &config,
                     &id,
-                    vti_geb_bridge::halt::ClearConfirmation { yes, readmitted },
+                    openvti_bridges::halt::ClearConfirmation { yes, readmitted },
                 )
                 .await
             }
@@ -217,7 +217,7 @@ async fn main() -> std::process::ExitCode {
         .init();
     vta_sdk::crypto_init::install_default_crypto_provider();
     #[cfg(feature = "keyring")]
-    vta_sdk::keyring_init::warn_store_unavailable("vti-geb-bridge");
+    vta_sdk::keyring_init::warn_store_unavailable("openvti-bridges");
     match dispatch(Cli::parse()).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {

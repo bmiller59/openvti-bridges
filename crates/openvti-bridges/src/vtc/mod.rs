@@ -114,7 +114,7 @@ fn b64() -> base64::engine::GeneralPurpose {
 impl VtcRoom {
     /// Build the room side. `client` is the bridge's authenticated `VtaClient`
     /// (its own `did:key`, narrowed to `room-present,room-open` in the
-    /// `geb-bridge` context).
+    /// `openvti-bridges` context).
     pub fn new(client: Arc<VtaClient>, host: HostDelivery, cfg: VtcRoomConfig) -> Self {
         Self {
             client,

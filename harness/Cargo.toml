@@ -11,8 +11,8 @@
 # `[patch."https://example.invalid/verifiable-trust-infrastructure.git"]` entry (see
 # README, "The room-host harness").
 [package]
-name = "vti-geb-bridge-harness"
-description = "Tests of vti-geb-bridge against a real room-host (not published, not built by CI)"
+name = "openvti-bridges-harness"
+description = "Tests of openvti-bridges against a real room-host (not published, not built by CI)"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -22,7 +22,7 @@ license = "Apache-2.0"
 [workspace]
 
 [dependencies]
-vti-geb-bridge = { path = "..", features = ["harness", "geb-live", "geb-mls"] }
+openvti-bridges = { path = "../crates/openvti-bridges", features = ["harness", "geb-live", "geb-mls"] }
 
 [dev-dependencies]
 # Pinned by rev; the VTI commit the crate was extracted at.

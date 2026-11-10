@@ -6,7 +6,7 @@
 //!   This module only records its DID. There is deliberately no export call
 //!   for it anywhere in this crate.
 //! - **The Geb device DID `G_b`** = `did:peer:2.A<ed>.V<ed>.E<x>`. The VTA mints
-//!   two key records in the `geb-bridge` context (one Ed25519, one separately
+//!   two key records in the `openvti-bridges` context (one Ed25519, one separately
 //!   derived X25519); the bridge exports each once with `keys/export-secret/0.1`,
 //!   builds the DID itself with the already-bound encoder (no `.S`), and keeps
 //!   the two secrets only in its own secret store ([`SecretStore`], over
@@ -24,7 +24,7 @@
 //!
 //! Orphans (R2.1): the mint is two creates and two exports before the secrets
 //! are saved. A crash between leaves key records at the VTA that nothing
-//! references; they cost nothing and are listed under the `geb-bridge` context
+//! references; they cost nothing and are listed under the `openvti-bridges` context
 //! for the operator to revoke. The config is written only after the secrets.
 //!
 //! UNVERIFIED: a derived key is exportable by default
@@ -398,7 +398,7 @@ async fn mint_and_export(
             derivation_path: None,
             key_id: None,
             mnemonic: None,
-            label: Some(format!("geb-bridge/{link_id}/device-{which}")),
+            label: Some(format!("openvti-bridges/geb/{link_id}/device-{which}")),
             context_id: Some(context.to_string()),
             // Derived, not internal: an internal key can never be exported.
             internal: None,

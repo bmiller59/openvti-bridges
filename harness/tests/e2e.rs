@@ -36,28 +36,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tls_codec::Deserialize as _;
 use vta_sdk::client::VtaClient;
-use vti_geb_bridge::config::{Directions, GebConfig, LinkConfig, SecretsConfig, Tier};
-use vti_geb_bridge::custody::{BridgeSecrets, LinkSecrets, SecretStore, mint_device_identity};
-use vti_geb_bridge::fjall_store::FjallStore;
-use vti_geb_bridge::foreign::JoinState;
-use vti_geb_bridge::geb::codec::GuideCodec;
-use vti_geb_bridge::geb::crypto::{b64_decode, pair};
-use vti_geb_bridge::geb::dyad::{GebIdentity, Phase, StatefulDyad};
-use vti_geb_bridge::geb::event::KIND_MAILBOX;
-use vti_geb_bridge::geb::mls::sim::{Sim, mc, ml, post, welcome_frame};
-use vti_geb_bridge::geb::nostr::{NostrConfig, NostrRelay};
-use vti_geb_bridge::geb::policy::CommitCheckInputs;
-use vti_geb_bridge::geb::test_relay::TestRelay;
-use vti_geb_bridge::geb::traits::{GebCodec, GebDyad, GebRelay, GebSigner};
-use vti_geb_bridge::geb::wire::{Envelope, Frame, GroupOp};
-use vti_geb_bridge::halt::{self, ClearConfirmation, Cleared, HaltReason};
-use vti_geb_bridge::ops;
-use vti_geb_bridge::pump::TickReport;
-use vti_geb_bridge::room::PROVENANCE_OPEN;
-use vti_geb_bridge::run::{End, Health, LinkTick, Timing, supervise};
-use vti_geb_bridge::store::{BridgeStore, StateSpace};
-use vti_geb_bridge::wiring::{LinkInputs, LinkParts, assemble};
-use vti_geb_bridge::{Error, Result};
+use openvti_bridges::config::{Directions, GebConfig, LinkConfig, SecretsConfig, Tier};
+use openvti_bridges::custody::{BridgeSecrets, LinkSecrets, SecretStore, mint_device_identity};
+use openvti_bridges::fjall_store::FjallStore;
+use openvti_bridges::foreign::JoinState;
+use openvti_bridges::geb::codec::GuideCodec;
+use openvti_bridges::geb::crypto::{b64_decode, pair};
+use openvti_bridges::geb::dyad::{GebIdentity, Phase, StatefulDyad};
+use openvti_bridges::geb::event::KIND_MAILBOX;
+use openvti_bridges::geb::mls::sim::{Sim, mc, ml, post, welcome_frame};
+use openvti_bridges::geb::nostr::{NostrConfig, NostrRelay};
+use openvti_bridges::geb::policy::CommitCheckInputs;
+use openvti_bridges::geb::test_relay::TestRelay;
+use openvti_bridges::geb::traits::{GebCodec, GebDyad, GebRelay, GebSigner};
+use openvti_bridges::geb::wire::{Envelope, Frame, GroupOp};
+use openvti_bridges::halt::{self, ClearConfirmation, Cleared, HaltReason};
+use openvti_bridges::ops;
+use openvti_bridges::pump::TickReport;
+use openvti_bridges::room::PROVENANCE_OPEN;
+use openvti_bridges::run::{End, Health, LinkTick, Timing, supervise};
+use openvti_bridges::store::{BridgeStore, StateSpace};
+use openvti_bridges::wiring::{LinkInputs, LinkParts, assemble};
+use openvti_bridges::{Error, Result};
 
 const T0: u64 = 1_700_000_000;
 const ROOM: &str = "geb-room-0001";
@@ -93,7 +93,7 @@ fn member(seed: u8, relay_url: &str, now: &Arc<AtomicU64>) -> Member {
     let dyad = StatefulDyad::new(
         id,
         relay.clone(),
-        Arc::new(vti_geb_bridge::store::MemoryStore::new()),
+        Arc::new(openvti_bridges::store::MemoryStore::new()),
         Arc::new(move || n.load(Ordering::SeqCst) * 1000),
     );
     Member {
@@ -106,7 +106,7 @@ fn member(seed: u8, relay_url: &str, now: &Arc<AtomicU64>) -> Member {
 
 impl Member {
     /// Lines in the room mailbox that this member has not read yet.
-    async fn new_lines(&mut self) -> Vec<(String, vti_geb_bridge::geb::wire::LineBody)> {
+    async fn new_lines(&mut self) -> Vec<(String, openvti_bridges::geb::wire::LineBody)> {
         let keys = self.sim.keys(ROOM);
         let mailbox = keys.pubkey_hex().unwrap();
         let mut evs = self
@@ -188,7 +188,7 @@ impl Env {
         let kv = Arc::new(KeyVta::default());
         let minted = mint_device_identity(
             &VtaClient::loopback(kv.clone()),
-            "geb-bridge",
+            "openvti-bridges",
             "l1",
             world.persona(),
         )
@@ -235,7 +235,7 @@ impl Env {
             display_name: None,
             announce: false,
             notices: Default::default(),
-            retention_days: vti_geb_bridge::pump::DEFAULT_RETENTION_DAYS,
+            retention_days: openvti_bridges::pump::DEFAULT_RETENTION_DAYS,
         };
         Env {
             world,
@@ -258,7 +258,7 @@ impl Env {
         self.now.fetch_add(1, Ordering::SeqCst);
     }
     fn link_dir(&self) -> std::path::PathBuf {
-        vti_geb_bridge::wiring::link_dir(self.dir.path(), "l1")
+        openvti_bridges::wiring::link_dir(self.dir.path(), "l1")
     }
 
     fn try_boot_with(&self, store_key: [u8; 32]) -> Result<Proc> {
@@ -275,7 +275,7 @@ impl Env {
             store: store.clone(),
             relay: Arc::new(NostrRelay::new(relay_cfg(&self.relay.url()))?),
             vta: Arc::new(VtaClient::loopback(self.world.vta.clone())),
-            host: vti_geb_bridge::vtc::host::HostDelivery::for_loopback_tests(&self.world.host.url),
+            host: openvti_bridges::vtc::host::HostDelivery::for_loopback_tests(&self.world.host.url),
             clock: Arc::new(move || n.load(Ordering::SeqCst) * 1000),
             commit_inputs: self.inputs.clone(),
             pause: None,
@@ -333,7 +333,7 @@ async fn connect(env: &mut Env, p: &Proc) {
     assert_eq!(ours.unwrap(), Phase::Connected);
 }
 
-fn bridged_by(records: &[vti_geb_bridge::room::RoomRecord], persona: &str) -> usize {
+fn bridged_by(records: &[openvti_bridges::room::RoomRecord], persona: &str) -> usize {
     records
         .iter()
         .filter(|r| r.author == persona && r.body.starts_with(PROVENANCE_OPEN))

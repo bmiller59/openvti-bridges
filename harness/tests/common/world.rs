@@ -12,11 +12,11 @@ use vta_sdk::client::loopback::LoopbackSink;
 use vta_sdk::error::VtaError;
 use vtc_client::VtcClient;
 use vtc_client::rooms::CleartextContent;
-use vti_geb_bridge::config::Directions;
-use vti_geb_bridge::pump::LinkRuntime;
-use vti_geb_bridge::room::{RoomRecord, RoomSide};
-use vti_geb_bridge::vtc::host::HostDelivery;
-use vti_geb_bridge::vtc::{VtcRoom, VtcRoomConfig};
+use openvti_bridges::config::Directions;
+use openvti_bridges::pump::LinkRuntime;
+use openvti_bridges::room::{RoomRecord, RoomSide};
+use openvti_bridges::vtc::host::HostDelivery;
+use openvti_bridges::vtc::{VtcRoom, VtcRoomConfig};
 use vti_rooms_dtg::test_support::{Party, RoomFixture};
 
 pub const HOST_DID: &str = "did:key:zHost";

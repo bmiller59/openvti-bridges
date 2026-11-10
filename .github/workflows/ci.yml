@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt
-      - run: cargo fmt --check
+      - run: cargo fmt --all --check
 
   # `Cargo.lock` is not committed yet (README, "Cargo.lock"), so each job that builds
   # generates it first. Nothing here has run yet: see README, "What CI runs today".
@@ -36,9 +36,9 @@ jobs:
         with:
           components: clippy
       - run: cargo generate-lockfile
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --all-targets --features "cli geb-live geb-mls" -- -D warnings
-      - run: cargo clippy --all-targets --features "cli harness geb-live geb-mls" -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p openvti-bridges --all-targets --features "cli geb-live geb-mls" -- -D warnings
+      - run: cargo clippy -p openvti-bridges --all-targets --features "cli harness geb-live geb-mls" -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -46,10 +46,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - run: cargo generate-lockfile
-      - run: cargo test
-      - run: cargo test --features "cli geb-live geb-mls"
+      - run: cargo test --workspace
+      - run: cargo test -p openvti-bridges --features "cli geb-live geb-mls"
       # Adds tests/custody.rs and tests/cli.rs (they need `vta-sdk/test-loopback`, not a room host).
-      - run: cargo test --features "cli harness geb-live geb-mls"
+      - run: cargo test -p openvti-bridges --features "cli harness geb-live geb-mls"
 
   deny:
     runs-on: ubuntu-latest

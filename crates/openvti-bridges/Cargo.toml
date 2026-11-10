@@ -1,16 +1,12 @@
 [package]
-name = "vti-geb-bridge"
+name = "openvti-bridges"
 description = "Experimental … foreign room (first adapter: Geb)"
 version = "0.1.0"
-edition = "2024"
-# Not published. Experimental: the Geb path-B wire has no versioned
-# specification, nothing depends on this crate, and a
-# crates.io artifact would promise an API and a stability this crate does
-# not offer. Revisit when a Geb protocol version is pinned.
-publish = false
-rust-version = "1.95.0"
-license = "Apache-2.0"
-# repository: set once this repo has a home
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 default = []
@@ -63,7 +59,7 @@ geb-mls = [
 # with this feature. Without it, `[secrets]` must name another backend.
 keyring = ["vtc", "vti-secrets/keyring", "vta-sdk/keyring"]
 
-# The `vti-geb-bridge` binary and its library surface (`cli`, `setup`, `service`).
+# The `openvti-bridges` binary and its library surface (`cli`, `setup`, `service`).
 # A feature, not a default.
 cli = [
   "vtc",
@@ -85,7 +81,7 @@ harness = [
 ]
 
 [[bin]]
-name = "vti-geb-bridge"
+name = "openvti-bridges"
 path = "src/main.rs"
 required-features = ["cli"]
 
@@ -136,10 +132,5 @@ tls_codec = { version = "0.5", optional = true }
 tempfile = "3"
 tokio = { version = "1.49", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 
-[lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
-
-[lints.clippy]
-needless_pass_by_value = "allow"
-too_many_arguments = "allow"
-type_complexity = "allow"
+[lints]
+workspace = true

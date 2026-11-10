@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/openvti-bridges"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95.0"
+license = "Apache-2.0"
+# Not published. Experimental: the Geb path-B wire has no versioned
+# specification, nothing depends on these crates, and a crates.io artifact
+# would promise an API and a stability they do not offer. Revisit when a
+# foreign protocol version is pinned and a second adapter has proved the seam.
+publish = false
+repository = "https://github.com/bmiller59/openvti-bridges"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+needless_pass_by_value = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"

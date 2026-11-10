@@ -7,13 +7,15 @@
 mod common;
 
 use common::key_vta::KeyVta;
+use openvti_bridges::config::SecretsConfig;
+use openvti_bridges::custody::{
+    BridgeSecrets, ClientCredential, SecretStore, mint_device_identity,
+};
+use openvti_bridges::geb::crypto::did_peer;
+use openvti_bridges::geb::traits::GebSigner;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use vta_sdk::client::VtaClient;
-use vti_geb_bridge::config::SecretsConfig;
-use vti_geb_bridge::custody::{BridgeSecrets, ClientCredential, SecretStore, mint_device_identity};
-use vti_geb_bridge::geb::crypto::did_peer;
-use vti_geb_bridge::geb::traits::GebSigner;
 
 fn client(vta: &Arc<KeyVta>) -> VtaClient {
     VtaClient::loopback(vta.clone())
@@ -29,7 +31,7 @@ fn plaintext_cfg() -> SecretsConfig {
 #[tokio::test(flavor = "multi_thread")]
 async fn mints_two_separate_keys_and_builds_the_did_locally() {
     let vta = Arc::new(KeyVta::default());
-    let s = mint_device_identity(&client(&vta), "geb-bridge", "l1", "did:key:persona1")
+    let s = mint_device_identity(&client(&vta), "openvti-bridges", "l1", "did:key:persona1")
         .await
         .unwrap();
     // Two creates, one per type, in the bridge context.
@@ -37,7 +39,7 @@ async fn mints_two_separate_keys_and_builds_the_did_locally() {
     assert_eq!(created.len(), 2);
     assert_eq!(created[0]["keyType"], "ed25519");
     assert_eq!(created[1]["keyType"], "x25519");
-    assert!(created.iter().all(|c| c["contextId"] == "geb-bridge"));
+    assert!(created.iter().all(|c| c["contextId"] == "openvti-bridges"));
     assert!(created.iter().all(|c| c.get("internal").is_none()));
     // Exactly those two were exported, once each; nothing for the persona.
     let exported = vta.exported.lock().unwrap().clone();
@@ -58,13 +60,13 @@ async fn refuses_a_lying_or_unexportable_vta_and_stores_nothing() {
     let vta = Arc::new(KeyVta::default());
     vta.refuse_export.store(true, Ordering::SeqCst);
     assert!(
-        mint_device_identity(&client(&vta), "geb-bridge", "l1", "did:key:p")
+        mint_device_identity(&client(&vta), "openvti-bridges", "l1", "did:key:p")
             .await
             .is_err()
     );
     vta.refuse_export.store(false, Ordering::SeqCst);
     vta.lie_about_public.store(true, Ordering::SeqCst);
-    let e = mint_device_identity(&client(&vta), "geb-bridge", "l1", "did:key:p")
+    let e = mint_device_identity(&client(&vta), "openvti-bridges", "l1", "did:key:p")
         .await
         .unwrap_err();
     assert!(e.to_string().contains("does not match"), "{e}");
@@ -74,10 +76,10 @@ async fn refuses_a_lying_or_unexportable_vta_and_stores_nothing() {
 async fn one_device_did_and_one_persona_per_link() {
     let vta = Arc::new(KeyVta::default());
     let mut secrets = BridgeSecrets::new();
-    let a = mint_device_identity(&client(&vta), "geb-bridge", "l1", "did:key:p1")
+    let a = mint_device_identity(&client(&vta), "openvti-bridges", "l1", "did:key:p1")
         .await
         .unwrap();
-    let b = mint_device_identity(&client(&vta), "geb-bridge", "l2", "did:key:p2")
+    let b = mint_device_identity(&client(&vta), "openvti-bridges", "l2", "did:key:p2")
         .await
         .unwrap();
     secrets.insert("l1", a.clone()).unwrap();
@@ -85,7 +87,7 @@ async fn one_device_did_and_one_persona_per_link() {
     // Same link twice, same device on another link, same persona: all refused.
     assert!(secrets.insert("l1", a.clone()).is_err());
     assert!(secrets.insert("l3", a).is_err());
-    let c = mint_device_identity(&client(&vta), "geb-bridge", "l3", "did:key:p1")
+    let c = mint_device_identity(&client(&vta), "openvti-bridges", "l3", "did:key:p1")
         .await
         .unwrap();
     let e = secrets.insert("l3", c).unwrap_err();
@@ -100,7 +102,7 @@ async fn secrets_round_trip_the_store_and_never_print() {
     let store = SecretStore::open(&plaintext_cfg(), dir.path()).unwrap();
     assert!(store.load().await.unwrap().is_none());
     let mut secrets = BridgeSecrets::new();
-    let ls = mint_device_identity(&client(&vta), "geb-bridge", "l1", "did:key:p1")
+    let ls = mint_device_identity(&client(&vta), "openvti-bridges", "l1", "did:key:p1")
         .await
         .unwrap();
     secrets.insert("l1", ls.clone()).unwrap();
@@ -135,7 +137,7 @@ async fn secrets_round_trip_the_store_and_never_print() {
     assert!(!dbg.contains(&ed_hex));
 }
 
-fn hex_of_ed(ls: &vti_geb_bridge::custody::LinkSecrets) -> String {
+fn hex_of_ed(ls: &openvti_bridges::custody::LinkSecrets) -> String {
     // The serialised form is the only place the secret appears.
     let v = serde_json::to_value(ls).unwrap();
     v["ed_secret"].as_str().unwrap().to_string()

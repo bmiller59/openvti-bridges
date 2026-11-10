@@ -146,7 +146,7 @@ fn open_err(dir: &Path, e: AppError) -> Error {
     let raw = e.to_string();
     if raw.to_lowercase().contains("lock") {
         return Error::Store(format!(
-            "the store at {} is in use by another process (a running `vti-geb-bridge run`?). \
+            "the store at {} is in use by another process (a running `openvti-bridges run`?). \
              Stop it, then repeat this command",
             dir.display()
         ));
