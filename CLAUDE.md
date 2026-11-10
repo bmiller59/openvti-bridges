@@ -1,4 +1,4 @@
-# CLAUDE.md — vti-geb-bridge
+# CLAUDE.md — openvti-bridges
 
 Crate guidance for the experimental …
 foreign room (first adapter: Geb). This crate was extracted from the VTI
@@ -212,7 +212,7 @@ Plan: `docs/bridges/geb/plan.md` and `docs/bridges/geb/companion-notes.md`.
   root crate would stop resolving for everyone.
 
 **What CI can run** (`.github/workflows/ci.yml`; none of it has run yet, there is no
-remote): fmt; clippy and tests for default, `cli geb-live geb-mls` and
+remote): fmt; clippy and tests for default, `geb-live geb-mls` (now `live mls` on `openvti-bridge-geb`) and
 `cli harness geb-live geb-mls`; `cargo deny check`; a Signed-off-by check on PRs. CI
 generates `Cargo.lock` first because none is committed (a lock produced here has
 path-patched sources). The `harness/` package stays manual until the URL is real. Do not
@@ -220,8 +220,8 @@ write "verified in CI" for anything.
 
 Run everything locally: the root crate needs the local-only `.cargo/config.toml` override
 (git-ignored; `[patch.crates-io]` for VTI crates not in the cargo cache, plus a `[patch]` for
-`room-host`). `cargo test --offline --features "cli harness geb-live geb-mls" --no-fail-fast`
-in the root gives 273 lib, `cli` 5, `custody` 5, `geb_live` 9, `vectors` 11, `vectors2` 9. For
+`room-host`). `cargo test --offline --workspace --features harness --no-fail-fast`
+in the root gives the sums 312 lib (85 core, 214 geb, 13 vtc), `cli` 10, `custody` 5, `geb_live` 9, `vectors` 11, `vectors2` 9. For
 the room-host tests, `cd harness && cargo test --offline`: `e2e` 3, `harness` 8. A `[patch]` on
 a git source still has to fetch it on a fresh resolve (no lock), so offline either point
 `room-host` at a path in `harness/Cargo.toml` temporarily (do not commit that) or keep a lock.
@@ -293,7 +293,7 @@ peer's receive counter is inferred from acks only.
 ## Operational shell (custody, sealed state, CLI)
 
 - **Custody** (`custody`, feature `vtc`): the VTA mints two key records in the
-  `geb-bridge` context (Ed25519, and a separately derived X25519), the bridge
+  `openvti-bridges` context (Ed25519, and a separately derived X25519), the bridge
   exports each once (`keys/export-secret/0.1`), builds `did:peer:2.A.V.E`
   itself (no `.S`) and keeps the secrets only in its `vti-secrets` store
   (`SecretStore`, one blob: `BridgeSecrets`). The room persona is only
@@ -308,7 +308,7 @@ peer's receive counter is inferred from acks only.
   queue (re-read from the relay: the cursor barrier holds the position) and the
   dedup window (the journal covers it). Cursors, journal, outbox and xref are
   not secrets and stay in clear.
-- **CLI** (`--features cli`, `src/main.rs`, `cli`, `service`; not a default
+- **CLI** (`crates/openvti-bridges/src/main.rs`, `cli`, `service`; not a default
   feature): two-phase `setup`
   (`--setup-key-out`, then `--from`), `link add|list|pause|resume|remove`,
   `geb connect|stock-kps`, `status`, `run`. One fjall store per link under

@@ -1,4 +1,4 @@
-# vti-geb-bridge: design
+# openvti-bridges: design
 
 Status: experimental, `publish = false`. Nothing in this document has been verified against a
 live Geb node, a real VTA, a real room host or a real Nostr relay. Every test in this repository
@@ -49,11 +49,11 @@ layer.
 
 ## 2. Architecture
 
-The bridge is a separate process (`vti-geb-bridge run`). One link joins one VTC room to one Geb
+The bridge is a separate process (`openvti-bridges run`). One link joins one VTC room to one Geb
 room; the process supervises every link (a paused one idles).
 
 ```
-                 +-------------------- vti-geb-bridge (one process) --------------------+
+                 +-------------------- openvti-bridges (one process) --------------------+
                  |                                                                       |
  VTC room host   |  vtc::VtcRoom        pump          geb::GebRoom (ForeignRoom)         |  Nostr relay
  (HTTPS, Trust   |  (RoomSide)  <-->  [per link]  <-->  GebDyad + GebGroup (OpenMLS)    |  (wss, kinds
@@ -132,10 +132,10 @@ VTC side, operations (feature-gated):
 | `geb-live` | `tokio-tungstenite`, `futures-util`, `url`, `tokio` | `NostrRelay`, `TestRelay` |
 | `geb-mls` | `openmls` 0.9, `openmls_rust_crypto`, `openmls_basic_credential`, `openmls_traits`, `tls_codec` | `MlsGroupClient`, own provider; no `vti-rooms` |
 | `keyring` | `vtc`, `vti-secrets/keyring`, `vta-sdk/keyring` | OS keyring as the secret store |
-| `cli` | `vtc`, `geb-live`, `geb-mls`, `clap`, `tracing-subscriber`, `vta-sdk/provision-client`, `vta-sdk/crypto-provider` | The `vti-geb-bridge` binary (`required-features = ["cli"]`) |
+| `cli` | `vtc`, `geb-live`, `geb-mls`, `clap`, `tracing-subscriber`, `vta-sdk/provision-client`, `vta-sdk/crypto-provider` | The `openvti-bridges` binary (`required-features = ["cli"]`) |
 | `harness` | `vtc`, `vta-sdk/test-loopback` | Test support: loopback host delivery, the in-process MLS `sim`, the loopback sink for `tests/custody.rs` and `tests/cli.rs`. No room host: the real-`room-host` tests are the separate `harness/` package |
 
-`vti-geb-bridge` depends on published VTI crates by version. `room-host` is not published; only the
+`openvti-bridges` depends on published VTI crates by version. `room-host` is not published; only the
 separate `harness/` package takes it, by git (section 10).
 
 ## 3. The ForeignRoom seam, and adding another adapter
@@ -635,7 +635,7 @@ tick (no latched flag, R6.2).
 
 ## 9. Operations
 
-Build the binary with `--features cli`. All commands take `--config <path>` (default
+Build the binary with `cargo build -p openvti-bridges`. All commands take `--config <path>` (default
 `config.toml`). The log filter is the `RUST_LOG` environment variable, default `info`; logs go to
 stderr via `tracing_subscriber`. Security alerts carry `security_alert = true`.
 
@@ -665,7 +665,7 @@ data_dir = "data"                 # relative paths resolve against the config fi
 [vta]
 did = "did:webvh:vta.example"
 url = "https://vta.example"       # REST base; needed to run
-context = "geb-bridge"            # default
+context = "openvti-bridges"            # default
 
 [geb]
 relay_url = "wss://nostr.myceli.al"   # default
@@ -710,17 +710,17 @@ from the room's own `0xF001` policy (`geb/mls/client.rs`).
 Run (offline once dependencies are cached; run under `nice -n 10` on a shared machine):
 
 ```sh
-cargo test                                          # default features
-cargo test --features "cli geb-live geb-mls"
-cargo test --features "cli harness geb-live geb-mls"  # adds tests/custody.rs and tests/cli.rs
+cargo test -p openvti-bridge-core                  # the neutral core alone
+cargo test --workspace --no-fail-fast
+cargo test --workspace --features harness            # adds tests/custody.rs and tests/cli.rs
 (cd harness && cargo test)                          # real room-host: manual, see below
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features "cli geb-live geb-mls" -- -D warnings
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features harness -- -D warnings
 ```
 
 CI (`.github/workflows/ci.yml`), on Rust 1.95.0, is configured to run: fmt; clippy and tests for the
-default features, `cli geb-live geb-mls` and `cli harness geb-live geb-mls`; `cargo deny check`; and,
+default features, `geb-live geb-mls` (now `live mls` on `openvti-bridge-geb`) and `cli harness geb-live geb-mls`; `cargo deny check`; and,
 on pull requests, a check that every commit has a `Signed-off-by` trailer. It generates `Cargo.lock`
 first because none is committed. **None of this has run**: the repository has no remote yet. The
 `harness/` package (real `room-host`) is a manual job (`workflow_dispatch`) that cannot pass until

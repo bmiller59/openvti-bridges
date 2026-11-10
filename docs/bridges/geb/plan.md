@@ -1,3 +1,6 @@
+> Renamed `vti-geb-bridge` -> `openvti-bridges` and split into crates (core, vtc, geb, shell); the text below is
+> the historical plan and keeps its original wording and paths.
+
 > Superseded details (added 2026-11-09, extended 2026-11-09; `docs/DESIGN.md` is the current state). Where the body
 > below disagrees with it, this note wins:
 > - File layout (section 3) is the original plan: the code has `cli.rs`, `service.rs`, `run.rs`, `wiring.rs`, `ops.rs`,

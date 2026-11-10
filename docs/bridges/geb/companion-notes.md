@@ -1,5 +1,7 @@
 # Companion notes: Geb bridge plan
 
+> Renamed `vti-geb-bridge` -> `openvti-bridges`; this note keeps its original wording.
+
 Date: 2026-11-08. Author: BAM session. Plan: `plan.md`.
 Paths below that are not under `src/` or `docs/` refer to the VTI repository, where this document was first written.
 These notes explain the choices, record the threat model, and list what is still open. [V] = checked in code by a

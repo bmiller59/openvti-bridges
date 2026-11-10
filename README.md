@@ -1,6 +1,6 @@
-# vti-geb-bridge
+# openvti-bridges
 
-An experimental bridge between a Verifiable Trust Infrastructure (VTI) community data room and a
+Experimental bridges between a Verifiable Trust Infrastructure (VTI) community data room and a
 Geb room. It is a separate process that is a member of both rooms and carries content both ways: VTC
 records become chat lines in the Geb MLS room, and Geb lines become create-only records in the VTC
 room. The bridge signs as itself on each side and quotes the original author, and content that
@@ -28,16 +28,16 @@ Needs Rust 1.95.0 (edition 2024). Run builds and tests under `nice -n 10` on a s
 
 ```sh
 cargo generate-lockfile                               # once, if there is no Cargo.lock (needs network)
-cargo test                                            # default features
-cargo test --features "cli geb-live geb-mls"          # the full CI configuration
-cargo test --features "cli harness geb-live geb-mls"  # also tests/custody.rs and tests/cli.rs
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo build --features cli                            # the vti-geb-bridge binary
+cargo test --workspace                                # default features
+cargo test --workspace --features harness             # also the shell's tests/custody.rs and tests/cli.rs
+cargo test -p openvti-bridge-geb --features "live mls" # the Geb adapter on its own, with its live and MLS features
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build -p openvti-bridges                        # the openvti-bridges binary
 ```
 
-**What CI runs today** (`.github/workflows/ci.yml`): `cargo fmt --check`; clippy and tests for the
-default features, for `cli geb-live geb-mls`, and for `cli harness geb-live geb-mls` (which adds
+**What CI runs today** (`.github/workflows/ci.yml`): `cargo fmt --check`; clippy and tests per crate and for the
+workspace, with and without `harness` (which adds
 `tests/custody.rs` and `tests/cli.rs`); `cargo deny check`; a sign-off (DCO) check on pull
 requests. Those jobs need network (crates.io and the advisory database). **None of it has run in
 CI yet**: the repository has no remote, and the published VTI crates it needs (`vta-sdk` 0.85,
@@ -66,19 +66,23 @@ would be wrong for everyone else. Until it is committed, CI generates one before
 
 ## Features
 
-| Feature | Adds |
-|---|---|
-| (default) | The Geb core and the adapter-neutral core: codec, crypto, dyad, pump, store and room traits, loopback. No VTI crate, no network stack, no MLS |
-| `vtc` | The VTC room side (`vtc::VtcRoom` over `VtaClient`), the fjall `BridgeStore`, key custody, sealed-at-rest state, the supervisor |
-| `geb-live` | The Nostr relay client and an in-process test relay (`ws://` only for 127.0.0.1) |
-| `geb-mls` | The Geb MLS group over OpenMLS 0.9, tested only against an in-process second client |
-| `keyring` | The OS keyring as the secret store (implies `vtc`) |
-| `cli` | The `vti-geb-bridge` binary; implies `vtc geb-live geb-mls` |
-| `harness` | Test support: loopback host delivery, the in-process MLS `sim`, `vta-sdk`'s loopback sink (implies `vtc`). The real-`room-host` tests are the separate `harness/` package |
+Features are per crate. The core and the shell take none beyond the two below.
+
+| Crate | Feature | Adds |
+|---|---|---|
+| `openvti-bridge-core` | (none) | The adapter-neutral core: foreign-room seam, mapping, pump, halts, pause, supervisor, at-rest sealing, store and room traits, loopback. No VTI crate, no network stack, no MLS |
+| `openvti-bridge-vtc` | `harness` | Loopback host delivery and `vta-sdk`'s loopback sink, for tests that need no room host |
+| `openvti-bridge-vtc` | `keyring` | The OS keyring as the secret store |
+| `openvti-bridge-geb` | `live` | The Nostr relay client and an in-process test relay (`ws://` only for 127.0.0.1) |
+| `openvti-bridge-geb` | `mls` | The Geb MLS group over OpenMLS 0.9, tested only against an in-process second client |
+| `openvti-bridge-geb` | `harness` | The in-process MLS `sim` for other crates (implies `mls`) |
+| `openvti-bridges` | `harness`, `keyring` | Pass through to the crates above |
+
+The real-`room-host` tests are the separate `harness/` package.
 
 ## CLI
 
-Build with `--features cli`. Every command takes `--config <path>` (default `config.toml`).
+Build with `cargo build -p openvti-bridges`. Every command takes `--config <path>` (default `config.toml`).
 
 | Command | Purpose |
 |---|---|
@@ -99,13 +103,12 @@ section 9.
 ## Repository layout
 
 ```
-src/               core: foreign.rs (the seam), model, mapping, pump, store, room, halt, config, atrest
-src/geb/           the Geb adapter: wire, crypto, dyad, room, settle, policy, vrc, nostr, mls/
-src/vtc/           the VTC room side and HTTPS delivery to the room host
-src/{custody,run,wiring,ops,cli,service,main}.rs   key custody, supervision, operator shell
-tests/             vectors (Geb's), geb_live, custody, cli; fixtures/ holds the vectors
-harness/           separate package: harness and e2e tests against a real room-host (manual)
-docs/              DESIGN.md, bridges/geb/plan.md, bridges/geb/companion-notes.md
+crates/openvti-bridge-core/   the adapter-neutral core: foreign.rs (the seam), model, mapping, pump, store, room, halt, pause, run, config, atrest, loopback
+crates/openvti-bridge-vtc/    the VTI side: VTC room side, HTTPS delivery to the room host, fjall store, key custody
+crates/openvti-bridge-geb/    the Geb adapter (its own crate root): wire, crypto, dyad, room, settle, policy, vrc, nostr, mls/; its tests/ hold the vectors
+crates/openvti-bridges/       the shell and binary: cli, service, ops, wiring, main; tests/custody.rs and tests/cli.rs
+harness/                      separate package `openvti-bridges-harness`: harness and e2e tests against a real room-host (manual)
+docs/                         DESIGN.md, bridges/geb/plan.md, bridges/geb/companion-notes.md
 ```
 
 ## Documents
@@ -120,7 +123,7 @@ docs/              DESIGN.md, bridges/geb/plan.md, bridges/geb/companion-notes.m
 
 ## Origin
 
-Extracted from the VTI repository (crate `vti-geb-bridge`, branch `feat/geb-bridge`) as a fresh
+Extracted from the VTI repository (crate `vti-geb-bridge`, branch `feat/geb-bridge`; renamed `openvti-bridges`, canonical home `https://github.com/bmiller59/openvti-bridges.git`) as a fresh
 import without history; the first commit message names the source commit. It depends on published
 VTI crates by version; only the separate `harness/` package needs `room-host`.
 
