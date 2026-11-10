@@ -101,15 +101,7 @@ fn be8(b: Option<Vec<u8>>) -> Option<u64> {
 
 /// Read a link's status from its store alone: no network, no keys.
 pub async fn status(store: &dyn BridgeStore) -> Result<Status> {
-    let mut outbox_depth = 0;
-    for key in store.outbox_pending_keys().await? {
-        if !store
-            .xref_has(&format!("{}{key}", crate::pump::FAILED_PREFIX))
-            .await?
-        {
-            outbox_depth += 1;
-        }
-    }
+    let outbox_depth = crate::pump::outbox_depth(store).await?;
     Ok(Status {
         browse_version: be8(store.cursor(CURSOR_BROWSE).await?).unwrap_or(0),
         foreign_cursor_secs: be8(store.cursor(CURSOR_FOREIGN).await?),

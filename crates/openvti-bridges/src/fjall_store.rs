@@ -761,7 +761,7 @@ mod tests {
         );
         // `status` is bounded the same way.
         let before = s.decode_count();
-        assert_eq!(crate::ops::status(&s).await.unwrap().outbox_depth, 3);
+        assert_eq!(crate::pump::outbox_depth(&s).await.unwrap(), 3);
         assert_eq!(s.decode_count() - before, 3);
     }
 
@@ -799,7 +799,7 @@ mod tests {
         }
         // The raw store, with no key at all, still reports the count.
         let raw = FjallStore::open(dir.path()).unwrap();
-        assert_eq!(crate::ops::status(&raw).await.unwrap().outbox_depth, 1);
+        assert_eq!(crate::pump::outbox_depth(&raw).await.unwrap(), 1);
     }
 
     #[tokio::test]

@@ -48,6 +48,18 @@ pub const OVERSIZE_FAILED: &str = "oversize_failed";
 /// the outbox key; its value is the reason. An entry with one is never posted
 /// again and no longer counts as pending.
 pub const FAILED_PREFIX: &str = "failed:";
+
+/// Outbound events journalled, not yet posted and not dead-lettered. Bounded by
+/// the pending index, so it decodes only pending entries and opens no body.
+pub async fn outbox_depth(store: &dyn BridgeStore) -> Result<usize> {
+    let mut depth = 0;
+    for key in store.outbox_pending_keys().await? {
+        if !store.xref_has(&format!("{FAILED_PREFIX}{key}")).await? {
+            depth += 1;
+        }
+    }
+    Ok(depth)
+}
 /// Count (big-endian u64) of entries dead-lettered because they failed for a
 /// reason that cannot pass (a non-retryable room error, a line that cannot be
 /// encoded, a record the room will never let the persona read); `status`
@@ -1588,13 +1600,13 @@ mod tests {
 
     /// P1-6: a refusal from the VTI side (the VTA's 403, the host's
     /// `permissionDenied`) is not "the foreign room removed the bridge".
-    #[cfg(feature = "vtc")]
     #[tokio::test]
     async fn a_vtc_side_refusal_halts_with_its_own_reason_and_remediation() {
         use crate::halt::{ClearConfirmation, Cleared, clear};
         let room = ScriptedRoom::new();
         *room.always.lock().unwrap() = Some(|| {
-            crate::vtc::host::from_vta(vta_sdk::error::VtaError::Forbidden("no grant".into()))
+            // What `vtc::host::from_vta` returns for a `Forbidden` (pinned in host.rs).
+            Error::VtcRefused("the VTA refused the bridge: no grant".into())
         });
         let (lb, store) = (
             Arc::new(Loopback::new("bridge-id")),
