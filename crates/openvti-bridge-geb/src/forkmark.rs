@@ -23,8 +23,10 @@ use crate::{Error, Result};
 use openvti_bridge_core::store::BridgeStore;
 use serde::{Deserialize, Serialize};
 
-/// The marker's name (a cursor of the link's store).
-pub const FORK: &str = "fork";
+/// The marker's name: a cursor of the link's store, under the adapter's kind.
+/// A cursor, not adapter state, on purpose: cursors are never sealed, and
+/// `status` reads the marker without any key.
+pub const FORK: &str = "geb/fork";
 
 /// Where a split stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

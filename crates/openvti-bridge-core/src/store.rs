@@ -2,9 +2,8 @@
 //! `fjall_store`, behind feature `vtc`, is async). The in-memory store backs
 //! the unit tests.
 //!
-//! Keyspaces named in the plan: cursors, `journal_in`, `outbox_out`, `xref`.
-//! (`links`, `geb_mls` and `ratchets` belong to the Geb adapter and arrive
-//! with it.)
+//! Keyspaces: cursors, `journal_in`, `outbox_out`, `xref`, and one adapter-owned
+//! state space addressed by a namespace string (see [`BridgeStore::state_get`]).
 
 use crate::foreign::Receipt;
 use crate::model::BridgeEvent;
@@ -12,16 +11,6 @@ use crate::{Error, Result};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-
-/// Adapter-owned keyspaces reachable through [`BridgeStore::state_get`] and
-/// [`BridgeStore::state_put`]. The core never interprets the bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum StateSpace {
-    /// Per-link and per-connection state (`links`).
-    Links,
-    /// Pair ratchets and their queues (`ratchets`).
-    Ratchets,
-}
 
 /// What one [`BridgeStore::prune`] removed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -83,14 +72,17 @@ pub trait BridgeStore: Send + Sync {
     async fn prune(&self, _now_secs: u64, _retention_secs: u64) -> Result<PruneStats> {
         Ok(PruneStats::default())
     }
-    /// Read an adapter-owned record. A store that does not provide adapter
-    /// state refuses rather than pretending.
-    async fn state_get(&self, _space: StateSpace, _key: &str) -> Result<Option<Vec<u8>>> {
+    /// Read an adapter-owned record. `ns` is the adapter's own namespace and
+    /// must start with its kind (`"geb/links"`): two adapters, or one adapter
+    /// re-pointed at another's state, can never read each other's records. The
+    /// core never interprets `ns` or the bytes. A store that does not provide
+    /// adapter state refuses rather than pretending.
+    async fn state_get(&self, _ns: &str, _key: &str) -> Result<Option<Vec<u8>>> {
         Err(Error::Store("this store keeps no adapter state".into()))
     }
     /// Write an adapter-owned record. When this returns the record is durable
     /// (a ratchet step is persisted before its frame is posted or acked).
-    async fn state_put(&self, _space: StateSpace, _key: &str, _value: &[u8]) -> Result<()> {
+    async fn state_put(&self, _ns: &str, _key: &str, _value: &[u8]) -> Result<()> {
         Err(Error::Store("this store keeps no adapter state".into()))
     }
     /// Cross-reference: `a` is bridged as `b`.
@@ -109,7 +101,7 @@ struct Inner {
     journal: BTreeMap<String, BridgeEvent>,
     outbox: BTreeMap<String, (BridgeEvent, Option<Receipt>)>,
     xref: BTreeMap<String, String>,
-    state: BTreeMap<(StateSpace, String), Vec<u8>>,
+    state: BTreeMap<(String, String), Vec<u8>>,
 }
 
 /// In-memory [`BridgeStore`].
@@ -179,13 +171,17 @@ impl BridgeStore for MemoryStore {
             .map(|(k, (e, _))| (k.clone(), e.clone()))
             .collect())
     }
-    async fn state_get(&self, space: StateSpace, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.lock()?.state.get(&(space, key.to_string())).cloned())
+    async fn state_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .lock()?
+            .state
+            .get(&(ns.to_string(), key.to_string()))
+            .cloned())
     }
-    async fn state_put(&self, space: StateSpace, key: &str, value: &[u8]) -> Result<()> {
+    async fn state_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
         self.lock()?
             .state
-            .insert((space, key.to_string()), value.to_vec());
+            .insert((ns.to_string(), key.to_string()), value.to_vec());
         Ok(())
     }
     async fn xref_set(&self, a: &str, b: &str) -> Result<()> {

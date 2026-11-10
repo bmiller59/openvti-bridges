@@ -60,12 +60,17 @@ use super::wire::{
 use crate::{Error, Result};
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
-use openvti_bridge_core::store::{BridgeStore, StateSpace};
+use openvti_bridge_core::store::BridgeStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
+
+/// The adapter-state namespace of per-connection state (`dyad/<peer>`).
+const NS_LINKS: &str = "geb/links";
+/// The adapter-state namespace of pair ratchets (keyed by peer).
+const NS_RATCHETS: &str = "geb/ratchets";
 
 /// Largest frame plaintext we send. Conservative: it was sized to fit the
 /// old 65,536-byte event once the ratchet frame, two base64 layers (about
@@ -388,14 +393,14 @@ impl StatefulDyad {
         }
         let Some(raw) = self
             .store
-            .state_get(StateSpace::Links, &format!("dyad/{peer}"))
+            .state_get(NS_LINKS, &format!("dyad/{peer}"))
             .await?
         else {
             return Ok(());
         };
         let conn: ConnRecord = serde_json::from_slice(&raw)
             .map_err(|e| Error::Store(format!("connection record does not decode: {e}")))?;
-        let ratchet = match self.store.state_get(StateSpace::Ratchets, peer).await? {
+        let ratchet = match self.store.state_get(NS_RATCHETS, peer).await? {
             Some(r) => Some(
                 serde_json::from_slice(&r)
                     .map_err(|e| Error::Store(format!("ratchet record does not decode: {e}")))?,
@@ -408,18 +413,12 @@ impl StatefulDyad {
 
     async fn save_conn(&self, c: &ConnRecord) -> Result<()> {
         self.store
-            .state_put(
-                StateSpace::Links,
-                &format!("dyad/{}", c.peer),
-                &to_bytes(c)?,
-            )
+            .state_put(NS_LINKS, &format!("dyad/{}", c.peer), &to_bytes(c)?)
             .await
     }
 
     async fn save_ratchet(&self, peer: &str, r: &RatchetRecord) -> Result<()> {
-        self.store
-            .state_put(StateSpace::Ratchets, peer, &to_bytes(r)?)
-            .await
+        self.store.state_put(NS_RATCHETS, peer, &to_bytes(r)?).await
     }
 
     /// Seal `payload` to the invitee's inbox and post it (kind 4178, signed by
@@ -1385,7 +1384,7 @@ mod tests {
         // The VRCs are kept on both sides and verify.
         let ra = w
             .a_store
-            .state_get(StateSpace::Links, &format!("dyad/{}", w.b.did()))
+            .state_get(NS_LINKS, &format!("dyad/{}", w.b.did()))
             .await
             .unwrap()
             .unwrap();
@@ -1872,11 +1871,11 @@ mod tests {
         async fn xref_get(&self, a: &str) -> Result<Option<String>> {
             self.inner.xref_get(a).await
         }
-        async fn state_get(&self, s: StateSpace, k: &str) -> Result<Option<Vec<u8>>> {
+        async fn state_get(&self, s: &str, k: &str) -> Result<Option<Vec<u8>>> {
             self.inner.state_get(s, k).await
         }
-        async fn state_put(&self, s: StateSpace, k: &str, v: &[u8]) -> Result<()> {
-            if s == StateSpace::Ratchets && self.fail.load(Ordering::SeqCst) {
+        async fn state_put(&self, s: &str, k: &str, v: &[u8]) -> Result<()> {
+            if s == NS_RATCHETS && self.fail.load(Ordering::SeqCst) {
                 return Err(Error::Store("disk full".into()));
             }
             self.inner.state_put(s, k, v).await

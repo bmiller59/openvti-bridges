@@ -31,7 +31,7 @@
 
 use crate::foreign::Receipt;
 use crate::model::BridgeEvent;
-use crate::store::{BridgeStore, PruneStats, StateSpace};
+use crate::store::{BridgeStore, PruneStats};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -129,16 +129,9 @@ impl AtRestKey {
     }
 }
 
-fn space_name(s: StateSpace) -> &'static str {
-    match s {
-        StateSpace::Links => "links",
-        StateSpace::Ratchets => "ratchets",
-    }
-}
-
-/// A [`BridgeStore`] that encrypts the adapter-owned state records
-/// ([`StateSpace::Links`], [`StateSpace::Ratchets`]) and passes everything
-/// else straight through. `scope` (the link id) is part of each record's AAD.
+/// A [`BridgeStore`] that encrypts every adapter-owned state record
+/// ([`BridgeStore::state_get`] / [`BridgeStore::state_put`]) and passes
+/// everything else straight through. `scope` (the link id) is part of each record's AAD.
 pub struct EncryptedState {
     inner: Arc<dyn BridgeStore>,
     key: AtRestKey,
@@ -155,8 +148,8 @@ impl EncryptedState {
         }
     }
 
-    fn aad(&self, space: StateSpace, key: &str) -> String {
-        format!("state/{}/{}/{key}", self.scope, space_name(space))
+    fn aad(&self, ns: &str, key: &str) -> String {
+        format!("state/{}/{ns}/{key}", self.scope)
     }
 
     fn event_aad(&self, kind: &str, key: &str) -> String {
@@ -252,15 +245,15 @@ impl BridgeStore for EncryptedState {
     async fn prune(&self, now_secs: u64, retention_secs: u64) -> Result<PruneStats> {
         self.inner.prune(now_secs, retention_secs).await
     }
-    async fn state_get(&self, space: StateSpace, key: &str) -> Result<Option<Vec<u8>>> {
-        match self.inner.state_get(space, key).await? {
+    async fn state_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        match self.inner.state_get(ns, key).await? {
             None => Ok(None),
-            Some(blob) => Ok(Some(self.key.open(&self.aad(space, key), &blob)?.to_vec())),
+            Some(blob) => Ok(Some(self.key.open(&self.aad(ns, key), &blob)?.to_vec())),
         }
     }
-    async fn state_put(&self, space: StateSpace, key: &str, value: &[u8]) -> Result<()> {
-        let blob = self.key.seal(&self.aad(space, key), value)?;
-        self.inner.state_put(space, key, &blob).await
+    async fn state_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
+        let blob = self.key.seal(&self.aad(ns, key), value)?;
+        self.inner.state_put(ns, key, &blob).await
     }
     async fn xref_set(&self, a: &str, b: &str) -> Result<()> {
         self.inner.xref_set(a, b).await
@@ -378,44 +371,30 @@ mod tests {
     async fn encrypted_state_stores_no_plaintext_and_binds_the_place() {
         let inner = Arc::new(MemoryStore::new());
         let s = EncryptedState::new(inner.clone(), key(1, "state"), "l1");
-        s.state_put(StateSpace::Ratchets, "peer", b"chain-key-bytes")
+        s.state_put("x/ratchets", "peer", b"chain-key-bytes")
             .await
             .unwrap();
         let raw = inner
-            .state_get(StateSpace::Ratchets, "peer")
+            .state_get("x/ratchets", "peer")
             .await
             .unwrap()
             .unwrap();
         assert!(!raw.windows(5).any(|w| w == b"chain"));
         assert_eq!(
-            s.state_get(StateSpace::Ratchets, "peer").await.unwrap(),
+            s.state_get("x/ratchets", "peer").await.unwrap(),
             Some(b"chain-key-bytes".to_vec())
         );
-        // The same blob under another key, space or link does not open.
-        inner
-            .state_put(StateSpace::Ratchets, "other", &raw)
-            .await
-            .unwrap();
-        assert!(s.state_get(StateSpace::Ratchets, "other").await.is_err());
-        inner
-            .state_put(StateSpace::Links, "peer", &raw)
-            .await
-            .unwrap();
-        assert!(s.state_get(StateSpace::Links, "peer").await.is_err());
+        // The same blob under another key, namespace or link does not open.
+        inner.state_put("x/ratchets", "other", &raw).await.unwrap();
+        assert!(s.state_get("x/ratchets", "other").await.is_err());
+        inner.state_put("x/links", "peer", &raw).await.unwrap();
+        assert!(s.state_get("x/links", "peer").await.is_err());
         let other_link = EncryptedState::new(inner.clone(), key(1, "state"), "l2");
-        assert!(
-            other_link
-                .state_get(StateSpace::Ratchets, "peer")
-                .await
-                .is_err()
-        );
+        assert!(other_link.state_get("x/ratchets", "peer").await.is_err());
         // Wrong store key refuses; a missing record is simply absent.
         let wrong = EncryptedState::new(inner.clone(), key(9, "state"), "l1");
-        assert!(wrong.state_get(StateSpace::Ratchets, "peer").await.is_err());
-        assert_eq!(
-            s.state_get(StateSpace::Ratchets, "none").await.unwrap(),
-            None
-        );
+        assert!(wrong.state_get("x/ratchets", "peer").await.is_err());
+        assert_eq!(s.state_get("x/ratchets", "none").await.unwrap(), None);
         // Cursors pass through unencrypted.
         s.set_cursor("halt", b"why").await.unwrap();
         assert_eq!(inner.cursor("halt").await.unwrap(), Some(b"why".to_vec()));

@@ -1,11 +1,11 @@
 //! The durable [`BridgeStore`] over `vti_common::store` (fjall).
 //!
-//! Keyspaces are the plan's section 3: `links`, `cursors`, `journal_in`,
-//! `outbox_out`, `xref`, `geb_mls`, `ratchets`. The pump's [`BridgeStore`]
-//! uses the middle four; `links` (per-link state), `geb_mls` and `ratchets`
-//! belong to the Geb adapter (M2/M3) and are only opened here so a store
-//! always has the complete set (a missing keyspace is created on first use by
-//! fjall, but naming them keeps the set in one place).
+//! Keyspaces: `cursors`, `journal_in`, `outbox_out`, `xref` and `adapter_state`.
+//! The pump's [`BridgeStore`] uses the first four. `adapter_state` is the one
+//! keyspace behind [`BridgeStore::state_get`] / [`BridgeStore::state_put`]:
+//! every adapter keeps its records there under `<ns>\0<key>`, where `ns`
+//! starts with the adapter's kind (`geb/links`), so no adapter can see another
+//! kind's state. (The store directory is already per link.)
 //!
 //! Two further keyspaces keep the store bounded (P1-4). `outbox_pending` indexes
 //! the outbox entries not yet posted or retired, so a tick reads only those,
@@ -29,7 +29,7 @@ use crate::{Error, Result};
 use async_trait::async_trait;
 use openvti_bridge_core::foreign::Receipt;
 use openvti_bridge_core::model::BridgeEvent;
-use openvti_bridge_core::store::{BridgeStore, PruneStats, StateSpace};
+use openvti_bridge_core::store::{BridgeStore, PruneStats};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -38,8 +38,6 @@ use vti_common::config::StoreConfig;
 use vti_common::error::AppError;
 use vti_common::store::{KeyspaceHandle, Store};
 
-/// Per-link state (halt reasons, join state). Adapter-owned from M2.
-pub const KS_LINKS: &str = "links";
 /// Named cursors (browse version, foreign relay cursor, halt).
 pub const KS_CURSORS: &str = "cursors";
 /// Inbound events, journalled before they are acted on.
@@ -48,10 +46,9 @@ pub const KS_JOURNAL_IN: &str = "journal_in";
 pub const KS_OUTBOX_OUT: &str = "outbox_out";
 /// Cross-references between the two sides' ids.
 pub const KS_XREF: &str = "xref";
-/// Geb MLS state (M3).
-pub const KS_GEB_MLS: &str = "geb_mls";
-/// Geb pair ratchets (M2).
-pub const KS_RATCHETS: &str = "ratchets";
+/// Adapter-owned records, keyed `<ns>\0<key>` (the namespace starts with the
+/// adapter's kind).
+pub const KS_ADAPTER_STATE: &str = "adapter_state";
 
 /// Index of outbox entries not yet posted or retired (key to a marker).
 pub const KS_OUTBOX_PENDING: &str = "outbox_pending";
@@ -59,14 +56,12 @@ pub const KS_OUTBOX_PENDING: &str = "outbox_pending";
 pub const KS_RETENTION: &str = "retention";
 
 /// Every keyspace, in one place.
-pub const ALL_KEYSPACES: [&str; 9] = [
-    KS_LINKS,
+pub const ALL_KEYSPACES: [&str; 7] = [
     KS_CURSORS,
     KS_JOURNAL_IN,
     KS_OUTBOX_OUT,
     KS_XREF,
-    KS_GEB_MLS,
-    KS_RATCHETS,
+    KS_ADAPTER_STATE,
     KS_OUTBOX_PENDING,
     KS_RETENTION,
 ];
@@ -161,9 +156,7 @@ pub struct FjallStore {
     journal_in: KeyspaceHandle,
     outbox_out: KeyspaceHandle,
     xref: KeyspaceHandle,
-    links: KeyspaceHandle,
-    geb_mls: KeyspaceHandle,
-    ratchets: KeyspaceHandle,
+    adapter_state: KeyspaceHandle,
     outbox_pending: KeyspaceHandle,
     retention: KeyspaceHandle,
     clock: Clock,
@@ -184,9 +177,7 @@ impl FjallStore {
             journal_in: ks(KS_JOURNAL_IN)?,
             outbox_out: ks(KS_OUTBOX_OUT)?,
             xref: ks(KS_XREF)?,
-            links: ks(KS_LINKS)?,
-            geb_mls: ks(KS_GEB_MLS)?,
-            ratchets: ks(KS_RATCHETS)?,
+            adapter_state: ks(KS_ADAPTER_STATE)?,
             outbox_pending: ks(KS_OUTBOX_PENDING)?,
             retention: ks(KS_RETENTION)?,
             clock: Arc::new(system_secs),
@@ -315,21 +306,18 @@ impl FjallStore {
             .map_err(store_err)?;
         sync(&self.cursors).await
     }
+}
 
-    /// The `links` keyspace (adapter-owned from M2).
-    pub fn links(&self) -> &KeyspaceHandle {
-        &self.links
+/// The `adapter_state` key of `(ns, key)`. `ns` must name an adapter
+/// (`<kind>/<what>`) and, like `key`, must not hold the NUL separator, so two
+/// pairs can never share a key.
+fn state_key(ns: &str, key: &str) -> Result<Vec<u8>> {
+    if !ns.contains('/') || ns.contains('\0') || key.contains('\0') {
+        return Err(Error::Store(format!(
+            "adapter state namespace {ns:?} must be `<kind>/<name>` with no NUL"
+        )));
     }
-
-    /// The `geb_mls` keyspace (M3).
-    pub fn geb_mls(&self) -> &KeyspaceHandle {
-        &self.geb_mls
-    }
-
-    /// The `ratchets` keyspace (M2).
-    pub fn ratchets(&self) -> &KeyspaceHandle {
-        &self.ratchets
-    }
+    Ok(format!("{ns}\0{key}").into_bytes())
 }
 
 async fn sync(ks: &KeyspaceHandle) -> Result<()> {
@@ -578,23 +566,19 @@ impl BridgeStore for FjallStore {
         Ok(stats)
     }
 
-    async fn state_get(&self, space: StateSpace, key: &str) -> Result<Option<Vec<u8>>> {
-        let ks = match space {
-            StateSpace::Links => &self.links,
-            StateSpace::Ratchets => &self.ratchets,
-        };
-        ks.get_raw(key).await.map_err(store_err)
+    async fn state_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        self.adapter_state
+            .get_raw(state_key(ns, key)?)
+            .await
+            .map_err(store_err)
     }
 
-    async fn state_put(&self, space: StateSpace, key: &str, value: &[u8]) -> Result<()> {
-        let ks = match space {
-            StateSpace::Links => &self.links,
-            StateSpace::Ratchets => &self.ratchets,
-        };
-        ks.insert_raw(key, value.to_vec())
+    async fn state_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
+        self.adapter_state
+            .insert_raw(state_key(ns, key)?, value.to_vec())
             .await
             .map_err(store_err)?;
-        sync(ks).await
+        sync(&self.adapter_state).await
     }
 
     async fn xref_set(&self, a: &str, b: &str) -> Result<()> {
@@ -679,15 +663,12 @@ mod tests {
             assert!(s.journal_insert("j", &ev("a")).await.unwrap());
             assert!(!s.journal_insert("j", &ev("a")).await.unwrap());
             s.xref_set("vtc:a", "").await.unwrap();
-            s.state_put(StateSpace::Ratchets, "p", b"r1").await.unwrap();
-            s.state_put(StateSpace::Links, "p", b"l1").await.unwrap();
+            s.state_put("geb/ratchets", "p", b"r1").await.unwrap();
+            s.state_put("geb/links", "p", b"l1").await.unwrap();
         }
         let s = FjallStore::open(dir.path()).unwrap();
         assert_eq!(
-            s.state_get(StateSpace::Ratchets, "p")
-                .await
-                .unwrap()
-                .unwrap(),
+            s.state_get("geb/ratchets", "p").await.unwrap().unwrap(),
             b"r1"
         );
         assert_eq!(
@@ -701,10 +682,7 @@ mod tests {
         let unposted = s.outbox_unposted().await.unwrap();
         assert_eq!(unposted.len(), 1);
         assert_eq!(unposted[0].0, "k2");
-        assert_eq!(
-            s.state_get(StateSpace::Links, "p").await.unwrap().unwrap(),
-            b"l1"
-        );
+        assert_eq!(s.state_get("geb/links", "p").await.unwrap().unwrap(), b"l1");
         assert!(s.xref_has("vtc:a").await.unwrap());
         assert_eq!(s.xref_get("vtc:a").await.unwrap().as_deref(), Some(""));
         assert_eq!(s.xref_get("nope").await.unwrap(), None);
