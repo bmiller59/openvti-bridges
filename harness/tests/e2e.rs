@@ -57,7 +57,7 @@ use openvti_bridges::ops;
 use openvti_bridges::pump::TickReport;
 use openvti_bridges::room::PROVENANCE_OPEN;
 use openvti_bridges::run::{End, Health, LinkTick, Timing, supervise};
-use openvti_bridges::store::{BridgeStore, StateSpace};
+use openvti_bridges::store::BridgeStore;
 use openvti_bridges::wiring::{LinkInputs, LinkParts, assemble};
 use openvti_bridges::{Error, Result};
 
@@ -506,7 +506,7 @@ async fn the_whole_stack_connects_seats_relays_and_survives_restarts() {
     // --- state at rest: the ratchet record and the MLS files are sealed.
     let raw = p
         .store
-        .state_get(StateSpace::Ratchets, &a_did)
+        .state_get("geb/ratchets", &a_did)
         .await
         .unwrap()
         .expect("a ratchet record exists");
