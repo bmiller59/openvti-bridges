@@ -54,7 +54,7 @@ fn hkdf32(salt: Option<&[u8]>, ikm: &[u8], info: &[u8]) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-const SALT: &[u8] = b"vti-geb-bridge/at-rest/v1";
+const SALT: &[u8] = b"openvti-bridges/at-rest/v1";
 
 /// A purpose-bound at-rest key.
 #[derive(Clone)]
