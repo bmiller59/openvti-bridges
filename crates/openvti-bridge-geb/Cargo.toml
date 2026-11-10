@@ -1,0 +1,76 @@
+[package]
+name = "openvti-bridge-geb"
+description = "The Geb adapter for the openvti bridges (Geb path B over Nostr, MLS via OpenMLS)"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# The live Nostr client (`nostr`) and the in-process test relay (`test_relay`).
+# Off by default: it pulls a websocket stack. Nothing here connects anywhere by
+# itself; the only plaintext `ws://` accepted is 127.0.0.1.
+live = [
+  "dep:tokio-tungstenite",
+  "dep:futures-util",
+  "dep:url",
+  "tokio/net",
+  "tokio/time",
+  "tokio/rt",
+  "tokio/macros",
+  "tokio/sync",
+]
+# The Geb-side MLS client (`mls`, OpenMLS 0.9): the `GebGroup` that replaces
+# `UnsupportedGroup`. Off by default so the default build stays fail-closed and
+# compiles no MLS stack. Tested only against an in-process second OpenMLS
+# client; no test reaches a relay or a Geb node.
+mls = [
+  "dep:openmls",
+  "dep:openmls_rust_crypto",
+  "dep:openmls_basic_credential",
+  "dep:openmls_traits",
+  "dep:tls_codec",
+]
+# Test support for other crates and the harness: the in-process second MLS client
+# (`mls::sim`), which the adapter's own tests always have.
+harness = ["mls"]
+
+[dependencies]
+openvti-bridge-core = { path = "../openvti-bridge-core" }
+tokio = { version = "1.49", features = ["sync", "time", "rt", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_json_canonicalizer = "0.4"
+async-trait = "0.1"
+tracing = "0.1"
+sha2 = "0.11"
+hkdf = "0.13"
+aes-gcm = "0.11"
+chacha20poly1305 = "0.11"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+ed25519-dalek = "3"
+k256 = { version = "0.14", features = ["arithmetic", "schnorr"] }
+base64 = "0.23"
+multibase = "0.9"
+hex = "0.4"
+rand = "0.10"
+zeroize = "1"
+tokio-tungstenite = { version = "0.30", features = ["connect", "rustls-tls-native-roots"], optional = true }
+futures-util = { version = "0.3", optional = true }
+url = { version = "2", optional = true }
+openmls = { version = "0.9", optional = true }
+openmls_rust_crypto = { version = "0.6", optional = true }
+openmls_basic_credential = { version = "0.6", optional = true }
+openmls_traits = { version = "0.6", optional = true }
+tls_codec = { version = "0.5", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.49", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+futures-util = "0.3"
+
+[lints]
+workspace = true

@@ -31,12 +31,12 @@
 //!   were at when the re-seat arrived (at most 100).
 
 use super::*;
-use crate::geb::settle::Held;
-use crate::geb::status::{
+use crate::settle::Held;
+use crate::status::{
     ChainEntry, Comparison, Holding, MAX_CHAIN, MAX_CHAIN_SENT, RoomStatus, compare_status,
     fork_mine_wins,
 };
-use crate::geb::wire::LineBody;
+use crate::wire::LineBody;
 use std::collections::{BTreeMap, HashSet};
 
 /// Prefix of the error for a Welcome whose KeyPackage we no longer hold.
@@ -532,9 +532,9 @@ impl MlsGroupClient {
                         .collect();
                     let (we_won, why) = fork_mine_wins(hash_wins, mine.e, theirs.e, &others);
                     let reason = match why {
-                        crate::geb::status::ForkReason::BehindAll => "behind-all",
-                        crate::geb::status::ForkReason::TheyBehindAll => "they-behind-all",
-                        crate::geb::status::ForkReason::Hash => "hash",
+                        crate::status::ForkReason::BehindAll => "behind-all",
+                        crate::status::ForkReason::TheyBehindAll => "they-behind-all",
+                        crate::status::ForkReason::Hash => "hash",
                     };
                     let at_ms = match &heal.p.split {
                         Some(s) if s.epoch == epoch && s.peer == peer && !s.resolved => s.at_ms,
@@ -700,7 +700,7 @@ impl MlsGroupClient {
             if !matches!(g.state, State::Seated(_) | State::Reseating(_)) {
                 return;
             }
-            let wid = crate::geb::crypto::frame_id::frame_id(w);
+            let wid = crate::crypto::frame_id::frame_id(w);
             if g.heal.p.last_welcome.as_deref() == Some(wid.as_str()) {
                 tracing::debug!("a Welcome already applied came again (redelivery); skipped");
                 return;
@@ -743,7 +743,7 @@ impl MlsGroupClient {
     /// when the record differs. A failed write is logged and never fails the
     /// caller; the marker is informational.
     pub(super) async fn sync_fork_marker(&self) {
-        use crate::geb::forkmark::{self, ForkMarker, ForkState};
+        use crate::forkmark::{self, ForkMarker, ForkState};
         let Some((store, link)) = &self.fork_sink else {
             return;
         };

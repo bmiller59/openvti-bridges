@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/openvti-bridges"]
+members = [
+  "crates/openvti-bridge-core",
+  "crates/openvti-bridge-vtc",
+  "crates/openvti-bridge-geb",
+  "crates/openvti-bridges",
+]
 
 [workspace.package]
 edition = "2024"

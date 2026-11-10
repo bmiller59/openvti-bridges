@@ -10,123 +10,37 @@ repository.workspace = true
 
 [features]
 default = []
-# The VTC room side and the durable store: `vtc::VtcRoom` (a `RoomSide` over
-# `VtaClient`) and `fjall_store::FjallStore` (a `BridgeStore` over
-# `vti_common::store`). Off by default so the Geb core, which needs none of
-# any VTI crate, builds and tests without compiling `vta-sdk`, the generated
-# Trust Task crates or fjall. The pump never needs it: it talks to the
-# `RoomSide` and `BridgeStore` traits.
-vtc = [
-  "dep:vta-sdk",
-  "dep:vti-common",
-  "dep:vti-specs",
-  "dep:trust-tasks-rs",
-  "dep:reqwest",
-  "dep:chrono",
-  "dep:tokio",
-  "dep:vti-secrets",
-]
-
-# The live Nostr client (`geb::nostr`) and the in-process test relay
-# (`geb::test_relay`). Off by default: it pulls a websocket stack. Nothing here
-# connects anywhere by itself; the only plaintext `ws://` accepted is 127.0.0.1.
-geb-live = [
-  "dep:tokio-tungstenite",
-  "dep:futures-util",
-  "dep:url",
-  "dep:tokio",
-  "tokio/net",
-  "tokio/time",
-  "tokio/rt",
-  "tokio/macros",
-  "tokio/sync",
-]
-
-# The Geb-side MLS client (`geb::mls`, OpenMLS 0.9): the `GebGroup` that
-# replaces `UnsupportedGroup`. Off by default so the default build stays
-# fail-closed and compiles no MLS stack. Tested only against an in-process
-# second OpenMLS client; no test reaches a relay or a Geb node.
-geb-mls = [
-  "dep:openmls",
-  "dep:openmls_rust_crypto",
-  "dep:openmls_basic_credential",
-  "dep:openmls_traits",
-  "dep:tls_codec",
-]
-
-# The OS keyring as the secret store (the default for the VTA, VTC and witness).
-# The binary must register a platform store at startup; it does when built
-# with this feature. Without it, `[secrets]` must name another backend.
-keyring = ["vtc", "vti-secrets/keyring", "vta-sdk/keyring"]
-
-# The `openvti-bridges` binary and its library surface (`cli`, `setup`, `service`).
-# A feature, not a default.
-cli = [
-  "vtc",
-  "geb-live",
-  "geb-mls",
-  "dep:clap",
-  "dep:tracing-subscriber",
-  "vta-sdk/provision-client",
-  "vta-sdk/crypto-provider",
-]
-
-# Test support for the tests that need no room host: `HostDelivery::for_loopback_tests`, the
-# in-process MLS `sim`, and `vta-sdk`'s loopback sink for `tests/custody.rs` and
-# `tests/cli.rs`. The tests that need a real `room-host` are the separate `harness/` package
-# (not a member of this crate, because `room-host` is not published; see its Cargo.toml).
-harness = [
-  "vtc",
-  "vta-sdk/test-loopback",
-]
+# Test support for the tests that need no room host: `HostDelivery::for_loopback_tests`
+# and `vta-sdk`'s loopback sink for `tests/custody.rs` and `tests/cli.rs`. The tests
+# that need a real `room-host` are the separate `harness/` package.
+harness = ["openvti-bridge-vtc/harness", "openvti-bridge-geb/harness", "vta-sdk/test-loopback"]
+# The OS keyring as the secret store. The binary registers a platform store at startup
+# when built with this feature.
+keyring = ["openvti-bridge-vtc/keyring", "vti-secrets/keyring", "vta-sdk/keyring"]
 
 [[bin]]
 name = "openvti-bridges"
 path = "src/main.rs"
-required-features = ["cli"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"], optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
-vta-sdk = { version = "0.85", features = ["client"], optional = true }
-vti-common = { version = "0.61", optional = true }
-vti-specs = { version = "0.10", optional = true }
-# Key custody (`custody`): the bridge's own secret store, behind the same
-# backends and feature names the VTA, VTC and witness use.
-vti-secrets = { version = "0.34", optional = true }
-trust-tasks-rs = { version = "0.37.2", default-features = false, features = ["validate"], optional = true }
-reqwest = { version = "0.13", features = ["json"], optional = true }
-chrono = { version = "0.4", features = ["serde"], optional = true }
-tokio = { version = "1.49", optional = true, features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+openvti-bridge-core = { path = "../openvti-bridge-core" }
+openvti-bridge-vtc = { path = "../openvti-bridge-vtc" }
+# TEMPORARY: the shell still names Geb directly; it becomes an optional, registered kind.
+openvti-bridge-geb = { path = "../openvti-bridge-geb", features = ["live", "mls"] }
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+vta-sdk = { version = "0.85", features = ["client", "provision-client", "crypto-provider"] }
+vti-secrets = "0.34"
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_json_canonicalizer = "0.4"
 toml = "1"
-thiserror = "2"
-async-trait = "0.1"
 tracing = "0.1"
-sha2 = "0.11"
-hmac = "0.13"
-hkdf = "0.13"
-aes-gcm = "0.11"
-chacha20poly1305 = "0.11"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 ed25519-dalek = "3"
-k256 = { version = "0.14", features = ["arithmetic", "schnorr"] }
-base64 = "0.23"
 multibase = "0.9"
-hex = "0.4"
 rand = "0.10"
 zeroize = "1"
-tokio-tungstenite = { version = "0.30", features = ["connect", "rustls-tls-native-roots"], optional = true }
-futures-util = { version = "0.3", optional = true }
-url = { version = "2", optional = true }
-# Own MLS stack for `geb-mls`: this crate does not depend on `vti-rooms`.
-openmls = { version = "0.9", optional = true }
-openmls_rust_crypto = { version = "0.6", optional = true }
-openmls_basic_credential = { version = "0.6", optional = true }
-openmls_traits = { version = "0.6", optional = true }
-tls_codec = { version = "0.5", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

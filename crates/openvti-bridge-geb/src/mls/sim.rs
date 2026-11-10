@@ -7,13 +7,13 @@
 
 use super::identity::{SUITE, leaf_capabilities};
 use crate::Result;
-use crate::geb::codec::GuideCodec;
-use crate::geb::crypto::rendezvous::RelayKeys;
-use crate::geb::crypto::{b64_encode, did_peer, leaf, pair, sign};
-use crate::geb::room::KIND_MAILBOX;
-use crate::geb::settle::commit_hash;
-use crate::geb::traits::{GebCodec, GebDyad, GebRelay, RelayEvent};
-use crate::geb::wire::{Envelope, Frame, GroupOp, LineBody, RoomInfo, signing_doc};
+use crate::codec::GuideCodec;
+use crate::crypto::rendezvous::RelayKeys;
+use crate::crypto::{b64_encode, did_peer, leaf, pair, sign};
+use crate::room::KIND_MAILBOX;
+use crate::settle::commit_hash;
+use crate::traits::{GebCodec, GebDyad, GebRelay, RelayEvent};
+use crate::wire::{Envelope, Frame, GroupOp, LineBody, RoomInfo, signing_doc};
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use openmls::prelude::*;
@@ -642,7 +642,7 @@ pub async fn post(relay: &Arc<dyn GebRelay>, keys: &RelayKeys, env: &Envelope, c
         &keys.nostr_secret,
         KIND_MAILBOX,
         created_at,
-        crate::geb::event::standard_tags(created_at),
+        crate::event::standard_tags(created_at),
         content,
     )
     .unwrap();

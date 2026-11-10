@@ -1,57 +1,23 @@
-//! Experimental … foreign room.
+//! The `openvti-bridges` shell: the operator CLI, setup, the supervisor service
+//! and the assembly of a running link from the core, the VTI side and an
+//! adapter.
 //!
-//! The core (`config`, `model`, `foreign`, `mapping`, `room`, `store`, `pump`)
-//! knows nothing about any foreign system: it talks to one seam,
-//! [`foreign::ForeignRoom`], and reads what that adapter can do from
-//! [`foreign::RoomCapabilities`]. Everything specific to a foreign system lives
-//! in an adapter module. The first is [`geb`]; [`loopback`] is a trivial
-//! in-memory adapter that proves the core is adapter-agnostic.
-//!
-//! The Geb side is a foreign-protocol interface (workspace `CLAUDE.md`,
-//! exceptions to "every remote operation is a Trust Task"). Geb path B has no
-//! versioned specification: the adapter pins to Geb's answers
-//! (`Geb's path B answers, round 1` and round 2 to round 4: rounds 1 to 4, read
-//! at release 0.5.15, commit `fdf804d`; the fixture vectors were generated at
-//! release 0.5.14 (round 1) and the round 2 reading (round 2), see [`geb::status_line`]) and
-//! fails closed on anything it does not recognise.
-//!
-//! Status: experimental. M0, M1 (the VTC room side and the durable store, behind
-//! feature `vtc`), M2 (the stateful dyad, the Nostr client behind `geb-live`,
-//! tested only offline), and the offline groundwork of M3 (the settle rule, the
-//! commit check and, behind `geb-mls`, the Geb-side MLS client; tested only
-//! against an in-process second OpenMLS client).
+//! Experimental. The crate re-exports the modules that used to live here so
+//! existing paths (`openvti_bridges::pump`, `::geb`) keep resolving while the
+//! shell is made adapter-neutral; the re-exports go when the registry lands.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-pub mod atrest;
-#[cfg(feature = "cli")]
 pub mod cli;
-pub mod config;
-#[cfg(feature = "vtc")]
-pub mod custody;
-pub mod error;
-#[cfg(feature = "vtc")]
-pub mod fjall_store;
-pub mod foreign;
-pub mod geb;
-pub mod halt;
-pub mod loopback;
-pub mod mapping;
-pub mod model;
-#[cfg(all(feature = "vtc", feature = "geb-mls"))]
 pub mod ops;
-pub mod pause;
-pub mod pump;
-pub mod room;
-#[cfg(feature = "vtc")]
-pub mod run;
-#[cfg(feature = "cli")]
 pub mod service;
-pub mod store;
-#[cfg(feature = "vtc")]
-pub mod vtc;
-#[cfg(all(feature = "vtc", feature = "geb-mls"))]
 pub mod wiring;
 
-pub use error::{Error, Result};
+pub use openvti_bridge_core::{
+    Error, Result, atrest, config, error, foreign, halt, loopback, mapping, model, pause, pump,
+    room, run, store,
+};
+pub use openvti_bridge_geb as geb;
+pub use openvti_bridge_vtc as vtc;
+pub use openvti_bridge_vtc::{custody, fjall_store};

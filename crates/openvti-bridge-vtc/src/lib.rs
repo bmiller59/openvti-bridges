@@ -22,13 +22,19 @@
 //! re-seal at the version the host assigned, which is a different request, not
 //! a retry.
 
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod custody;
+pub mod fjall_store;
 pub mod host;
 
-use crate::room::{PutOutcome, RecordWrite, RoomRecord, RoomSide, SkippedRecord};
-use crate::{Error, Result};
+pub use openvti_bridge_core::{Error, Result};
+
 use async_trait::async_trait;
 use base64::Engine;
 use host::{HostDelivery, from_vta, is_version_conflict};
+use openvti_bridge_core::room::{PutOutcome, RecordWrite, RoomRecord, RoomSide, SkippedRecord};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::OnceCell;

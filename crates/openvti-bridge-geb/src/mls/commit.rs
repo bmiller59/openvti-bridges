@@ -6,7 +6,7 @@
 //! Geb's `validCommit` needs persona cards ("same person"), which the bridge
 //! does not hold; the signed leaves (`{t:"lv"}` lines, dyad `leave` frames) it
 //! does take (`geb::leave`). With the production inputs
-//! ([`NoLocalKnowledge`](crate::geb::policy::NoLocalKnowledge) plus the held
+//! ([`NoLocalKnowledge`](crate::policy::NoLocalKnowledge) plus the held
 //! signed leaves, `can_evaluate() == false`) this module merges a commit
 //! **only if all of**:
 //!
@@ -67,11 +67,11 @@
 //! group with inputs whose `can_evaluate` is false AND do not call `settle`,
 //! or leave the `geb-mls` feature off (the default).
 
-use crate::geb::crypto::{did_peer, leaf};
-use crate::geb::policy::{
+use crate::crypto::{did_peer, leaf};
+use crate::policy::{
     CommitCheckInputs, CommitFacts, CommitVerdict, RoomPolicy, parse_policy, valid_commit,
 };
-use crate::geb::settle::{Candidate, CommitHash, Judge, Verdict};
+use crate::settle::{Candidate, CommitHash, Judge, Verdict};
 use openmls::prelude::*;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use std::collections::HashMap;
@@ -223,7 +223,7 @@ pub struct GroupJudge<'a> {
     /// candidate that is looked at again on a later poll must not be
     /// processed again: its first verdict stands.
     cache: &'a mut HashMap<CommitHash, Verdict>,
-    staged: Option<(crate::geb::settle::CommitHash, Box<StagedCommit>)>,
+    staged: Option<(crate::settle::CommitHash, Box<StagedCommit>)>,
     /// The bytes of the candidate that was merged (kept to answer a lagging
     /// peer with `rc`).
     pub merged_bytes: Option<Vec<u8>>,
@@ -449,10 +449,10 @@ pub fn parse_welcome(bytes: &[u8]) -> Result<Welcome, String> {
 /// `MLSMessage`-wrapped KeyPackage or trailing bytes fail). The result is not
 /// yet validated (signature, lifetime): that needs a crypto provider.
 pub fn parse_key_package(b64: &str) -> Result<KeyPackageIn, String> {
-    if !crate::geb::wire::is_std_b64(b64) {
+    if !crate::wire::is_std_b64(b64) {
         return Err("a KeyPackage is standard base64 (^[A-Za-z0-9+/=]+$)".into());
     }
-    let bytes = crate::geb::crypto::b64_decode(b64).map_err(|e| e.to_string())?;
+    let bytes = crate::crypto::b64_decode(b64).map_err(|e| e.to_string())?;
     KeyPackageIn::tls_deserialize_exact(&bytes)
         .map_err(|_| "not a bare KeyPackage (an MLSMessage wrapper or trailing bytes)".to_string())
 }

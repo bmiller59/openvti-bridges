@@ -1,0 +1,52 @@
+[package]
+name = "openvti-bridge-vtc"
+description = "VTI side of the openvti bridges: the VTC room side, HTTPS delivery to the room host, the durable fjall store and key custody"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# The OS keyring as the secret store (the default for the VTA, VTC and witness).
+# The binary must register a platform store at startup; it does when built
+# with this feature. Without it, `[secrets]` must name another backend.
+keyring = ["vti-secrets/keyring", "vta-sdk/keyring"]
+# Test support for the tests that need no room host: `HostDelivery::for_loopback_tests`
+# and `vta-sdk`'s loopback sink. The tests that need a real `room-host` are the separate
+# `harness/` package (`room-host` is not published; see its Cargo.toml).
+harness = ["vta-sdk/test-loopback"]
+
+[dependencies]
+openvti-bridge-core = { path = "../openvti-bridge-core" }
+# TEMPORARY (removed when custody is split): custody still names Geb's identity types.
+openvti-bridge-geb = { path = "../openvti-bridge-geb" }
+vta-sdk = { version = "0.85", features = ["client"] }
+vti-common = "0.61"
+vti-specs = "0.10"
+# Key custody (`custody`): the bridge's own secret store, behind the same
+# backends and feature names the VTA, VTC and witness use.
+vti-secrets = "0.34"
+trust-tasks-rs = { version = "0.37.2", default-features = false, features = ["validate"] }
+reqwest = { version = "0.13", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+async-trait = "0.1"
+tracing = "0.1"
+ed25519-dalek = "3"
+base64 = "0.23"
+multibase = "0.9"
+hex = "0.4"
+rand = "0.10"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.49", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

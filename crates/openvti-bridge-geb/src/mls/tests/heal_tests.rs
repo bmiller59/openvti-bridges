@@ -4,8 +4,8 @@
 //! client. Self-consistency only: no Geb node is involved.
 
 use super::*;
-use crate::geb::crypto::line_id::line_id;
-use crate::geb::status::{ChainEntry, RoomStatus};
+use crate::crypto::line_id::line_id;
+use crate::status::{ChainEntry, RoomStatus};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
@@ -177,7 +177,7 @@ async fn an_rs_with_no_valid_body_is_dropped_and_a_non_member_rs_is_dropped() {
         r#"{"k":"g","op":"rs","room":{"id":"geb-room-0001"}}"#,
         r#"{"k":"g","op":"rs","room":{"id":"geb-room-0001"},"s":{"e":1,"a":"zz","chain":[]}}"#,
     ] {
-        let f = crate::geb::wire::parse_frame(bad.as_bytes()).unwrap();
+        let f = crate::wire::parse_frame(bad.as_bytes()).unwrap();
         assert!(matches!(f, Frame::Group(GroupOp::Rs { s: None, .. })));
         w.bus.put(&w.a.did, &w.our_did, f);
     }
@@ -619,7 +619,7 @@ async fn a_reseat_welcome_replaces_the_group_and_our_dead_branch_lines_are_repos
             continue;
         };
         if let Ok(Envelope::Ml { m }) = serde_json::from_slice(&b) {
-            let raw = crate::geb::crypto::b64_decode(&m).unwrap();
+            let raw = crate::crypto::b64_decode(&m).unwrap();
             if let Some((who, line)) = w.a.open_line(&raw)
                 && who == w.our_did
             {
@@ -716,7 +716,7 @@ async fn a_welcome_that_is_not_a_reseat_of_us_is_ignored_and_the_old_group_stays
                 Frame::Group(GroupOp::Welcome { room, .. }) => room,
                 _ => unreachable!(),
             },
-            &crate::geb::crypto::b64_encode(&welcome),
+            &crate::crypto::b64_encode(&welcome),
         )
         .await;
     assert_eq!(w.client.reseats(), 0);
@@ -739,7 +739,7 @@ async fn a_welcome_for_a_package_we_no_longer_hold_is_answered_with_a_bound_seat
     let asks = seat_asks(&sent(&w));
     assert_eq!(asks.len(), 1);
     let kp = asks[0].clone().expect("with a fresh bound KeyPackage");
-    assert!(crate::geb::wire::is_std_b64(&kp));
+    assert!(crate::wire::is_std_b64(&kp));
     assert_eq!(
         binding_status(parse_kp(&kp).leaf_node()),
         BindingStatus::Verified
@@ -879,7 +879,7 @@ async fn own_lines_are_kept_bounded_to_100() {
 
 #[tokio::test]
 async fn a_recorded_split_is_mirrored_in_the_unsealed_marker() {
-    use crate::geb::forkmark::{self, ForkState};
+    use crate::forkmark::{self, ForkState};
     let (w, b_status) = forked_world().await;
     assert_eq!(
         forkmark::read(&*w.marks).await.unwrap(),
@@ -913,7 +913,7 @@ async fn a_recorded_split_is_mirrored_in_the_unsealed_marker() {
 
 #[tokio::test]
 async fn accepting_a_reseat_welcome_marks_the_split_reseated() {
-    use crate::geb::forkmark::{self, ForkState};
+    use crate::forkmark::{self, ForkState};
     let mut w = World::build(Arc::new(AllKnown), "");
     let kps = w.seat_raw().await;
     sent(&w);

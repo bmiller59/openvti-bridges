@@ -19,8 +19,8 @@
 //!   record stays, in this state, until a later split replaces it, so `status`
 //!   shows that the last split was resolved and when.
 
-use crate::store::BridgeStore;
 use crate::{Error, Result};
+use openvti_bridge_core::store::BridgeStore;
 use serde::{Deserialize, Serialize};
 
 /// The marker's name (a cursor of the link's store).
@@ -112,7 +112,7 @@ pub async fn write(store: &dyn BridgeStore, m: &ForkMarker) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemoryStore;
+    use openvti_bridge_core::store::MemoryStore;
 
     fn marker(state: ForkState) -> ForkMarker {
         ForkMarker {

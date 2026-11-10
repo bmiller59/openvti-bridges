@@ -25,7 +25,7 @@ pub fn inbox_pubkey(recipient_e_pub: &[u8; 32]) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geb::crypto::kdf::hkdf32;
+    use crate::crypto::kdf::hkdf32;
 
     #[test]
     fn matches_an_independent_derivation_from_the_guide_text() {

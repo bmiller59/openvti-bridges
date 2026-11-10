@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! The Geb adapter: everything specific to Geb path B lives under here, and
 //! the bridge core sees only [`room::GebRoom`] as a `ForeignRoom`.
 //!
@@ -8,10 +11,10 @@
 //! release 0.5.14 for round 1 and the round 2 reading for round 2). They supersede the
 //! implementer's guide (`Geb's implementer's guide (2026-11-07)`) where they differ. Not
 //! built by default (M3): the MLS group stays `UnsupportedGroup` and returns
-//! `Error::Unsupported`; feature `geb-mls` adds `mls::MlsGroupClient`, the
+//! `Error::Unsupported`; feature `mls` adds `mls::MlsGroupClient`, the
 //! settle rule ([`settle`]) and the commit check ([`policy::valid_commit`],
 //! which needs persona cards and signed leaves the bridge lacks). The stateful dyad is [`dyad`]; the Nostr client
-//! (`nostr`, feature `geb-live`) and the event primitives ([`event`]) exist.
+//! (`nostr`, feature `live`) and the event primitives ([`event`]) exist.
 //!
 //! Bridges are welcome in Geb rooms with no marking required by default. Geb
 //! will later define room-level bridge policy (not welcome / welcome
@@ -44,7 +47,9 @@ mod tests {
     }
 }
 
-#[cfg(feature = "geb-mls")]
+pub use openvti_bridge_core::{Error, Result};
+
+#[cfg(feature = "mls")]
 mod atrest_mls;
 pub mod codec;
 pub mod crypto;
@@ -53,15 +58,15 @@ pub mod event;
 pub mod fake;
 pub mod forkmark;
 pub mod leave;
-#[cfg(feature = "geb-mls")]
+#[cfg(feature = "mls")]
 pub mod mls;
-#[cfg(feature = "geb-live")]
+#[cfg(feature = "live")]
 pub mod nostr;
 pub mod policy;
 pub mod room;
 pub mod settle;
 pub mod status;
-#[cfg(feature = "geb-live")]
+#[cfg(feature = "live")]
 pub mod test_relay;
 pub mod traits;
 pub mod vrc;

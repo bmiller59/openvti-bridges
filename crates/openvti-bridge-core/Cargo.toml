@@ -1,0 +1,33 @@
+[package]
+name = "openvti-bridge-core"
+description = "Bridge-neutral core of the openvti bridges: the foreign-room seam, the pump, mapping, halts, pause and at-rest sealing (no VTI crates, no network)"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+sha2 = "0.11"
+hmac = "0.13"
+hkdf = "0.13"
+chacha20poly1305 = "0.11"
+base64 = "0.23"
+hex = "0.4"
+rand = "0.10"
+zeroize = "1"
+tokio = { version = "1.49", features = ["macros", "sync", "time", "rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.49", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

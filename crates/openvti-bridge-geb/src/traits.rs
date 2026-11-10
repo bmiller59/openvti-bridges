@@ -107,7 +107,7 @@ pub struct SettleReport {
 pub trait GebGroup: Send + Sync {
     /// Be seated in the room: stock KeyPackages or answer `kp-req` over a
     /// dyad, then accept the Welcome. Idempotent once seated.
-    async fn ensure_seated(&self) -> Result<crate::foreign::JoinState>;
+    async fn ensure_seated(&self) -> Result<openvti_bridge_core::foreign::JoinState>;
     /// Leave.
     async fn leave(&self) -> Result<()>;
     /// Relay keys of the current epoch.

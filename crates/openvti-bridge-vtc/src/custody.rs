@@ -1,4 +1,4 @@
-//! Identity and key custody (plan section 4), behind feature `vtc`.
+//! Identity and key custody (plan section 4).
 //!
 //! Two identities per link, never linked:
 //!
@@ -18,7 +18,7 @@
 //! dyad's key agreement (plan section 4).
 //!
 //! The secret store holds one blob, [`BridgeSecrets`]: a 32-byte *store key*
-//! (from which [`crate::atrest`] derives the at-rest keys for ratchet, MLS and
+//! (from which [`openvti_bridge_core::atrest`] derives the at-rest keys for ratchet, MLS and
 //! signature-key state) and one [`LinkSecrets`] per link. Nothing here ever
 //! prints a secret: `Debug` is hand-written and names only DIDs and key ids.
 //!
@@ -36,10 +36,10 @@
 //! real VTA's encoding of that field (raw or multicodec-prefixed) is accepted
 //! both ways but not observed.
 
-use crate::geb::crypto::{did_peer, x25519_public};
-use crate::geb::dyad::GebIdentity;
 use crate::{Error, Result};
 use ed25519_dalek::SigningKey;
+use openvti_bridge_geb::crypto::{did_peer, x25519_public};
+use openvti_bridge_geb::dyad::GebIdentity;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use vta_sdk::client::{CreateKeyRequest, VtaClient};
@@ -139,7 +139,7 @@ impl LinkSecrets {
         let ed = self.ed_secret.to_32()?;
         let x = self.x_secret.to_32()?;
         let id = GebIdentity::new(SigningKey::from_bytes(&ed), *x)?;
-        use crate::geb::traits::GebSigner;
+        use openvti_bridge_geb::traits::GebSigner;
         if id.did() != self.device_did {
             return Err(Error::Crypto(
                 "the stored keys do not produce the stored device DID".into(),
@@ -307,7 +307,7 @@ impl SecretStore {
     /// Open the backend `[secrets]` selects. Refuses `config_seed` (it keeps
     /// the key in `config.toml`).
     pub fn open(
-        secrets: &crate::config::SecretsConfig,
+        secrets: &openvti_bridge_core::config::SecretsConfig,
         data_dir: &std::path::Path,
     ) -> Result<Self> {
         let cfg: vti_secrets::SecretsConfig = toml::Value::Table(secrets.0.clone())

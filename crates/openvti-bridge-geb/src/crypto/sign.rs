@@ -1,7 +1,7 @@
 //! `sign_json`: Ed25519 over the RFC 8785 (JCS) form, base64url without
 //! padding.
 
-use crate::geb::traits::GebSigner;
+use crate::traits::GebSigner;
 use crate::{Error, Result};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

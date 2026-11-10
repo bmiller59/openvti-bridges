@@ -57,10 +57,10 @@ use super::wire::{
     COMPLETION_TYPE, Envelope, Frame, GroupOp, INVITATION_TYPE, Invitation, InvitePayload,
     MAX_ACK_IDS, MAX_EVENT_BYTES, RESPONSE_TYPE, VrcCompletion, VrcResponse, is_nonce, parse_frame,
 };
-use crate::store::{BridgeStore, StateSpace};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
+use openvti_bridge_core::store::{BridgeStore, StateSpace};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -213,7 +213,7 @@ pub struct PendingMeta {
 /// Most frames sent and not yet acked. Beyond it we stop sending to that peer
 /// (see [`PEER_BEHIND`]) and never drop an unacked frame.
 ///
-/// Why: a receiver keeps 512 skipped message keys ([`MAX_SKIPPED`](super::crypto::crate::geb::crypto::ratchet::MAX_SKIPPED))
+/// Why: a receiver keeps 512 skipped message keys ([`MAX_SKIPPED`](super::crypto::crate::crypto::ratchet::MAX_SKIPPED))
 /// and Geb applies a cooldown to a jump of more than 512 counters (answers
 /// round 3 section 6, "do not run hundreds of frames ahead of an offline
 /// peer"). Capping the unacked frames, and the counter span from the oldest
@@ -1250,8 +1250,8 @@ impl GebDyad for StatefulDyad {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geb::fake::FakeRelay;
-    use crate::store::MemoryStore;
+    use crate::fake::FakeRelay;
+    use openvti_bridge_core::store::MemoryStore;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     const T0: u64 = 1_700_000_000;
@@ -1831,19 +1831,36 @@ mod tests {
         async fn set_cursor(&self, n: &str, v: &[u8]) -> Result<()> {
             self.inner.set_cursor(n, v).await
         }
-        async fn journal_insert(&self, k: &str, e: &crate::model::BridgeEvent) -> Result<bool> {
+        async fn journal_insert(
+            &self,
+            k: &str,
+            e: &openvti_bridge_core::model::BridgeEvent,
+        ) -> Result<bool> {
             self.inner.journal_insert(k, e).await
         }
-        async fn outbox_insert(&self, k: &str, e: &crate::model::BridgeEvent) -> Result<bool> {
+        async fn outbox_insert(
+            &self,
+            k: &str,
+            e: &openvti_bridge_core::model::BridgeEvent,
+        ) -> Result<bool> {
             self.inner.outbox_insert(k, e).await
         }
-        async fn outbox_mark(&self, k: &str, r: crate::foreign::Receipt) -> Result<()> {
+        async fn outbox_mark(
+            &self,
+            k: &str,
+            r: openvti_bridge_core::foreign::Receipt,
+        ) -> Result<()> {
             self.inner.outbox_mark(k, r).await
         }
-        async fn outbox_receipt(&self, k: &str) -> Result<Option<crate::foreign::Receipt>> {
+        async fn outbox_receipt(
+            &self,
+            k: &str,
+        ) -> Result<Option<openvti_bridge_core::foreign::Receipt>> {
             self.inner.outbox_receipt(k).await
         }
-        async fn outbox_unposted(&self) -> Result<Vec<(String, crate::model::BridgeEvent)>> {
+        async fn outbox_unposted(
+            &self,
+        ) -> Result<Vec<(String, openvti_bridge_core::model::BridgeEvent)>> {
             self.inner.outbox_unposted().await
         }
         async fn xref_set(&self, a: &str, b: &str) -> Result<()> {
@@ -2043,9 +2060,9 @@ mod tests {
         }
         assert!(stopped, "the span from the lost frame stops the sender");
         assert!(
-            sent < crate::geb::crypto::ratchet::MAX_SKIPPED,
+            sent < crate::crypto::ratchet::MAX_SKIPPED,
             "{sent} frames sent past a lost one; the receiver keeps {} skipped keys",
-            crate::geb::crypto::ratchet::MAX_SKIPPED
+            crate::crypto::ratchet::MAX_SKIPPED
         );
         // The lost frame is reposted and the peer still opens it.
         w.now.fetch_add(REPOST_AFTER_SECS, Ordering::SeqCst);

@@ -3,8 +3,8 @@
 //! the traits are Geb's; the core's `atrest` knows nothing of them.
 
 use super::mls::{GroupStateStore, SignatureKeyVault};
-use crate::atrest::SealedFile;
 use crate::{Error, Result};
+use openvti_bridge_core::atrest::SealedFile;
 
 impl GroupStateStore for SealedFile {
     fn load(&self) -> Result<Option<Vec<u8>>> {
@@ -41,7 +41,7 @@ mod tests {
     #[test]
     fn the_signature_key_vault_and_state_file_refuse_the_wrong_key_and_tampering() {
         use super::*;
-        use crate::atrest::AtRestKey;
+        use openvti_bridge_core::atrest::AtRestKey;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sig.enc");
         let vault = SealedFile::new(

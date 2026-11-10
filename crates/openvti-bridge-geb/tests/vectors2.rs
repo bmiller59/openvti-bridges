@@ -13,11 +13,11 @@
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use openvti_bridges::geb::crypto::{b64_decode, b64_encode, did_peer, leaf, rendezvous, sign};
-use openvti_bridges::geb::settle::{
+use openvti_bridge_geb::crypto::{b64_decode, b64_encode, did_peer, leaf, rendezvous, sign};
+use openvti_bridge_geb::settle::{
     Candidate, Held, Judge, Outcome, SettleQueue, Verdict, commit_hash,
 };
-use openvti_bridges::geb::vrc;
+use openvti_bridge_geb::vrc;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 

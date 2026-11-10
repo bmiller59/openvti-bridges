@@ -6,18 +6,18 @@ use super::client::KP_LOW_MIN_INTERVAL_MS;
 use super::sim::{Bus, MemDyad, Sim, mc, ml, post, welcome_frame};
 use super::*;
 use crate::Error;
-use crate::foreign::{ForeignRoom, JoinState, Polled};
-use crate::geb::codec::GuideCodec;
-use crate::geb::crypto::{did_peer, leaf, pair};
-use crate::geb::fake::FakeRelay;
-use crate::geb::policy::{CommitCheckInputs, NoLocalKnowledge};
-use crate::geb::room::{GebRoom, KIND_MAILBOX};
-use crate::geb::settle::commit_hash;
-use crate::geb::traits::{GebCodec, GebGroup, GebRelay, GebSigner};
-use crate::geb::wire::{Envelope, Frame, GroupOp, RoomRef, signing_doc};
-use crate::model::{AuthorCheck, BridgeEvent, EventKind, Origin};
+use crate::codec::GuideCodec;
+use crate::crypto::{did_peer, leaf, pair};
+use crate::fake::FakeRelay;
+use crate::policy::{CommitCheckInputs, NoLocalKnowledge};
+use crate::room::{GebRoom, KIND_MAILBOX};
+use crate::settle::commit_hash;
+use crate::traits::{GebCodec, GebGroup, GebRelay, GebSigner};
+use crate::wire::{Envelope, Frame, GroupOp, RoomRef, signing_doc};
 use ed25519_dalek::SigningKey;
 use openmls::prelude::*;
+use openvti_bridge_core::foreign::{ForeignRoom, JoinState, Polled};
+use openvti_bridge_core::model::{AuthorCheck, BridgeEvent, EventKind, Origin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -58,7 +58,7 @@ struct World {
     our_did: String,
     our_dev: SigningKey,
     /// Where the client keeps its non-secret fork marker.
-    marks: Arc<crate::store::MemoryStore>,
+    marks: Arc<openvti_bridge_core::store::MemoryStore>,
 }
 
 impl World {
@@ -93,7 +93,7 @@ impl World {
         let our_dev = SigningKey::from_bytes(&[50u8; 32]);
         let our_did =
             did_peer::encode(&our_dev.verifying_key().to_bytes(), &[50u8; 32], None).unwrap();
-        let device: Arc<dyn GebSigner> = Arc::new(crate::geb::crypto::sign::LocalSigner::new(
+        let device: Arc<dyn GebSigner> = Arc::new(crate::crypto::sign::LocalSigner::new(
             our_did.clone(),
             our_dev.clone(),
         ));
@@ -103,7 +103,7 @@ impl World {
         // The client follows the world's clock (so a test steps both with
         // `at`), anchored at the real time its KeyPackage lifetimes need.
         let real0 = now_secs() * 1000;
-        let marks = Arc::new(crate::store::MemoryStore::new());
+        let marks = Arc::new(openvti_bridge_core::store::MemoryStore::new());
         let c1 = clock.clone();
         let client = Arc::new(
             MlsGroupClient::new(
@@ -501,7 +501,7 @@ fn a_keypackage_is_a_bare_tls_keypackage_in_standard_base64() {
     assert!(super::parse_key_package("").is_err());
     // Our own stock and `kp` frames pass the same gate.
     let f = Frame::Group(GroupOp::Kp {
-        room: crate::geb::wire::RoomRef {
+        room: crate::wire::RoomRef {
             id: ROOM.into(),
             name: None,
         },
@@ -516,7 +516,7 @@ fn a_keypackage_is_a_bare_tls_keypackage_in_standard_base64() {
 fn the_mls_key_is_random_and_not_the_device_key() {
     let dev = SigningKey::from_bytes(&[3u8; 32]);
     let did = did_peer::encode(&dev.verifying_key().to_bytes(), &[3u8; 32], None).unwrap();
-    let signer = crate::geb::crypto::sign::LocalSigner::new(did.clone(), dev.clone());
+    let signer = crate::crypto::sign::LocalSigner::new(did.clone(), dev.clone());
     let p = openmls_rust_crypto::OpenMlsRustCrypto::default();
     let vault = MemoryVault::default();
     let id = MlsIdentity::new(&did, &p, &vault).unwrap();
@@ -553,7 +553,7 @@ fn config_is_checked() {
     let mk = |cfg: MlsConfig| {
         MlsGroupClient::new(
             cfg,
-            Arc::new(crate::geb::crypto::sign::LocalSigner::new(
+            Arc::new(crate::crypto::sign::LocalSigner::new(
                 did.clone(),
                 dev.clone(),
             )),
@@ -651,7 +651,7 @@ impl World {
 #[tokio::test]
 async fn a_kp_req_is_answered_with_a_kp_and_other_rooms_are_ignored() {
     let mut w = World::build(Arc::new(NoLocalKnowledge), "");
-    let rr = |id: &str| crate::geb::wire::RoomRef {
+    let rr = |id: &str| crate::wire::RoomRef {
         id: id.into(),
         name: Some("Test room".into()),
     };
@@ -711,7 +711,7 @@ async fn bad_welcomes_are_ignored_and_we_stay_pending() {
     else {
         panic!()
     };
-    let with = |f: &dyn Fn(&mut crate::geb::wire::RoomInfo)| {
+    let with = |f: &dyn Fn(&mut crate::wire::RoomInfo)| {
         let mut r = room.clone();
         f(&mut r);
         Frame::Group(GroupOp::Welcome {
@@ -806,14 +806,14 @@ async fn lines_flow_both_ways_signed_and_unsigned_are_marked() {
         .decode_envelope(&pair::open(&w.a.keys(ROOM), KIND_MAILBOX, &ev.content).unwrap())
         .unwrap();
     let Envelope::Ml { m } = env else { panic!() };
-    let bytes = crate::geb::crypto::b64_decode(&m).unwrap();
+    let bytes = crate::crypto::b64_decode(&m).unwrap();
     for sim in [&mut w.a, &mut w.b] {
         let (sender, line) = sim.open_line(&bytes).expect("a member opens our line");
         assert_eq!(sender, w.our_did);
         assert_eq!(line.text, "hello from the bridge");
         let sg = line.sg.clone().expect("signed");
         let doc = signing_doc(ROOM, &w.our_did, &line).unwrap();
-        crate::geb::crypto::sign::verify_json(&w.our_dev.verifying_key(), &doc, &sg).unwrap();
+        crate::crypto::sign::verify_json(&w.our_dev.verifying_key(), &doc, &sg).unwrap();
     }
     // A, B -> us: one signed, one unsigned.
     w.at(11_000);
@@ -1621,7 +1621,7 @@ fn restarted(
     store: Arc<dyn GroupStateStore>,
     vault: &dyn SignatureKeyVault,
 ) -> (Arc<MlsGroupClient>, GebRoom) {
-    let device: Arc<dyn GebSigner> = Arc::new(crate::geb::crypto::sign::LocalSigner::new(
+    let device: Arc<dyn GebSigner> = Arc::new(crate::crypto::sign::LocalSigner::new(
         w.our_did.clone(),
         w.our_dev.clone(),
     ));
@@ -1708,7 +1708,7 @@ async fn a_restart_resumes_seated_without_re_seating() {
             .decode_envelope(&pair::open(&w.a.keys(ROOM), KIND_MAILBOX, &ev.content).unwrap())
             .unwrap();
         if let Envelope::Ml { m } = env {
-            let bytes = crate::geb::crypto::b64_decode(&m).unwrap();
+            let bytes = crate::crypto::b64_decode(&m).unwrap();
             let (_, line) = w.a.open_line(&bytes).expect("a member opens it");
             texts.push(line.text);
         }
@@ -1729,7 +1729,7 @@ async fn a_corrupt_snapshot_refuses_to_start() {
     let w = World::build(Arc::new(NoLocalKnowledge), "");
     let store = Arc::new(MemState::default());
     *store.0.lock().unwrap() = Some(b"not a snapshot".to_vec());
-    let device: Arc<dyn GebSigner> = Arc::new(crate::geb::crypto::sign::LocalSigner::new(
+    let device: Arc<dyn GebSigner> = Arc::new(crate::crypto::sign::LocalSigner::new(
         w.our_did.clone(),
         w.our_dev.clone(),
     ));
@@ -1799,7 +1799,7 @@ impl StockWorld {
         store: &Arc<MemState>,
         vault: &Arc<MemoryVault>,
     ) -> (Arc<MlsGroupClient>, GebRoom) {
-        let device: Arc<dyn GebSigner> = Arc::new(crate::geb::crypto::sign::LocalSigner::new(
+        let device: Arc<dyn GebSigner> = Arc::new(crate::crypto::sign::LocalSigner::new(
             me.to_string(),
             dev.clone(),
         ));
@@ -1985,7 +1985,7 @@ async fn private_keys_are_kept_for_the_newest_two_gens_and_the_last_hour_only() 
 async fn single_packages_are_kept_seven_days_then_pruned() {
     let w = StockWorld::new();
     w.deliver(Frame::Group(GroupOp::KpReq {
-        room: crate::geb::wire::RoomRef {
+        room: crate::wire::RoomRef {
             id: ROOM.into(),
             name: None,
         },
@@ -2017,7 +2017,7 @@ async fn seat_check_is_answered_with_a_body_rs_when_seated_and_a_seat_ask_with_a
     let mut w = World::build(Arc::new(NoLocalKnowledge), "");
     let check = |e| {
         Frame::Group(GroupOp::SeatCheck {
-            room: crate::geb::wire::RoomRef {
+            room: crate::wire::RoomRef {
                 id: ROOM.into(),
                 name: None,
             },
@@ -2067,7 +2067,7 @@ async fn seat_check_is_answered_with_a_body_rs_when_seated_and_a_seat_ask_with_a
         &w.a.did,
         &w.our_did,
         Frame::Group(GroupOp::SeatCheck {
-            room: crate::geb::wire::RoomRef {
+            room: crate::wire::RoomRef {
                 id: "other-room-9".into(),
                 name: None,
             },
@@ -2127,14 +2127,11 @@ fn lv_plaintext(
     ls_key: &SigningKey,
     sg_key: &SigningKey,
 ) -> Vec<u8> {
-    let ls = crate::geb::crypto::sign::sign_json(
-        ls_key,
-        &crate::geb::leave::leave_payload(room, ls_by, at),
-    )
-    .unwrap();
+    let ls = crate::crypto::sign::sign_json(ls_key, &crate::leave::leave_payload(room, ls_by, at))
+        .unwrap();
     let mut line = serde_json::json!({"t": "lv", "at": at, "ls": ls});
     let doc = serde_json::json!({"v": 1, "room": room, "author": sender, "body": line});
-    line["sg"] = serde_json::json!(crate::geb::crypto::sign::sign_json(sg_key, &doc).unwrap());
+    line["sg"] = serde_json::json!(crate::crypto::sign::sign_json(sg_key, &doc).unwrap());
     serde_json::to_vec(&line).unwrap()
 }
 
@@ -2163,11 +2160,8 @@ fn leave_frame(by: &str, at: u64, sig: &str) -> Frame {
 }
 
 fn good_leave(room: &str, who: &Sim, at: u64) -> String {
-    crate::geb::crypto::sign::sign_json(
-        &who.dev,
-        &crate::geb::leave::leave_payload(room, &who.did, at),
-    )
-    .unwrap()
+    crate::crypto::sign::sign_json(&who.dev, &crate::leave::leave_payload(room, &who.did, at))
+        .unwrap()
 }
 
 /// F3 (4): a non-root, non-admin member's re-seat of someone else merges with
@@ -2467,7 +2461,7 @@ async fn unauthenticated_future_epoch_commits_never_fail_a_poll_or_pin_the_curso
         20u64.to_be_bytes().to_vec(),
         "the cursor is not held back by commits that cannot be judged"
     );
-    assert!(w.client.held_commits() <= crate::geb::settle::MAX_HELD_AHEAD);
+    assert!(w.client.held_commits() <= crate::settle::MAX_HELD_AHEAD);
     // And it keeps working on the next poll.
     w.poll().await.expect("still not failing");
 }
@@ -2502,11 +2496,8 @@ async fn a_leave_by_a_non_member_is_dropped_and_cannot_fill_the_book() {
     w.seat().await;
     for i in 0..1100u32 {
         let (did, dev) = throwaway(i);
-        let sig = crate::geb::crypto::sign::sign_json(
-            &dev,
-            &crate::geb::leave::leave_payload(ROOM, &did, 5),
-        )
-        .unwrap();
+        let sig = crate::crypto::sign::sign_json(&dev, &crate::leave::leave_payload(ROOM, &did, 5))
+            .unwrap();
         assert!(!w.client.take_signed_leave(&did, 5, &sig).unwrap());
         if i < 50 {
             // Also through the dyad frame path.

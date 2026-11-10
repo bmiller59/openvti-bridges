@@ -7,9 +7,9 @@
 //! `true`, a reaction's `on` coerced with `!!`) is kept as a raw `Value` with a
 //! helper that applies Geb's rule.
 
-use crate::geb::crypto::frame_id::is_frame_id;
-use crate::geb::crypto::line_id::is_line_ref;
-use crate::geb::crypto::ratchet::Side;
+use crate::crypto::frame_id::is_frame_id;
+use crate::crypto::line_id::is_line_ref;
+use crate::crypto::ratchet::Side;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -666,7 +666,7 @@ pub struct LineBody {
     /// Non-empty, up to 20,000 characters.
     pub text: String,
     /// The id of the line answered. In a room this is the **derived** id
-    /// ([`crate::geb::crypto::line_id::line_id`]); `^[0-9a-f]{16,64}$`.
+    /// ([`crate::crypto::line_id::line_id`]); `^[0-9a-f]{16,64}$`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub re: Option<String>,
     /// At most 16 mentions. …
@@ -685,7 +685,7 @@ pub struct LineBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fk: Option<Value>,
     /// The original line's id, carried only with `fk`. UNVERIFIED: whether it is
-    /// the derived 32-hex id ([`crate::geb::crypto::line_id::line_id`]) or the
+    /// the derived 32-hex id ([`crate::crypto::line_id::line_id`]) or the
     /// 16-hex of a dyad line; a room line's id is the derived one, so we send that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

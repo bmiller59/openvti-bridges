@@ -16,16 +16,16 @@ use super::traits::{
     GebCodec, GebGroup, GebRelay, GebSigner, OpenedMessage, RelayEvent, SettleReport,
 };
 use super::wire::{Envelope, LineBody, MAX_EVENT_BYTES, MAX_LINE_CHARS, signing_doc, utf16_len};
-use crate::foreign::{
+use crate::crypto::line_id::line_id;
+use crate::crypto::rendezvous::RelayKeys;
+use crate::{Error, Result};
+use async_trait::async_trait;
+use openvti_bridge_core::foreign::{
     Cursor, ForeignIdentity, ForeignRoom, JoinState, Polled, Posted, Receipt, RoomCapabilities,
     Verifiability,
 };
-use crate::geb::crypto::line_id::line_id;
-use crate::geb::crypto::rendezvous::RelayKeys;
-use crate::mapping::{DedupWindow, msg_hash};
-use crate::model::{AuthorCheck, BridgeEvent, EventKind, Origin, Provenance};
-use crate::{Error, Result};
-use async_trait::async_trait;
+use openvti_bridge_core::mapping::{DedupWindow, msg_hash};
+use openvti_bridge_core::model::{AuthorCheck, BridgeEvent, EventKind, Origin, Provenance};
 use std::sync::{Arc, Mutex};
 
 /// Mailbox kind for pair and room envelopes.
@@ -465,14 +465,14 @@ impl GebRoom {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Directions;
-    use crate::geb::codec::GuideCodec;
-    use crate::geb::crypto::sign::LocalSigner;
-    use crate::geb::fake::{FakeGroup, FakeRelay};
-    use crate::pump::{LinkRuntime, Pump};
-    use crate::room::MemoryRoom;
-    use crate::store::MemoryStore;
+    use crate::codec::GuideCodec;
+    use crate::crypto::sign::LocalSigner;
+    use crate::fake::{FakeGroup, FakeRelay};
     use ed25519_dalek::SigningKey;
+    use openvti_bridge_core::config::Directions;
+    use openvti_bridge_core::pump::{LinkRuntime, Pump};
+    use openvti_bridge_core::room::MemoryRoom;
+    use openvti_bridge_core::store::MemoryStore;
 
     fn device(seed: u8) -> (String, SigningKey) {
         let k = SigningKey::from_bytes(&[seed; 32]);
@@ -968,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn seating_states_pass_through() {
-        use crate::foreign::JoinState;
+        use openvti_bridge_core::foreign::JoinState;
         let relay = Arc::new(FakeRelay::new());
         let (did, key) = device(1);
         let group = Arc::new(FakeGroup::new(&did));

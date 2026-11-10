@@ -25,11 +25,11 @@
 //! One pump writes a given store; `outbox_mark` is a read-then-write that is
 //! forward-only and safe under that single writer.
 
-use crate::foreign::Receipt;
-use crate::model::BridgeEvent;
-use crate::store::{BridgeStore, PruneStats, StateSpace};
 use crate::{Error, Result};
 use async_trait::async_trait;
+use openvti_bridge_core::foreign::Receipt;
+use openvti_bridge_core::model::BridgeEvent;
+use openvti_bridge_core::store::{BridgeStore, PruneStats, StateSpace};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -628,7 +628,7 @@ impl BridgeStore for FjallStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EventKind, Origin};
+    use openvti_bridge_core::model::{EventKind, Origin};
 
     fn ev(id: &str) -> BridgeEvent {
         BridgeEvent {
@@ -712,7 +712,7 @@ mod tests {
 
     // --- P1-4: bounded work, pruning, sealing -------------------------------
 
-    use crate::atrest::{AtRestKey, EncryptedState};
+    use openvti_bridge_core::atrest::{AtRestKey, EncryptedState};
     use std::sync::atomic::AtomicU64;
 
     const DAYS: u64 = 86_400;
@@ -761,7 +761,10 @@ mod tests {
         );
         // `status` is bounded the same way.
         let before = s.decode_count();
-        assert_eq!(crate::pump::outbox_depth(&s).await.unwrap(), 3);
+        assert_eq!(
+            openvti_bridge_core::pump::outbox_depth(&s).await.unwrap(),
+            3
+        );
         assert_eq!(s.decode_count() - before, 3);
     }
 
@@ -799,7 +802,10 @@ mod tests {
         }
         // The raw store, with no key at all, still reports the count.
         let raw = FjallStore::open(dir.path()).unwrap();
-        assert_eq!(crate::pump::outbox_depth(&raw).await.unwrap(), 1);
+        assert_eq!(
+            openvti_bridge_core::pump::outbox_depth(&raw).await.unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -867,10 +873,10 @@ mod tests {
 
     #[tokio::test]
     async fn pruning_never_causes_a_re_post_even_when_the_browse_cursor_is_lost() {
-        use crate::config::Directions;
-        use crate::loopback::Loopback;
-        use crate::pump::{CURSOR_BROWSE as BROWSE_CURSOR, LinkRuntime, Pump};
-        use crate::room::MemoryRoom;
+        use openvti_bridge_core::config::Directions;
+        use openvti_bridge_core::loopback::Loopback;
+        use openvti_bridge_core::pump::{CURSOR_BROWSE as BROWSE_CURSOR, LinkRuntime, Pump};
+        use openvti_bridge_core::room::MemoryRoom;
         let dir = tempfile::tempdir().unwrap();
         // The pump prunes by the real clock (an hour after start, never within
         // the test), so the store is dated by it too.

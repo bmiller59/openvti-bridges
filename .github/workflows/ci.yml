@@ -36,9 +36,12 @@ jobs:
         with:
           components: clippy
       - run: cargo generate-lockfile
+      # Per crate (a per-crate build compiles what feature unification hides) and the whole workspace.
+      - run: cargo clippy -p openvti-bridge-core --all-targets -- -D warnings
+      - run: cargo clippy -p openvti-bridge-geb --all-targets -- -D warnings
+      - run: cargo clippy -p openvti-bridge-geb --all-targets --features "live mls" -- -D warnings
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p openvti-bridges --all-targets --features "cli geb-live geb-mls" -- -D warnings
-      - run: cargo clippy -p openvti-bridges --all-targets --features "cli harness geb-live geb-mls" -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features harness -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -46,10 +49,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - run: cargo generate-lockfile
+      - run: cargo test -p openvti-bridge-core
+      - run: cargo test -p openvti-bridge-geb
+      - run: cargo test -p openvti-bridge-geb --features "live mls"
       - run: cargo test --workspace
-      - run: cargo test -p openvti-bridges --features "cli geb-live geb-mls"
-      # Adds tests/custody.rs and tests/cli.rs (they need `vta-sdk/test-loopback`, not a room host).
-      - run: cargo test -p openvti-bridges --features "cli harness geb-live geb-mls"
+      # Adds the bridge crate's tests/custody.rs and tests/cli.rs (they need `vta-sdk/test-loopback`, not a room host).
+      - run: cargo test --workspace --features harness
 
   deny:
     runs-on: ubuntu-latest

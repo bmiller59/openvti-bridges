@@ -2,18 +2,18 @@
 //! (feature `geb-live`). Nothing here reaches a real relay or a real Geb node:
 //! the relay is `geb::test_relay::TestRelay`, started by each test on an
 //! ephemeral loopback port.
-#![cfg(feature = "geb-live")]
+#![cfg(feature = "live")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
-use openvti_bridges::geb::dyad::{GebIdentity, Phase, StatefulDyad};
-use openvti_bridges::geb::event::{KIND_INBOX, KIND_MAILBOX, standard_tags};
-use openvti_bridges::geb::nostr::{NostrConfig, NostrRelay};
-use openvti_bridges::geb::test_relay::TestRelay;
-use openvti_bridges::geb::traits::{GebDyad, GebRelay, RelayEvent};
-use openvti_bridges::geb::wire::Frame;
-use openvti_bridges::store::MemoryStore;
+use openvti_bridge_core::store::MemoryStore;
+use openvti_bridge_geb::dyad::{GebIdentity, Phase, StatefulDyad};
+use openvti_bridge_geb::event::{KIND_INBOX, KIND_MAILBOX, standard_tags};
+use openvti_bridge_geb::nostr::{NostrConfig, NostrRelay};
+use openvti_bridge_geb::test_relay::TestRelay;
+use openvti_bridge_geb::traits::{GebDyad, GebRelay, RelayEvent};
+use openvti_bridge_geb::wire::Frame;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -261,10 +261,10 @@ async fn connect_when_apart_and_acked_messages_over_a_real_socket() {
 
 /// Read and consume, as a consumer that has persisted its own state does.
 async fn take(
-    d: &openvti_bridges::geb::dyad::StatefulDyad,
+    d: &openvti_bridge_geb::dyad::StatefulDyad,
     peer: &str,
-) -> openvti_bridges::Result<Vec<openvti_bridges::geb::wire::Frame>> {
-    use openvti_bridges::geb::traits::GebDyad;
+) -> openvti_bridge_core::Result<Vec<openvti_bridge_geb::wire::Frame>> {
+    use openvti_bridge_geb::traits::GebDyad;
     let got = d.recv_counted(peer).await?;
     let counters: Vec<u32> = got.iter().map(|(n, _)| *n).collect();
     d.commit_recv(peer, &counters).await?;

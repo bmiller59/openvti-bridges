@@ -5,9 +5,9 @@
 
 use super::crypto::rendezvous::RelayKeys;
 use super::traits::{GebGroup, GebRelay, OpenedMessage, RelayEvent};
-use crate::foreign::JoinState;
 use crate::{Error, Result};
 use async_trait::async_trait;
+use openvti_bridge_core::foreign::JoinState;
 use std::sync::Mutex;
 
 /// In-memory relay.

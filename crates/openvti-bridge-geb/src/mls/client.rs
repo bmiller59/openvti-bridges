@@ -8,16 +8,14 @@ pub use heal::Split;
 
 use super::commit::{GroupJudge, credential_did, group_policy, parse_message, parse_welcome};
 use super::identity::{MlsIdentity, SUITE, SignatureKeyVault};
-use crate::foreign::JoinState;
-use crate::geb::crypto::b64_decode;
-use crate::geb::crypto::leaf;
-use crate::geb::crypto::rendezvous::RelayKeys;
-use crate::geb::leave::LeaveBook;
-use crate::geb::policy::CommitCheckInputs;
-use crate::geb::settle::{CommitHash, Held, Outcome, SettleQueue, Verdict};
-use crate::geb::traits::{GebDyad, GebGroup, GebSigner, OpenedMessage, SettleReport};
-use crate::geb::wire::{Frame, GroupOp, RoomInfo, RoomRef};
-use crate::store::BridgeStore;
+use crate::crypto::b64_decode;
+use crate::crypto::leaf;
+use crate::crypto::rendezvous::RelayKeys;
+use crate::leave::LeaveBook;
+use crate::policy::CommitCheckInputs;
+use crate::settle::{CommitHash, Held, Outcome, SettleQueue, Verdict};
+use crate::traits::{GebDyad, GebGroup, GebSigner, OpenedMessage, SettleReport};
+use crate::wire::{Frame, GroupOp, RoomInfo, RoomRef};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -26,6 +24,8 @@ use openmls::prelude::*;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider};
+use openvti_bridge_core::foreign::JoinState;
+use openvti_bridge_core::store::BridgeStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -221,7 +221,7 @@ fn mls<E: std::fmt::Debug>(what: &str, e: E) -> Error {
 
 impl MlsGroupClient {
     /// Build a client. `inputs` supplies the two local-knowledge facts; use
-    /// [`crate::geb::policy::NoLocalKnowledge`] in production.
+    /// [`crate::policy::NoLocalKnowledge`] in production.
     pub fn new(
         cfg: MlsConfig,
         device: Arc<dyn GebSigner>,
@@ -232,7 +232,7 @@ impl MlsGroupClient {
         if cfg.stock_size == 0 || cfg.stock_size > MAX_STOCK {
             return Err(Error::Config("stock_size must be 1-16".into()));
         }
-        if !crate::geb::wire::is_room_id(&cfg.room_id) {
+        if !crate::wire::is_room_id(&cfg.room_id) {
             return Err(Error::Config(
                 "room id must match [A-Za-z0-9_-]{8,64}".into(),
             ));
@@ -488,7 +488,7 @@ impl MlsGroupClient {
             .tls_serialize_detached()
             .map_err(|e| mls("serialise key package", e))?;
         let b64 = STANDARD.encode(raw);
-        if b64.len() > crate::geb::wire::MAX_STOCK_KP_CHARS {
+        if b64.len() > crate::wire::MAX_STOCK_KP_CHARS {
             return Err(Error::Crypto("a KeyPackage over 65,536 characters".into()));
         }
         // TLS-encoded, so pruning can rebuild the reference.
@@ -1099,8 +1099,7 @@ impl GebGroup for MlsGroupClient {
                             let replace = matches!(g.state, State::Reseating(_)).then_some(&**peer);
                             let r = self.join_from_welcome(&mut g, &room, &w, replace, false);
                             if r.is_ok() {
-                                g.heal.p.last_welcome =
-                                    Some(crate::geb::crypto::frame_id::frame_id(&w));
+                                g.heal.p.last_welcome = Some(crate::crypto::frame_id::frame_id(&w));
                                 self.persist_state(&g)?;
                             }
                             r
@@ -1164,7 +1163,7 @@ impl GebGroup for MlsGroupClient {
             .unwrap_or(false)
     }
 
-    fn pending_reposts(&self) -> Vec<crate::geb::wire::LineBody> {
+    fn pending_reposts(&self) -> Vec<crate::wire::LineBody> {
         self.lock()
             .map(|g| g.heal.p.pending_reposts.clone())
             .unwrap_or_default()

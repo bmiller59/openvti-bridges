@@ -7,8 +7,8 @@
 //! The KeyPackage declares extensions `[0xF001, 0xF002]` and …
 //! … (answer 7).
 
-use crate::geb::crypto::leaf;
-use crate::geb::traits::GebSigner;
+use crate::crypto::leaf;
+use crate::traits::GebSigner;
 use crate::{Error, Result};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;

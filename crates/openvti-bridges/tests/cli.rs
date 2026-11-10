@@ -1,7 +1,7 @@
 //! The operator surface: setup inputs, provisioning against a fake VTA that
 //! serves key create and export, link management on a config file, and the
 //! binary itself (offline commands only: no network is reached).
-#![cfg(all(feature = "cli", feature = "harness"))]
+#![cfg(feature = "harness")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
