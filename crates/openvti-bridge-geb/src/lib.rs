@@ -111,7 +111,15 @@ mod tests {
                 "halt code {code:?} is written in the sources but not in HALT_CODES"
             );
         }
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/bridges/geb.md"),
+        )
+        .unwrap();
         for code in &table {
+            assert!(
+                doc.contains(&format!("`{code}`")),
+                "{code} is not documented in docs/bridges/geb.md"
+            );
             assert!(
                 code.starts_with("geb."),
                 "{code}: codes are `<kind>.<reason>`"
