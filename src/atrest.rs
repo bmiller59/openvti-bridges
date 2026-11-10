@@ -30,7 +30,6 @@
 //! protects the disk at rest, not a live compromise.
 
 use crate::foreign::Receipt;
-use crate::geb::crypto::kdf::hkdf32;
 use crate::model::BridgeEvent;
 use crate::store::{BridgeStore, PruneStats, StateSpace};
 use crate::{Error, Result};
@@ -45,6 +44,16 @@ use zeroize::Zeroizing;
 
 const FORMAT: u8 = 1;
 const NONCE_LEN: usize = 24;
+/// HKDF-SHA256 to 32 bytes. Local to this module so the core never reaches
+/// into an adapter's crypto helpers.
+fn hkdf32(salt: Option<&[u8]>, ikm: &[u8], info: &[u8]) -> Result<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(salt, ikm)
+        .expand(info, &mut out)
+        .map_err(|e| Error::Crypto(format!("hkdf: {e}")))?;
+    Ok(out)
+}
+
 const SALT: &[u8] = b"vti-geb-bridge/at-rest/v1";
 
 /// A purpose-bound at-rest key.
@@ -335,43 +344,6 @@ impl SealedFile {
     }
 }
 
-#[cfg(feature = "geb-mls")]
-mod mls_impls {
-    use super::SealedFile;
-    use crate::geb::mls::{GroupStateStore, SignatureKeyVault};
-    use crate::{Error, Result};
-
-    impl GroupStateStore for SealedFile {
-        fn load(&self) -> Result<Option<Vec<u8>>> {
-            Ok(self.read()?.map(|z| z.to_vec()))
-        }
-        fn save(&self, snapshot: &[u8]) -> Result<()> {
-            self.write(snapshot)
-        }
-    }
-
-    /// The MLS signature key, encrypted at rest.
-    impl SignatureKeyVault for SealedFile {
-        fn load(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-            let Some(raw) = self.read()? else {
-                return Ok(None);
-            };
-            let (private, public): (String, String) = serde_json::from_slice(&raw)
-                .map_err(|_| Error::Crypto("signature key record is unreadable".into()))?;
-            let dec =
-                |s: &str| hex::decode(s).map_err(|_| Error::Crypto("signature key record".into()));
-            Ok(Some((dec(&private)?, dec(&public)?)))
-        }
-        fn save(&self, private: &[u8], public: &[u8]) -> Result<()> {
-            let raw = zeroize::Zeroizing::new(
-                serde_json::to_vec(&(hex::encode(private), hex::encode(public)))
-                    .map_err(|_| Error::Crypto("encode signature key".into()))?,
-            );
-            self.write(&raw)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,35 +448,5 @@ mod tests {
         // Another record name over the same bytes fails too.
         let g = SealedFile::new(dir.path().join("d/x.enc"), key(1, "mls"), "mls/l2/state");
         assert!(g.read().is_err());
-    }
-
-    #[cfg(feature = "geb-mls")]
-    #[test]
-    fn the_signature_key_vault_and_state_file_refuse_the_wrong_key_and_tampering() {
-        use crate::geb::mls::{GroupStateStore, SignatureKeyVault};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sig.enc");
-        let vault = SealedFile::new(path.clone(), key(1, "mls"), "mls/l1/sigkey");
-        assert!(SignatureKeyVault::load(&vault).unwrap().is_none());
-        SignatureKeyVault::save(&vault, &[7u8; 32], &[8u8; 32]).unwrap();
-        let raw = std::fs::read(&path).unwrap();
-        assert!(!raw.windows(8).any(|w| w == [7u8; 8]), "no plaintext key");
-        assert_eq!(
-            SignatureKeyVault::load(&vault).unwrap(),
-            Some((vec![7u8; 32], vec![8u8; 32]))
-        );
-        let wrong = SealedFile::new(path.clone(), key(2, "mls"), "mls/l1/sigkey");
-        assert!(SignatureKeyVault::load(&wrong).is_err());
-        let state = SealedFile::new(dir.path().join("st.enc"), key(1, "mls"), "mls/l1/state");
-        GroupStateStore::save(&state, b"snapshot").unwrap();
-        assert_eq!(
-            GroupStateStore::load(&state).unwrap(),
-            Some(b"snapshot".to_vec())
-        );
-        let mut blob = std::fs::read(dir.path().join("st.enc")).unwrap();
-        let last = blob.len() - 1;
-        blob[last] ^= 1;
-        std::fs::write(dir.path().join("st.enc"), blob).unwrap();
-        assert!(GroupStateStore::load(&state).is_err());
     }
 }

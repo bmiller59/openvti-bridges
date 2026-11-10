@@ -44,6 +44,8 @@ mod tests {
     }
 }
 
+#[cfg(feature = "geb-mls")]
+mod atrest_mls;
 pub mod codec;
 pub mod crypto;
 pub mod dyad;
