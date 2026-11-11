@@ -4,8 +4,8 @@
 //! The device DID's key proves the link between the two by signing the leaf
 //! binding (`geb::crypto::leaf`) through the [`GebSigner`] seam, so this module
 //! never holds the device key. The binding goes in LeafNode extension `0xF002`.
-//! The KeyPackage declares extensions `[0xF001, 0xF002]` and …
-//! … (answer 7).
+//! The KeyPackage declares extensions `[0xF001, 0xF002]` and keeps the OpenMLS
+//! default for every other capability list (answer 7).
 
 use crate::crypto::leaf;
 use crate::traits::GebSigner;
@@ -17,7 +17,7 @@ use openmls_traits::OpenMlsProvider;
 use std::sync::Mutex;
 
 /// The one ciphersuite: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`
-/// (`0x0001`), `mls.rs:26`.
+/// (`0x0001`).
 pub const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
 /// Where the MLS signature key lives between runs.

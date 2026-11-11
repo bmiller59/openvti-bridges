@@ -1,8 +1,8 @@
 //! `did:peer:2.A<ed>.V<ed>.E<x>[.S<b64url json>]` encode and decode.
 //!
-//! …
-//! … Ed25519, `ec 01` for X25519. …
-//! … and still read older V-only DIDs. Verifiers use `.V`, or `.A`
+//! Each key is a multibase `z` string: base58btc over a multicodec prefix and
+//! 32 key bytes (`ed 01` for Ed25519, `ec 01` for X25519). Purpose codes we do
+//! not know are skipped, and older V-only DIDs still read. Verifiers use `.V`, or `.A`
 //! when there is no `.V`.
 //!
 //! The element order `A`, `V`, `E` is confirmed by Geb's vectors (byte-exact
@@ -133,8 +133,8 @@ pub fn decode(did: &str) -> Result<DidPeer> {
 /// The DID document Geb's resolver builds (checked against its vector): one
 /// verification method per key element, numbered `#key-1`, `#key-2`, ... in
 /// the order the elements appear in the DID; `A` goes to `assertionMethod`,
-/// `V` to `authentication`, `E` to `keyAgreement`. …
-/// … is two methods. `.S` and unknown codes add no method.
+/// `V` to `authentication`, `E` to `keyAgreement`. One Ed25519 key listed under
+/// both `.A` and `.V` yields two methods. `.S` and unknown codes add no method.
 pub fn document(did: &str) -> Result<Value> {
     decode(did)?; // validate first
     let rest = did

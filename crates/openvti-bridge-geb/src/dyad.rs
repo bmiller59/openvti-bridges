@@ -597,7 +597,7 @@ impl StatefulDyad {
         if p.v != 1 || p.invitation.kind != INVITATION_TYPE || !is_nonce(&p.invitation.nonce) {
             return Err(Error::Wire("malformed invitation".into()));
         }
-        // Guide step 3: … signature.
+        // Guide step 3: the invitation must name the sender, and its signature must verify.
         if p.invitation.did != p.from {
             return Err(Error::Crypto("invitation.did is not from".into()));
         }

@@ -3,7 +3,7 @@
 //! `directed`, an `eddsa-jcs-2022` DataIntegrityProof whose
 //! `verificationMethod` is `<issuer>#key-1`, and
 //! `credentialSubject.issuerPublicKey` equal to the issuer's assertion key
-//! (guide, "Connecting" step 8; `vrc.rs:11-14,59-149,210` in Geb).
+//! (guide, "Connecting" step 8).
 //!
 //! The shape is Geb's v2 form (answers-2 section 4, `crates/identity/src/vrc.rs`
 //! at Geb), bound byte for byte to `tests/fixtures/geb-path-b-vectors-2.json`:

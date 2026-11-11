@@ -1,10 +1,9 @@
-//! The MLS leaf binding (Geb path B answer 6,
-//! `mls.rs:29-33,51-57,289-292`).
+//! The MLS leaf binding (Geb path B answer 6).
 //!
 //! A device proves that an MLS leaf signature key belongs to its DID by
 //! signing, with the DID's key (`.V`, else `.A`), the JCS form of
-//! `{"did":"<device DID>","k":"<64 hex>","t":"leaf","v":1}` where …
-//! … key. The
+//! `{"did":"<device DID>","k":"<64 hex>","t":"leaf","v":1}` where `k` is the leaf's own
+//! 32-byte Ed25519 MLS signature key written as lowercase hex. The
 //! binding is that signature as base64url without padding (86 characters),
 //! and the value of the LeafNode extension [`EXT_LEAF_BINDING`] is its UTF-8
 //! bytes. A missing binding is seated but "unverified"; a forged one makes

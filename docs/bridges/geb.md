@@ -13,12 +13,11 @@ ForeignRoom seam, the data model and the operations that are not Geb's are in
 Pinned reading: **path B version `0.1`** (our own label; Geb has not decided whether 0.5.15 is
 still 0.1, see section 11) against **Geb release 0.5.15, substrate commit `fdf804d`**
 (`geb::PATH_B_VERSION`, `geb::PATH_B_PINNED_COMMIT`, `geb::status_line()`). Round 1 of Geb's
-answers was read at release 0.5.14 (release 0.5.14); round 2 and 3 were read at `fdf804d`. The fixture
-vectors were generated at release 0.5.14 (round 1) and the round 2 reading (round 2); none at `fdf804d`. The
-sources are `Geb's implementer's guide (2026-11-07)` (the implementer's guide, 2026-11-07), and
-`Geb's path B answers, round 1`, round 2, round 3; the 0.5.15 paragraphs of round 2 supersede
-the guide where they differ. All of this is Geb's word, and none of it is checked against live
-Geb.
+answers was read at release 0.5.14; rounds 2 to 4 were read at `fdf804d`. The fixture vectors were
+generated at release 0.5.14 (round 1) and at the round 2 reading; none at `fdf804d`. The sources are
+Geb's implementer's guide (2026-11-07) and Geb's path B answers, rounds 1 to 4 (all private, none
+stored here); the 0.5.15 paragraphs of round 2 supersede the guide where they differ. None of it is
+checked against live Geb.
 
 **Identity (built).** A device DID `did:peer:2.A<ed>.V<ed>.E<x>`: the same Ed25519 key under `.A`
 and `.V`, a separately generated X25519 key under `.E`, no `.S`. The order of the purpose elements
@@ -82,16 +81,16 @@ an update-path leaf naming another DID than its sender, an unbound added leaf na
 admin or a seated DID (the DID a same commit removes still counts as seated), and a remove,
 re-seat or policy change from a sender whose leaf, as it stood before the commit, is not bound
 (`selfHeal` excepted: an unbound sender may remove leaves naming only its own DID if it adds at
-least one leaf, … bound, and there is no policy change). A
+least one leaf, each added leaf names the sender and carries a binding signed by the sender's own key,
+and there is no policy change). A
 path-only self-update carrying the sender's binding (a "heal") is valid and need not keep its key.
-At join a Welcome whose … with one unbound, is
-refused.
+At join a Welcome is refused if a leaf in its tree carries a forged binding, or if one DID sits
+in two leaves and one of them is unbound.
 
 A **Remove** passes (Geb's exact rule, round 4 Q6) when any of: (1) every
 removed DID is the sender's person (no persona store here, so the sender's own DID only); (2) every
-removed leaf is covered by a held signed leave, with no adds and no policy change; (3) a re-seat:
-… change, by any member with a bound
-leaf; (4) the sender is root or an admin (exact DID compare, never widened by persona cards) or the
+removed leaf is covered by a held signed leave, with no adds and no policy change; (3) a re-seat: the same non-empty DID set removed and added, policy untouched, by any member with a
+bound leaf; (4) the sender is root or an admin (exact DID compare, never widened by persona cards) or the
 room's policy is v1. Geb **refuses anything else and goes on; it never halts a room.**
 
 **The one deliberate difference.** The bridge holds no persona store (persona-card intake is not
@@ -103,11 +102,10 @@ honest alternative to a silent fork; Geb itself refuses and continues. The same 
 direct-room Add of a DID that is not exactly one of the pair.
 
 **Signed leaves (received, never sent).** Ignoring a leave is safe only if the signed room line is
-taken (round 4 Q7), or a device with …
-leaver that every Geb device merges. The payload is `JCS {t:"leave", v:1, room, by, at}` signed by
+taken (round 4 Q7): a device lacking the signed leave would refuse the healer's Remove of the
+leaver while every Geb device merges it, and we would fork. The payload is `JCS {t:"leave", v:1, room, by, at}` signed by
 the leaver's device DID key. It arrives as a room line `{t:"lv", at, ls, sg}` (the line's `sg` must
-verify for its MLS sender, then `ls` for that sender) and as …
-… (still acked). The newest leave per signer per room is kept and persisted
+verify for its MLS sender, then `ls` for that sender) and as a dyad frame `leave` carrying the same fields plus `sig` (still acked). The newest leave per signer per room is kept and persisted
 in the sealed MLS state; one that does not verify is dropped. A held leave covers its signer's exact
 DID in rule (2). The bridge does not send a leave, elect a healer or commit a Remove.
 
@@ -142,15 +140,15 @@ the first read starts at the 7-day retention floor, never unbounded.
 
 ### Open questions for Geb
 
-Rounds 2 and 3 left a list of follow-ups; **round 4** (`Geb's path B answers, round 4`,
+Rounds 2 and 3 left a list of follow-ups; **round 4** (Geb's path B answers, round 4,
 2026-11-09, read at `fdf804d`) answered nearly all of them. Four of our readings would have forked
 us and are fixed (Q1 walk, Q2 `selfHeal`, Q6 removes, Q7 signed leaves).
 
 Answered and confirmed (no longer UNVERIFIED):
 
 - Geb's OpenMLS 0.8.2 is stock from crates.io, no `[patch]` (Q19).
-- Root and admin are an exact DID compare; persona cards widen only …
-  … (Q4).
+- Root and admin are an exact DID compare; persona cards widen the match only for a person's own leave, the devices a signed leave covers and direct-room
+  adds (Q4).
 - A heal needs the same DID and a valid binding if present; the new key is not compared (Q3).
   Whether OpenMLS 0.8.2 itself accepts a new key in an update path is unconfirmed.
 - A DID removed in the same commit still counts as seated for `unboundClaim` (Q5).

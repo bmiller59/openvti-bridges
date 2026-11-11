@@ -2,16 +2,16 @@
 //!
 //! Channel key = HKDF-SHA256(ikm = X25519 shared secret, no salt, info
 //! `consensual/dyad-channel/v1`). Two chains start from the channel key under
-//! `lo2hi` and `hi2lo`; …
+//! `lo2hi` and `hi2lo`; the lower DID string sends on
 //! `lo2hi`. Each step derives a message key (`msg`) and the next chain key
 //! (`chain`). A frame is `counter u32 BE || nonce(12) || ChaCha20-Poly1305`.
 //! A receiver keeps 512 skipped keys and heals jumps up to 65,536.
 //!
-//! Settled by Geb's answers 3 and 4 (read from their code, `ratchet.rs:57-75`):
+//! Settled by Geb's answers 3 and 4 (read from their code):
 //! the labels `lo2hi` / `hi2lo`, `msg` and `chain` are HKDF **info** strings
 //! with the key as IKM and no salt; there is no AAD on a frame (the same
-//! `seal` / `open` as the sealed box); the lo/hi side …
-//! … || nonce(12) ||
+//! `seal` / `open` as the sealed box); which side is lo is decided by comparing the
+//! two full DID strings with `<`. A frame is `counter u32 BE || nonce(12) ||
 //! ct+tag(16)`.
 
 use super::kdf::hkdf32;

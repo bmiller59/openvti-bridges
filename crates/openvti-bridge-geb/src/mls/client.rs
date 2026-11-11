@@ -522,7 +522,7 @@ impl MlsGroupClient {
 
     /// Delete the private halves of everything past its keep rule: per
     /// contact the newest TWO stock generations (the newest batch of each) plus
-    /// any batch … for 7 days.
+    /// any batch minted within the last hour, and single packages for 7 days.
     /// Returns whether anything was removed.
     fn prune(&self, g: &mut Inner, now_ms: u64) -> bool {
         let Inner {
@@ -828,7 +828,7 @@ impl MlsGroupClient {
         }
         // OpenMLS refuses a Welcome for a group id it already holds
         // (`GroupAlreadyExists`), so the old group is deleted from storage
-        // FIRST (answers round 2 section 8: `mls.rs:498-506`). A copy of the
+        // FIRST (answers round 2 section 8). A copy of the
         // whole store is taken before, and put back if anything after it
         // refuses: a refused or inconsistent Welcome leaves the old state as it
         // was.
@@ -1250,8 +1250,7 @@ impl GebGroup for MlsGroupClient {
                 return Err(Error::Foreign("not seated in the room yet".into()));
             }
         };
-        // Receivers ignore a commit made from an epoch below theirs
-        // .
+        // Receivers ignore a commit made from an epoch below theirs.
         if parent_epoch < epoch {
             return Ok(());
         }

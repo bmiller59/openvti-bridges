@@ -22,11 +22,11 @@ held by a census test and documented in `docs/bridges/geb.md`. Adapter state liv
   Do not depend on `vti-rooms`.
 - **Geb is a foreign-protocol interface** (workspace `CLAUDE.md`, exceptions
   to "every remote operation is a Trust Task"). Its wire has no versioned spec:
-  pin to Geb's authoritative answers `Geb's path B answers, round 1` (code at
-  release 0.5.14), round 2 (release 0.5.15, `fdf804d`; the 0.5.15 paragraphs are
-  the current rules; they supersede `Geb's implementer's guide (2026-11-07)` where they differ)
-  round 3 (round 3, 2026-11-09, read at `fdf804d`; see "Round 3 answers") and
-  round 4 (round 4, 2026-11-09, `fdf804d`; see "Round 4 answers"), keep
+  pin to Geb's authoritative answers (private, not stored here): round 1 (read
+  at release 0.5.14), round 2 (release 0.5.15, `fdf804d`; its 0.5.15 paragraphs are
+  the current rules and supersede Geb's implementer's guide (2026-11-07) where they differ),
+  round 3 (2026-11-09, read at `fdf804d`; see "Round 3 answers") and
+  round 4 (2026-11-09, `fdf804d`; see "Round 4 answers"). Keep
   changes behind `GebCodec` and the other `geb::traits`, and mark anything the
   answers do not settle `// UNVERIFIED:`. Remaining markers: the `did:peer`
   purpose-element order, a few `parsePolicy` details (see `geb/policy.rs`), the
@@ -45,16 +45,14 @@ held by a census test and documented in `docs/bridges/geb.md`. Adapter state liv
   `geb::policy::NoLocalKnowledge` (`can_evaluate() == false`) plus the held
   signed leaves. A Remove passes (Geb's exact rule, answers
   round 4 Q6) when ANY of: (1) every removed DID is the sender's person (without
-  a persona store: the sender's own DID); (2) …
-  … we hold, no adds, no policy change; (3) a re-seat (removed and
+  a persona store: the sender's own DID); (2) a signed leave we hold covers each removed leaf (no adds, no policy change); (3) a re-seat (removed and
   added DIDs the same non-empty set, no policy change) by any member with a
   bound leaf; (4) the sender is root or an admin (EXACT DID compare, never
   widened, Q4) or the room's policy is v1 (`p.v !== 2`). A Remove or policy
   change needs a sender whose leaf is bound BEFORE the commit, except
   `selfHeal` (Q2: an unbound sender whose Remove has no policy change, removes
-  only leaves naming its own DID, adds at least one leaf and …
-  … signature). **Geb refuses
-  anything else and goes on; it never halts a room.** The ONE residue the bridge
+  only leaves naming its own DID, adds at least one leaf, each added leaf naming the sender and bound under the sender's own
+  signature). **Geb refuses everything else and goes on; a room is never halted.** The ONE residue the bridge
   cannot decide is a Remove of ANOTHER DID by a non-root non-admin sender in a v2
   room with no signed leave we hold and not a re-seat: a Geb device holding a
   persona card linking the two DIDs would merge it. Only that case (and a
@@ -94,8 +92,8 @@ held by a census test and documented in `docs/bridges/geb.md`. Adapter state liv
   no action.
 - **Signed leaves (receive only)** (answers round 2 section 8, round 4 Q7;
   `geb/leave.rs`). Ignoring a leave is safe only if we take the signed room
-  line, or a device with …
-  … leaver that every Geb device merges. Taken two ways, one payload:
+  line, or a device that lacks the leave refuses the healer's Remove of the
+  leaver while every other Geb device merges it. Taken two ways, one payload:
   `leavePayload(room, by, at) = JCS {t:"leave", v:1, room, by, at}` signed by the
   leaver's device DID Ed25519 key (verified against the key in the `did:peer`):
   (a) a room line `{t:"lv", at, ls, sg}` (read in `GebRoom::poll`; the line's
@@ -135,8 +133,8 @@ held by a census test and documented in `docs/bridges/geb.md`. Adapter state liv
   nothing. A `heal` (path-only self-update whose new leaf carries the sender's
   binding) is valid and need not keep the same signature key (Q3; whether
   OpenMLS 0.8.2 accepts a new key in an update path is unconfirmed). At join a
-  Welcome whose … with one
-  unbound, is refused (`treeRefusal`: the group `into_group` stored is deleted,
+  Welcome is refused when a leaf in its tree carries a forged binding or one DID sits in
+  two leaves with one unbound (`treeRefusal`: the group `into_group` stored is deleted,
   we stay pending). Leaf verdicts: bound = binding verifies
   (`BindingStatus::Verified`), unbound = no `0xF002` (`Missing`), forged = present
   and wrong (`Forged`); `k` is derived from the leaf's own signature key, so a
@@ -148,11 +146,11 @@ held by a census test and documented in `docs/bridges/geb.md`. Adapter state liv
   bridged record. Notice wording is configurable per link (`[links.notices]`).
 - **Capabilities.** The bridge sends `cap` `{k:"cap", dm:0, fc:0}`: `fc` is
   stated because an UNKNOWN `fc` makes Geb hold a large frame back until it
-  hears from us; `rv` and `wp` stay unset (a …
-  … which is what we want); it never claims `dm >= 1`,
+  hears from us; `rv` and `wp` stay unset (Geb treats a peer whose `rv` is not 1 as
+  offline for room routing, which is what we want); it never claims `dm >= 1`,
   `fc: 1` or `rv: 1`. KNOWN LIMITATION: with `fc:0` Geb sends a frame too big
-  for one 120,000-byte event whole and the relay refuses it, so …
-  … in it) NEVER reaches us and joining a
+  for one 120,000-byte event whole and the relay refuses it, so the Welcome for a big room (it carries the whole
+  ratchet tree) NEVER reaches us and joining a
   large room fails. Fragment reassembly (`{k:"fc", id, i, n, d}`, `n` <= 64)
   is not built (open item).
 - **Refusal stops the link.** If seating is refused or the leaf is removed
@@ -353,7 +351,7 @@ not safe to ignore), 6 (before the commit; key not required; OpenMLS 0.8.2's
 own acceptance unconfirmed), 7 (refused). Kept below as asked.
 
 1. Is Geb's build stock OpenMLS 0.8.2, with no `[patch]`?
-2. In `validCommit` (Geb's source), is the root / admin test an exact DID
+2. In Geb's `validCommit`, is the root / admin test an exact DID
    compare, or can persona cards (`same`) widen it to a sibling device? (Decides
    whether our card-free verdicts can fork.)
 3. In the settle walk, is a standalone-Proposal, by-reference or
@@ -409,7 +407,7 @@ checked against a live Geb; the status of each point is stated.
   an OpenMLS default (leaf capabilities, KeyPackage lifetime, ciphertext-only wire format, no padding, no
   retained past epochs, the standard exporter, no last-resort packages), check it against the live run.
   A line that loses an epoch race is recovered by the line self-heal, not by MLS. Whether a Welcome or
-  Commit carrying … accepted is not known.
+  Commit carrying an extension or proposal type that 0.8.2 lacks is accepted is not known.
   See "OpenMLS version".
 - **Release facts (implemented: pin only).** The bridge builds to release 0.5.15. The release metadata
   carries a wire number that is not a compatibility signal; there is no changelog and no release event,
@@ -417,7 +415,8 @@ checked against a live Geb; the status of each point is stated.
   of that metadata. Whether 0.5.15 still counts as path B 0.1 is not decided on Geb's side.
 - **Decisions Geb has not made yet (not assumed).** Staying on OpenMLS 0.8.2; a path B compatibility
   policy; a room member cap; bridge and agent room settings and how a member declares itself a bridge;
-  … devices; the live relay limits.
+  whether a bridge may be registered as a person's own device (so it could join their direct rooms); the live
+  relay limits.
 - **KeyPackages (implemented).** One mint path: always bound (leaf extension `0xF002`), with an explicit
   lifetime (back-dated one hour, valid 84 days). `gen` counts the stocks we sent to one contact, never
   packages and never globally; a stock is 6 packages (receivers keep at most 16) and a receiver replaces
@@ -439,12 +438,12 @@ checked against a live Geb; the status of each point is stated.
   inside a share and older builds drop it. We drop every unknown `t` (and a reaction) without effect, halt
   or any log above debug (`codec::is_not_a_line`); a batch share is never opened by the bridge.
 - **Direct rooms (implemented, OPEN at link time).** A bridge cannot sit in a direct room: Geb's commit
-  check refuses an … persons. A Welcome into one is refused
+  check refuses an add of any device that does not belong to one of the two persons. A Welcome into one is refused
   before the group is stored (`Error::Refused`, the link halts; `declares_direct` reads the policy JSON
   raw). `link add` is config-only and contacts nothing, so it cannot detect this beforehand. The leaf the
   adder made for us stays in that room (leaving is not built).
-- **Persona cards, heal, leave, `rs`, `seat-ask` (implemented as a follower).** A persona card is needed
-  only with two or more devices per person. A heal is path-only and bound leaves need no card. A new
+- **Persona cards, heal, leave, `rs`, `seat-ask` (implemented as a follower).** Persona cards matter
+  only when a person has two or more devices. A heal changes the path only, and bound leaves need no card. A new
   device DID is a new member; a wiped store sends a `seat-ask` with a fresh bound package. Silence never
   commits.
 
@@ -567,8 +566,8 @@ signers and pruned on removal; a replacing Welcome needs an expected re-seat
 (the 20-minute seat-ask window and the lower-epoch rule are ours); the 256
 unacked-frame cap and the 3 s / 60 s / 15 min repost schedule; that dead-lettering
 every non-retryable room error is right.
-Still open: OpenMLS 0.8.2's own acceptance of …
-… path; which of failed and refused fires for a by-reference
+Still open: OpenMLS 0.8.2's own acceptance of a changed signature key in a commit's update
+path; which of failed and refused fires for a by-reference
 commit; the live relay limits (see below); whether the `lv` line's `sg` uses the
 usual wrapper; and, from round 3:
 
@@ -653,8 +652,8 @@ subscriptions per connection and expiry handling may differ live, and Geb has sa
 to 120,000 bytes either way and keep our 8 concurrent catch-up reads.
 
 **Decisions Geb has not made yet.** Which test cases the compatibility run uses and whether test switches
-run on throwaway nodes; a fragmented-frame sample; publishing the live relay settings; …
-… joining. The fixed transcript for the compatibility cases follows
+run on throwaway nodes; a fragmented-frame sample; publishing the live relay settings; a suggested room size for clients that cannot join
+through fragments. The fixed transcript for the compatibility cases follows
 separately; each case can be staged from Geb's own CLI.
 
 ### Remaining questions for Geb (rs / re-seat round)

@@ -1,4 +1,4 @@
-//! `openvti-bridges`: the … foreign room.
+//! `openvti-bridges`: the bridge between a VTC data room and a foreign room.
 //! Experimental; see `openvti_bridges::cli`.
 
 use clap::{Args, Parser, Subcommand};

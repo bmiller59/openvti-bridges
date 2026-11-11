@@ -94,23 +94,22 @@ For us:
 - Is a generic template-driven did:peer:2 mint wanted upstream (ask a), and lifting the seal-and-retry put logic into
   `vta-sdk` (ask b)? Each needs approval before touching an existing crate.
 
-For Geb (Geb's announcement channel; bring file:line):
-1. Payload format of KeyPackage capability/extension 0xF001 (committer policy) and what the group requires of it
-   (mls.rs:27-33,48-50).
+For Geb (through Geb's announcement channel; cite the code):
+1. Payload format of KeyPackage capability/extension 0xF001 (committer policy) and what the group requires of it.
 2. The room `policy` JSON in the `welcome` frame (`room:{v:2,id,name,founder,since,policy…}`):
    schema, and what a read-and-post member must satisfy.
-3. Meaning of `re`, `m`, `o` in the `{t:"l"}` line  and in `{k:"m"}` frames.
+3. Meaning of `re`, `m`, `o` in the `{t:"l"}` line and in `{k:"m"}` frames.
 4. Is there any edit/delete/retract for lines? How do clients show a superseded line?
 5. Are bot-style or automated members permitted by room policy? Is there a way to mark a member as a bridge?
 6. Published test vectors for: inbox derivation, sealed box, rendezvous keys, AES-GCM AAD, ratchet with skipped keys,
    frame-id hash, sign_json, leaf binding.
 7. Policy check after the settle rule: exact rules for rejecting a winning commit, and what a non-committing member does
-   when the winner is rejected .
+   when the winner is rejected.
 8. Will path B be versioned or pinned to tags? How will breaking changes be announced?
 
 ## E. Pointers
 
-- Geb guide: `Geb's implementer's guide (2026-11-07)`.
+- Geb implementer's guide (2026-11-07): private, not stored in this repository.
 - VTI rooms: docs/02-vta/data-rooms.md, docs/05-design-notes/data-rooms*.md, vti-rooms/src/mls.rs, sealed.rs,
   room-host/src/lib.rs.
 - Template for the crate: vti-witness (Cargo.toml, CLAUDE.md, src/{setup,run,messaging}.rs).

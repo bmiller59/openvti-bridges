@@ -5,11 +5,11 @@
 //! the bridge core sees only [`room::GebRoom`] as a `ForeignRoom`.
 //!
 //! Pinned to Geb's authoritative answers, rounds 1 to 4
-//! (`Geb's path B answers, round 1`, round 2, round 3, round 4), read from
-//! their code at release 0.5.15, commit [`PATH_B_PINNED_COMMIT`] (`fdf804d`;
-//! round 1 was first read at release 0.5.14, and the fixture vectors come from
-//! release 0.5.14 for round 1 and the round 2 reading for round 2). They supersede the
-//! implementer's guide (`Geb's implementer's guide (2026-11-07)`) where they differ. Not
+//! (private, not stored in this repository), read from their code at release
+//! 0.5.15, commit [`PATH_B_PINNED_COMMIT`] (`fdf804d`; round 1 was first read at
+//! release 0.5.14, and the fixture vectors come from release 0.5.14 for round 1
+//! and the round 2 reading for round 2). They supersede Geb's implementer's
+//! guide (2026-11-07) where they differ. Not
 //! built by default (M3): the MLS group stays `UnsupportedGroup` and returns
 //! `Error::Unsupported`; feature `mls` adds `mls::MlsGroupClient`, the
 //! settle rule ([`settle`]) and the commit check ([`policy::valid_commit`],

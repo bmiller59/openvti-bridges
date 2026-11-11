@@ -24,8 +24,7 @@ fn cipher(
 
 /// Seal with a caller-supplied ephemeral secret and nonce (deterministic;
 /// exposed for tests and for callers that own their randomness).
-/// No AAD is used on the sealed box (Geb path B answer 3,
-/// `channel.rs:38-49`).
+/// No AAD is used on the sealed box (Geb path B answer 3).
 pub fn seal_with(
     recipient_pub: &[u8; 32],
     eph_secret: &[u8; 32],

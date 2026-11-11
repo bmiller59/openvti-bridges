@@ -1,48 +1,47 @@
 //! The room policy (GroupContext extension `0xF001`) and what a commit check
 //! needs. Pinned to Geb's path B answers, rounds 1 to 4, at release 0.5.15 (commit
-//! `fdf804d`): answers 7 and 9 of round 1 (first read at release 0.5.14, where the
-//! vectors were generated), round 2 section 7 (vectors from the round 2 reading) and the
-//! round 3 and 4 rules for `validCommit`.
+//! `fdf804d`); the summary of what each round settled is in this crate's
+//! `CLAUDE.md`.
 //!
-//! # Policy (answer 7)
+//! # Policy
 //!
 //! New rooms are founded with `{v:2, committer:"any-staged",
 //! settleWindowMs:3000, root:<founder DID>, admins:[]}`; direct rooms add
-//! `direct:[lo, hi]`. [`parse_policy`] mirrors Geb's `parsePolicy`: …
-//! …
-//! … nothing reads `committer` beyond the parse, so `"owner"` is
-//! not enforced by Geb. …
-//! … `settleWindowMs`.
+//! `direct:[lo, hi]`. [`parse_policy`] reads a malformed or missing policy as
+//! the v1 default `{v:1, committer:"any-staged", settleWindowMs:3000}`. Nothing
+//! reads `committer` beyond the parse, so `"owner"` is not enforced by Geb at
+//! this release. Only `root` can change the policy, by a GroupContextExtensions
+//! Commit that leaves `committer` and `settleWindowMs` alone.
 //!
-//! # Commit check (answer 9)
+//! # Commit check
 //!
-//! Geb does not … candidate
-//! Commits …
-//! … before it can win
-//! :
+//! Geb tests candidates before one can win rather than picking a winner and then
+//! testing it: it walks the candidate Commits for one parent epoch (its own
+//! pending Commit included) in ascending SHA-256 order.
 //!
-//! - … dropped
-//!   (`drop_staged`), reported `refused`, the next hash is tried;
+//! - a candidate rejected by `validCommit`, or one that seats a forged-binding
+//!   leaf, is dropped (`drop_staged`), reported `refused`, and the next hash
+//!   is tried;
 //! - the first Commit that passes is merged, on every device that reaches the
 //!   same verdict;
-//! - all refused: nothing settles and the epoch stays;
-//! - … branch, a
-//!   standalone Proposal): recorded `failed` and SKIPPED like a refusal (the
-//!   walk never stops, answers round 4 Q1). Only if nothing merged does the
-//!   cursor stay before it and one `rs` go out.
+//! - if all are refused, nothing settles and the epoch stays;
+//! - a candidate MLS cannot even process (a replay, a Commit made on another
+//!   branch, a standalone Proposal) is recorded `failed` and SKIPPED like a
+//!   refusal (the walk never stops). Only if nothing merged does the cursor
+//!   stay before it and one `rs` go out.
 //!
-//! `validCommit` (answers round 4 Q2 and Q6) passes a
-//! Remove when ANY of: every removed DID is the sender's person (`same`; with
-//! no persona store, the sender's own DID); …
-//! … we hold, with no adds and no policy change; …
-//! … set with no policy change (re-seat); the sender
-//! is root or an admin (EXACT DID compare), or the room's policy is v1
-//! (`p.v !== 2`). It needs a sender whose leaf is bound before the commit,
-//! except `selfHeal`. A policy change comes from `root`, is v2 and keeps
-//! `committer` / `settleWindowMs`; a direct room seats only its two persons'
-//! devices. Adds otherwise pass.
+//! `validCommit` passes a Remove when ANY of four holds: (A) the leaves removed
+//! all belong to the sender's own person (without a persona store, the sender's
+//! own DID); (B) each removed leaf has a signed leave on file here and the
+//! commit adds nothing and changes no policy; (C) it is a re-seat, the same
+//! non-empty DID set both removed and added, with the policy untouched; (D) the
+//! sender is root or an admin (EXACT DID
+//! compare), or the room's policy is v1. It needs a sender whose leaf is bound
+//! before the commit, except `selfHeal`. A policy change comes from `root`, is
+//! v2 and keeps `committer` / `settleWindowMs`; a direct room seats only its
+//! two persons' devices. Adds otherwise pass.
 //!
-//! Anything else …
+//! Anything else is refused and Geb goes on; it never halts a room.
 //!
 //! **Two inputs are local knowledge**: "same person" (persona cards, which
 //! the bridge does NOT hold: no persona-card intake is built) and "signed
@@ -260,18 +259,16 @@ pub enum CommitVerdict {
     Undecidable(String),
 }
 
-/// `roleOf` : root and admin are an **exact** DID compare,
-/// never widened by persona cards (answers round 4, Q4: …
-/// … Geb).
+/// Root and admin are an **exact** DID compare, never widened by persona cards
+/// (answers round 4, Q4): a root's sibling device holds no such rights.
 fn is_root_or_admin(policy: &RoomPolicy, who: &str) -> bool {
     policy.root.as_deref() == Some(who) || policy.admins.iter().any(|a| a == who)
 }
 
-/// `selfHeal` (used at; answers round 4, Q2):
-/// the one way an UNBOUND sender may commit a Remove. All of: …
-/// …
-/// …
-/// signature (a present binding that does not verify never reaches here: the
+/// `selfHeal` (answers round 4, Q2): the one way an UNBOUND sender may commit a
+/// Remove, which is to replace itself. It needs no policy change, only leaves of
+/// the sender's own DID removed, at least one leaf added, and every added leaf
+/// carrying that DID and a binding signed by the sender's own key (a present binding that does not verify never reaches here: the
 /// judge refuses a forged one first, and an unbound one is in `unbound_adds`).
 /// A plain heal (path only, no Remove) never reaches this rule at all.
 fn self_heal(facts: &CommitFacts) -> bool {
@@ -339,10 +336,9 @@ pub fn valid_commit(
             ));
         }
     }
-    // …
-    // … leaf, as it stands BEFORE the commit, is bound
-    // ; the one exception is `selfHeal` (answers round 4,
-    // Q2), which is a Remove, never a policy change.
+    // Removing, re-seating (which removes a leaf) and changing policy all need
+    // the sender's leaf to have been bound BEFORE the commit; the one exception is
+    // `selfHeal` (answers round 4, Q2), a Remove and never a policy change.
     if (!facts.removes.is_empty() || facts.policy_change.is_some())
         && !facts.sender_bound
         && !self_heal(facts)
@@ -387,16 +383,15 @@ pub fn valid_commit(
     if !facts.removes.is_empty() {
         // Geb's exact `validCommit` for removes (answers
         // round 4, Q6). A Remove passes when ANY of:
-        //  1. …
-        //     `same(a, b) = a === b || personOf(a).includes(b)`. With no
-        //     persona store only `a === b` can be decided;
-        //  2. … we
-        //     hold, … change;
-        //  3. re-seat (`isReseat`): …
-        //     … change;
-        //  4. the sender is root or an admin (exact), …
-        //     … || ...`).
-        // Anything else …
+        //  1. own person: all removed DIDs are the sender's person (`a === b`,
+        //     or the same person by persona card). Without a persona store only
+        //     `a === b` can be decided;
+        //  2. signed leave: a signed leave we hold covers each removed leaf, and
+        //     the commit adds nothing and changes no policy;
+        //  3. re-seat: the removed and added DIDs are one non-empty set, policy
+        //     untouched;
+        //  4. the sender is root or an admin (exact), or the room's policy is v1.
+        // Geb REFUSES everything else and goes on; a room is never halted.
         let leave = facts
             .removes
             .iter()
@@ -602,7 +597,7 @@ mod tests {
         f.sender = "did:root2".into();
         let fake = Fake::default().dev("did:root2", "did:root");
         assert!(inv(&pol(""), &f, &fake));
-        // leave: …
+        // own person: a Remove of the sender's own person's leaves
         let mut l = facts("did:m1");
         l.removes = s(&["did:m1", "did:m2"]);
         let fake = Fake::default().dev("did:m1", "P").dev("did:m2", "P");

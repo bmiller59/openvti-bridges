@@ -1,5 +1,5 @@
-//! The settle rule, as a pure component (Geb path B answer 9, code at commit
-//! release 0.5.14; release 0.5.15 is `fdf804d`; guide "Commits").
+//! The settle rule, as a pure component (Geb path B answer 9, read at release
+//! 0.5.14; release 0.5.15 is `fdf804d`; guide "Commits").
 //!
 //! Commits are never applied at once. Every `mc` is **held** for
 //! `settleWindowMs` (policy, default 3000, clamped 0-60000). When the window
@@ -11,10 +11,10 @@
 //!   staged commit is discarded), reported refused, the next hash is tried;
 //! - the first that passes is merged;
 //! - all refused: nothing settles, the epoch stays;
-//! - … branch, a
+//! - MLS cannot process it (a replay, a Commit made on another branch, a
 //!   standalone Proposal): recorded **failed** and SKIPPED exactly like a
-//!   refusal. The walk NEVER stops on any candidate (answers round 4 Q1,
-//!): the first candidate that passes is
+//!   refusal. The walk NEVER stops on any candidate (answers round 4 Q1):
+//!   the first candidate that passes is
 //!   merged, whatever failed below it. The two differ only after the walk: if
 //!   NOTHING merged and one failed, the read cursor stays before it (so a
 //!   later replay is judged again) and the device asks for the room status

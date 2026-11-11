@@ -36,8 +36,8 @@
 //! and who removes, re-seats or changes the policy (`validCommit`, with the
 //! one exception `selfHeal`, answers round 4 Q2). A bound
 //! update-path leaf from an unbound sender is the `heal` shape and is valid.
-//! At join, `tree_refusal` refuses a Welcome whose tree holds a forged leaf …
-//! … unbound.
+//! At join, `tree_refusal` refuses a Welcome in which a leaf carries a forged binding, or
+//! one DID sits in two leaves and one of them is unbound.
 //!
 //! Refused versus failed (the settle walk, answers round 4 Q1): the walk NEVER
 //! stops on either. `Verdict::Refused` = staged, then failed `leafAuth` /
@@ -147,7 +147,7 @@ pub fn facts_of(
 ) -> CommitFacts {
     let mut facts = CommitFacts {
         sender: credential_did(sender).unwrap_or_default(),
-        // Confirmed (answers round 4 Q2: `mls.rs:226-237`):
+        // Confirmed (answers round 4 Q2):
         // the sender's leaf BEFORE the commit decides; a commit whose own
         // update path brings a bound leaf does not count as bound for the
         // remove / re-seat / policy rule (only a heal commit, which has no
@@ -293,7 +293,7 @@ impl GroupJudge<'_> {
             Ok(p) => p,
             // We never store a proposal, so a commit that names one by
             // reference cannot be processed: Geb's binding never stores one
-            // either (`mls.rs:325-328`), so MLS cannot process it and it is
+            // either, so MLS cannot process it and it is
             // "failed" in the app (answers round 4 Q1). UNVERIFIED which of
             // failed and refused (by `leafAuth`, if staged) fires; both are
             // skipped by the walk, so only the cursor and `rs` differ.
@@ -310,9 +310,9 @@ impl GroupJudge<'_> {
             ProcessedMessageContent::StagedCommitMessage(staged) => staged,
             // A standalone Proposal is never stored (we never call
             // `store_pending_proposal`; Geb's binding returns
-            // `{kind:"proposal", refused:true}`, `mls.rs:324-334`). In an `mc`
-            // … (answers round 4
-            // Q1:); the walk skips it.
+            // `{kind:"proposal", refused:true}`). In an `mc`
+            // Not a staged Commit, so it counts as "failed" (answers round 4 Q1);
+            // the walk skips it.
             ProcessedMessageContent::ProposalMessage(_)
             | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
                 return unprocessable(
@@ -341,10 +341,10 @@ impl GroupJudge<'_> {
         // own leaf) and is valid; an unbound one is an ordinary self-update.
         // Confirmed (answers round 4 Q3): Geb's receivers check only the same
         // DID and, if a binding is present, that it verifies for the new leaf's
-        // key; nothing compares the new key with the old .
+        // key; nothing compares the new key with the old one.
         // Geb's own heal keeps the key, but that is not required of senders.
-        // UNVERIFIED: …
-        // … an update path (the crate was not read).
+        // UNVERIFIED: whether OpenMLS 0.8.2 itself lets a commit's update path
+        // change the signature key (the crate was not read).
         if let Some(path_leaf) = staged.update_path_leaf_node() {
             let (a, b) = (
                 credential_did(&sender),
@@ -391,8 +391,8 @@ impl GroupJudge<'_> {
 }
 
 /// treeRefusal (0.5.15, answers round 2 section 7): a Welcome is refused when
-/// …
-/// unbound. Checked on the group a Welcome made, before it is kept.
+/// a leaf in its tree carries a forged binding, or one DID sits in two
+/// leaves and one of them is unbound. Checked on the group a Welcome made, before it is kept.
 pub fn tree_refusal(group: &MlsGroup) -> Result<(), String> {
     let mut seen: HashMap<String, (usize, bool)> = HashMap::new();
     for m in group.members() {
@@ -416,8 +416,7 @@ pub fn tree_refusal(group: &MlsGroup) -> Result<(), String> {
 }
 
 /// Parse the bytes of an `mc` or `ml` envelope: a full RFC 9420 `MLSMessage`
-/// whose body is a **PrivateMessage**, and nothing else (answer 2: "Geb …
-/// … one"; the bytes
+/// whose body is a **PrivateMessage**, and nothing else (answer 2: Geb neither sends nor accepts a PublicMessage; the bytes
 /// are what `tls_serialize_detached` made of OpenMLS's `MlsMessageOut`).
 ///
 /// Refused, each with its own reason: a bare PrivateMessage or PublicMessage
@@ -434,7 +433,7 @@ pub fn parse_message(bytes: &[u8]) -> Result<ProtocolMessage, String> {
 }
 
 /// Parse a Welcome frame's `w`: an `MLSMessage` whose body is a Welcome
-/// (answer 2; Geb answers anything else "not a Welcome", `mls.rs:490-493`).
+/// (answer 2; Geb answers anything else "not a Welcome").
 pub fn parse_welcome(bytes: &[u8]) -> Result<Welcome, String> {
     match MlsMessageIn::tls_deserialize_exact(bytes).map(MlsMessageIn::extract) {
         Ok(MlsMessageBodyIn::Welcome(w)) => Ok(w),

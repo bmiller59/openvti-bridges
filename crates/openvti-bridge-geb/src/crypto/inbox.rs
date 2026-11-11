@@ -8,11 +8,11 @@ use crate::Result;
 pub const INBOX_NOSTR_SECRET_INFO: &[u8] = b"consensual/inbox/v1/nostr-secret";
 
 /// The inbox's Nostr secret, derived from the recipient's public X25519 key.
-/// The IKM … `ec 01`
+/// The IKM is the raw 32-byte X25519 public key, with no `ec 01`
 /// multicodec prefix and not the multibase text (Geb path B answer 2:
-/// `inbox_keys(x25519_pub: &[u8; 32])`, `rendezvous.rs:94-97`). The HKDF info
+/// `inbox_keys(x25519_pub: &[u8; 32])`). The HKDF info
 /// is the label followed by a counter byte that starts at 0 and is
-/// …
+/// (the derived key is incremented while it is not a valid secp256k1 scalar)
 pub fn inbox_secret(recipient_e_pub: &[u8; 32]) -> Result<[u8; 32]> {
     derive_secp256k1_secret(recipient_e_pub, INBOX_NOSTR_SECRET_INFO)
 }

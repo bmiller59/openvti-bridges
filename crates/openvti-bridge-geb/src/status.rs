@@ -1,6 +1,6 @@
 //! The room status `rs` body, its cleaner and the comparison (Geb answers
-//! round 2 section 5, round 4 sections 8 and 9; Geb code,
-//!). Pure: no MLS, no clock, built in every build.
+//! round 2 section 5, round 4 sections 8 and 9; Geb code).
+//! Pure: no MLS, no clock, built in every build.
 //!
 //! ```text
 //! { k:"g", op:"rs", room:{id},
@@ -11,7 +11,7 @@
 //! ```
 //!
 //! UNVERIFIED (the answers do not settle; each is a choice here):
-//! - the exact algorithm of `compareStatus`  is not
+//! - the exact algorithm of `compareStatus` is not
 //!   written out; [`compare_status`] is our reading of "equal / ahead (they
 //!   lag) / behind / fork at the lowest epoch where the authenticators differ";
 //! - whether `cleanStatus` drops a bad chain entry or the whole status (we
@@ -108,7 +108,7 @@ fn clean_holdings(v: &Value) -> Option<BTreeMap<String, Holding>> {
     Some(out)
 }
 
-/// `cleanStatus` : `None` when `s` is not a valid status.
+/// `cleanStatus`: `None` when `s` is not a valid status.
 pub fn clean_status(s: &Value) -> Option<RoomStatus> {
     let e = clean_uint(s.get("e")?)?;
     let a = clean_hex(s.get("a")?, 8)?;
@@ -138,7 +138,7 @@ pub fn clean_status(s: &Value) -> Option<RoomStatus> {
     })
 }
 
-/// `cleanVia` : non-empty strings, de-duplicated, sorted.
+/// `cleanVia`: non-empty strings, de-duplicated, sorted.
 pub fn clean_via(v: &Value) -> Vec<String> {
     let Some(a) = v.as_array() else {
         return Vec::new();
@@ -214,9 +214,8 @@ pub enum ForkReason {
     Hash,
 }
 
-/// `forkMineWins(hashWins, mine, theirs, others)` (round
-/// 4 Q9). `others` is …
-/// member. `every` over an empty list is true (UNVERIFIED that Geb reads it so).
+/// `forkMineWins(hashWins, mine, theirs, others)` (round 4 Q9). `others` holds, for each other member, the epoch
+/// of the newest status heard from it. `every` over an empty list is true (UNVERIFIED that Geb reads it so).
 pub fn fork_mine_wins(
     hash_wins: bool,
     mine: u64,

@@ -1,15 +1,14 @@
-//! Signed leaves (Geb path B answers round 2 section 8, round 4 Q7;
-//! leave code).
+//! Signed leaves (Geb path B answers round 2 section 8, round 4 Q7).
 //!
-//! A leaver signs … at}`
+//! A leaver signs the payload `leavePayload(room, by, at) = {t:"leave", v:1, room, by, at}`
 //! (JCS, `sign_json`) with its device DID's Ed25519 key, and sends it two ways:
 //!
 //! - a room line `{t:"lv", at, ls:<the leave signature>}`; the line also
 //!   carries `sg` like every room plaintext, and `by` is the MLS sender;
-//! - … sig}`.
+//! - a dyad frame `{k:"g", op:"leave", room:{id}, by, at, sig}`.
 //!
-//! A receiver …
-//! … ([`LeaveBook`]). A held leave feeds `validCommit` rule 2 (a
+//! A receiver checks the signature for that room and keeps only the newest
+//! leave per signer ([`LeaveBook`]). A held leave feeds `validCommit` rule 2 (a
 //! Remove of a leaver, no adds, no policy change): without one, a Geb device
 //! refuses the elected healer's Remove of the leaver and we would fork from
 //! every device that took it.
@@ -19,11 +18,10 @@
 //!
 //! UNVERIFIED: the `sg` of an `lv` line is read as the same wrapper every
 //! room plaintext uses, `{v:1, room, author, body}` with `body` the plaintext
-//! without `sg` ( for lines; round 2 says only "like every
-//! room plaintext"). The client keeps a leave only for a signer
+//! without `sg` (round 2 only says it follows the other room plaintexts). The client keeps a leave only for a signer
 //! seated in the group and drops it once a merged commit removes the signer
-//! (the answers say "newest per signer" and nothing about membership or
-//! expiry: both are bridge-side choices, UNVERIFIED against Geb).
+//! (the answers settle only the newest-per-signer rule and say nothing about
+//! membership or expiry: both are bridge-side choices, UNVERIFIED against Geb).
 
 use super::crypto::{did_peer, sign};
 use crate::{Error, Result};
@@ -37,7 +35,7 @@ use std::collections::BTreeMap;
 /// dropped (an update of a held one is not).
 pub const MAX_LEAVES: usize = 1024;
 
-/// `leavePayload(room, by, at)` (`leave code:33-35`).
+/// `leavePayload(room, by, at)` (Geb path B answers round 2).
 pub fn leave_payload(room: &str, by: &str, at: u64) -> Value {
     json!({"t": "leave", "v": 1, "room": room, "by": by, "at": at})
 }

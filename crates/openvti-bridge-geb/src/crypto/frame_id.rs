@@ -1,11 +1,11 @@
-//! The frame id: …
-//! … text (Geb path B answer 5, `src/lib/).
+//! The frame id: two 32-bit multiplicative hash passes over the padded base64
+//! text of the frame (Geb path B answer 5).
 //!
 //! ```text
-//! …
-//! … UTF-16 code unit c: a = imul32(a ^ c, 16777619)
+//! a = 0x811c9dc5; b = 0x01000193
+//! for each UTF-16 code unit c: a = imul32(a ^ c, 16777619)
 //!                              b = imul32(b ^ c, 0x5bd1e995)
-//! id = hex8(a) || hex8(b)        // 16 lowercase hex characters
+//! id = hex8(a) || hex8(b)        // 16 hex characters, lowercase
 //! ```
 //!
 //! The hashed text is exactly what `ChannelRatchet.seal` returned, i.e. the

@@ -1,7 +1,7 @@
 //! The pure cryptographic pieces of Geb path B that the guide specifies,
-//! implemented from `Geb's implementer's guide (2026-11-07)` and, where they differ, Geb's
-//! authoritative answers (`Geb's path B answers, round 1`, code at commit
-//! release 0.5.14, and round 2, release 0.5.15 at `fdf804d`). The tests here are round-trips, tamper checks and independent
+//! implemented from Geb's implementer's guide (2026-11-07) and, where they differ,
+//! Geb's authoritative answers (round 1, read at release 0.5.14, and round 2,
+//! release 0.5.15 at `fdf804d`). The tests here are round-trips, tamper checks and independent
 //! re-derivations written from the stated derivations; none of them is a Geb
 //! vector (Geb's own vectors are bound in `tests/vectors.rs`).
 //! Each remaining ambiguity is marked `UNVERIFIED:` at the code.

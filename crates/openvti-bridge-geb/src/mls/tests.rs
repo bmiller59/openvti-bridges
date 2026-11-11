@@ -895,7 +895,7 @@ async fn relay_keys_change_with_every_merged_commit_and_both_sides_agree() {
     for i in 0..3u64 {
         assert!(w.our_keys_match(&w.a));
         let c = w.a.stage_self_update();
-        w.post_mc(&w.a, &c).await; // …
+        w.post_mc(&w.a, &c).await; // posted under the keys of its parent epoch
         w.a.merge_pending();
         w.b.apply(&c).unwrap();
         let t = w.now();

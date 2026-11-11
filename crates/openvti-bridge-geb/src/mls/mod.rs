@@ -21,13 +21,13 @@
 //! OpenMLS client that plays a Geb member. That shows this client is
 //! self-consistent with the MLS profile in the guide and answers. It does NOT
 //! show byte-compatibility with Geb's own MLS code (Rust `mls.rs`, TypeScript
-//! Geb's source / Geb's source), which was not available.
+//! room code), which was not available.
 //!
 //! # UNVERIFIED (Geb's MLS source was not available; each is a choice)
 //!
 //! - Framing (SETTLED by answers round 2, section 2, no longer a choice): `m`
-//!   of `mc` / `ml` is an `MLSMessage` whose body is a PrivateMessage; …
-//!   … Welcome; each KeyPackage is a
+//!   of `mc` / `ml` is an `MLSMessage` whose body is a PrivateMessage; a
+//!   Welcome is an `MLSMessage` carrying a Welcome; each KeyPackage is a
 //!   bare `KeyPackage` in standard padded base64. We READ only those forms: a
 //!   PublicMessage, a bare PrivateMessage / Welcome, trailing bytes, and a
 //!   base64url KeyPackage are refused (`commit::parse_message`,
@@ -55,7 +55,7 @@
 //!   `kp-req` / `welcome` while unseated, and `GebDyad::recv` clears what it
 //!   hands over, so the dyad must not be shared with another consumer of group
 //!   frames meanwhile.
-//! - Leaving: Geb's leave is a signed `{t:"lv"}` (leave code); we RECEIVE
+//! - Leaving: Geb's leave is a signed `{t:"lv"}` (Geb's leave code); we RECEIVE
 //!   one (`geb::leave`, round 4 Q7) but never send one: `leave` fails closed.
 //! - State is in memory unless `MlsGroupClient::with_state_store` is used; then a
 //!   restart resumes seated (see there for what is saved and what a restart

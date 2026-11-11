@@ -56,7 +56,7 @@ pub fn is_room_id(id: &str) -> bool {
 }
 
 /// Whether `s` matches `^[A-Za-z0-9+/=]+$`, the pattern Geb applies to a
-/// KeyPackage string : standard
+/// KeyPackage string: standard
 /// base64 characters. A base64url string (`-`, `_`) fails it and Geb DROPS that
 /// string. (Alphabet only; padding and length are the decoder's business.)
 pub fn is_std_b64(s: &str) -> bool {
@@ -66,7 +66,7 @@ pub fn is_std_b64(s: &str) -> bool {
 }
 
 /// The KeyPackage strings of a `kp-stock` that Geb keeps: those matching
-/// [`is_std_b64`], at most 16 . UNVERIFIED: whether Geb
+/// [`is_std_b64`], at most 16. UNVERIFIED: whether Geb
 /// cuts the stock to the FIRST 16 or checks the count before filtering.
 pub fn stock_kept(kps: &[String]) -> Vec<&str> {
     kps.iter()
@@ -87,7 +87,7 @@ pub enum Envelope {
     /// A dyad frame: `f` is the frame's padded base64, `d` the *sender's* side.
     #[serde(rename = "f")]
     Frame { f: String, d: Side },
-    /// Receipts: frame ids, each exactly 16 lowercase hex characters, at most
+    /// Receipts: frame ids (each exactly 16 characters of lowercase hex), at most
     /// [`MAX_ACK_IDS`] per envelope. Posted on the pair mailbox.
     #[serde(rename = "ack")]
     Ack { a: Vec<String> },
@@ -95,8 +95,8 @@ pub enum Envelope {
     #[serde(rename = "ml")]
     Ml { m: String },
     /// A room commit: `e` is the JSON integer MLS epoch the Commit was made
-    /// *from*, `m` the standard base64 Commit. …
-    /// … epoch; here a non-integer `e` fails to decode
+    /// *from*, `m` the standard base64 Commit. Receivers ignore a
+    /// non-integer `e` and any `e` below their epoch; here a non-integer `e` fails to decode
     /// and the mailbox event is dropped as unreadable, the same outcome. A
     /// decoded `mc` stops the poll (see `GebRoom::poll`).
     #[serde(rename = "mc")]
@@ -225,8 +225,8 @@ pub struct RoomRef {
 }
 
 /// The room header in a `welcome` (answer 8): `{v:2, id, name, founder, since,
-/// policy, nameAt?, nameBy?}`. The header's `policy` is informational; …
-/// … MLS group context.
+/// policy, nameAt?, nameBy?}`. The header's `policy` is informational; the validity tests read the
+/// policy from the MLS group context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoomInfo {
     /// Always 2.
@@ -312,8 +312,8 @@ pub enum GroupOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<Vec<String>>,
     },
-    /// `{k:"g", op:"rc", room:{id}, e, c}`: one Commit the receiver lacks. …
-    /// … (round 4 Q9), `c` the standard
+    /// `{k:"g", op:"rc", room:{id}, e, c}`: one Commit the receiver lacks. `e` names the
+    /// epoch the Commit was built FROM (round 4 Q9), `c` the standard
     /// base64 `MLSMessage` bytes.
     #[serde(rename = "rc")]
     Rc { room: RoomRef, e: u64, c: String },
@@ -407,8 +407,8 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame> {
         return Ok(serde_json::from_value(v)
             .unwrap_or_else(|_| Frame::Group(GroupOp::Ignored("leave".into()))));
     }
-    // `rs`, `rc` and `seat-ask`: cleaned the way Geb cleans them. …
-    // … (round 4 Q8): it parses with `s: None` and is acked.
+    // `rs`, `rc` and `seat-ask`: cleaned the way Geb cleans them. An `rs` with no
+    // valid status body is dropped (round 4 Q8): it parses with `s: None` and is acked.
     if v.get("k").and_then(Value::as_str) == Some("g") {
         match v.get("op").and_then(Value::as_str) {
             Some("rs") => {
@@ -465,9 +465,9 @@ pub enum Frame {
     #[serde(rename = "g")]
     Group(GroupOp),
     /// Capabilities `{k:"cap", dm, fc?, rv?, wp?}`. `dm` is a number >= 0,
-    /// floored by receivers; … room".
+    /// floored by receivers; a value of 1 moves the dyad into a direct room.
     /// `fc` and `rv` count only when exactly `1` (fragments, room events over
-    /// the dyad); `wp` is … The
+    /// the dyad); `wp` is a Web Push endpoint (https, allowlisted). The
     /// bridge sends `dm: 0` and `fc: 0` (stated, because an UNKNOWN `fc` makes
     /// Geb hold a large frame back until it hears from us), and leaves `rv`
     /// and `wp` unset ([`Frame::bridge_cap`]).
@@ -669,7 +669,7 @@ pub struct LineBody {
     /// ([`crate::crypto::line_id::line_id`]); `^[0-9a-f]{16,64}$`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub re: Option<String>,
-    /// At most 16 mentions. …
+    /// At most 16 mentions. A line carrying `m` is meant for those members.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m: Option<Vec<Mention>>,
     /// One-tap options: trimmed, non-empty, at most 10 of at most 60
@@ -681,7 +681,7 @@ pub struct LineBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nr: Option<Value>,
     /// A re-post from a dead branch (answers round 4 Q10): `fk:1` with the
-    /// original line's `id` . Read only when exactly `1`.
+    /// original line's `id`. Read only when exactly `1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fk: Option<Value>,
     /// The original line's id, carried only with `fk`. UNVERIFIED: whether it is

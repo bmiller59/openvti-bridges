@@ -75,7 +75,7 @@ pub const COMMIT_KEEP: usize = 64;
 pub const OWN_LINES_MAX: usize = 100;
 const OWN_LINES_BYTES: usize = 256 * 1024;
 /// How long a re-seat Welcome is awaited before asking with a fresh package.
-/// UNVERIFIED: Geb's seat wait is 120 s ; we reuse it.
+/// UNVERIFIED: Geb's seat wait is 120 s; we reuse it.
 pub const SEAT_WAIT_MS: u64 = 120_000;
 /// How long after a `seat-ask` of ours a replacing Welcome is still expected.
 /// UNVERIFIED (not in the answers): a bridge-side window, two ask backoffs.

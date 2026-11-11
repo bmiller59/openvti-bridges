@@ -19,20 +19,20 @@
 >   count and a fork marker.
 > - The Geb pin is release 0.5.15 (`fdf804d`) and answers rounds 1 to 4, not only release 0.5.14.
 
-> Update 2026-11-08: Geb answered the open questions from its code at commit release 0.5.14, now versioned as "path B 0.1" (the pin moved to release 0.5.15, commit `fdf804d`, with round 2 on 2026-11-09)
-> (breaking changes are announced in the Geb's announcement channel first). Geb details below are pinned to it. Effects: a retraction
+> Update 2026-11-08: Geb answered the open questions from its code at release 0.5.14, now versioned as "path B 0.1" (the pin moved to release 0.5.15, commit `fdf804d`, with round 2 on 2026-11-09)
+> (breaking changes are announced in Geb's announcement channel first). Geb details below are pinned to it. Effects: a retraction
 > is an ordinary signed reply line, never a new kind; bridges are welcome by default with no marking; each room will later choose not
 > welcome / welcome automatically / ask, and whether to show a mark (same for AI agents), shapes not yet shared; the M3 blocker is now Geb's commit check, which needs persona cards and
 > signed leaves held locally (see section 7). Edit and delete are designed but not built.
 
-# Plan: `vti-geb-bridge` — a bidirectional … room
+# Plan: `vti-geb-bridge` — a bidirectional bridge between a VTC data room and a Geb room
 
 Note: this plan was written inside the VTI repository (a design note) and is kept here as a copy. References to "the workspace", "the VTI repository's root CLAUDE.md" and repository paths (vti-rooms/..., vti-witness/..., docs/...) mean the VTI repository, not this one. Requirement citations (VTI-*) are to the VTI specification.
 
 Status: draft for review. Date: 2026-11-08. Author: BAM session.
 Companion: `companion-notes.md` (rationale, threat model, decisions, questions for Geb).
 
-Sources: `Geb's implementer's guide (2026-11-07)` (Geb implementer's guide, code as of 2026-11-07) is the authority for Geb.
+Sources: Geb's implementer's guide (code as of 2026-11-07) is the authority for Geb.
 VTI facts were checked in this repo by a planning agent. [V] = checked in code, [I] = inferred, not yet checked.
 
 ## 1. Goal and non-goals
@@ -182,7 +182,7 @@ it; same author and hash means done.
   `eddsa-jcs-2022`), then post `kp-stock` (<= 16 KeyPackages, increasing `gen`) or answer `kp-req`, then accept
   `{k:"g",op:"welcome"}`. Never send `cap dm:1`.
 - Per-epoch relay keys from the exporter: labels `geb/room/v2/nostr` and `geb/room/v2/aead`, context = room id bytes.
-  Resubscribe after every merged commit. … from.
+  Resubscribe after every merged commit. Commits are posted under the keys of the epoch they were made from.
 - Geb's commit check (answer 9) walks candidates for one parent epoch in ascending SHA-256 order and tests each with
   `validCommit` before it can win; a failing Commit is dropped and the next is tried. Two inputs are local knowledge:
   persona cards (same-person) and signed leaves (`{t:"lv"}`). A bridge that cannot evaluate them refuses a leave or
@@ -224,7 +224,7 @@ it; same author and hash means done.
 ## 10. Testing
 
 - Pure: `mapping` round-trips; Geb conformance vectors taken from Geb's source (inbox derivation counter rule, sealed
-  box, rendezvous keys, AES-GCM AAD, ratchet lo2hi/hi2lo with skipped keys, frame-id hash at
+  box, rendezvous keys, AES-GCM AAD, ratchet lo2hi/hi2lo with skipped keys, frame-id hash,
   sign_json, leaf binding, did:peer:2.A.V.E encode/decode). Ask Geb for published vectors.
 - MLS: `GebGroup` against a second in-process OpenMLS client playing a Geb member; competing commits inside the settle
   window, re-seat, removal.
