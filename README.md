@@ -24,7 +24,7 @@ Each kind is a cargo feature of the shell (`geb` is on by default, `loopback` is
 anything. Nothing here has been run against a live Geb node, a real relay, a real VTA or a real room
 host. Every test uses a test double. Geb's path B has no versioned specification, so details that
 Geb's written answers do not settle are marked `// UNVERIFIED:` in the source. Tests show
-self-consistency and agreement with Geb's vendored test vectors, not interoperability.
+self-consistency, including on stand-in vectors (Geb's own vector files are not redistributed here and are run locally), not interoperability.
 
 Not built: `fc` fragments (joining a large Geb room fails), the `rs` status body, `seat-ask`,
 accepting a re-seat Welcome, sending a leave (signed leaves are received), persona-card intake,

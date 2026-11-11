@@ -1,7 +1,7 @@
 # Geb (path B): design
 
 Status: experimental. Everything in this document describes the Geb adapter crate
-(`crates/openvti-bridge-geb`) and rests on Geb's written answers, the vendored vectors and our own
+(`crates/openvti-bridge-geb`) and rests on Geb's written answers, Geb's test vectors (run locally; the committed ones are stand-ins, see the crate's `CLAUDE.md`) and our own
 tests; none of it has been run against a live Geb node or relay. The markers are the ones
 explained in [`../core.md`](../core.md) (Built, Not built, UNVERIFIED). The core, the
 ForeignRoom seam, the data model and the operations that are not Geb's are in

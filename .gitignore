@@ -16,3 +16,7 @@ setup-key*
 .DS_Store
 *.swp
 *~
+
+# Geb's own (not redistributed) test vector files, looked up by the vector tests when present
+# (see crates/openvti-bridge-geb/tests/common/mod.rs). Also settable with GEB_VECTORS_DIR.
+crates/openvti-bridge-geb/tests/fixtures/private/

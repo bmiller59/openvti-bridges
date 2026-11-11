@@ -166,11 +166,20 @@ held by a census test and documented in `docs/bridges/geb.md`. Adapter state liv
   signed "bridge" role badge; shapes are not shared yet and are not implemented.
 - **Receipts are evidence, not delivery** (R1.1). Geb can only ever return
   `Relayed`, after reading our own event back.
-- **No invented test vectors.** Geb's vectors are vendored at
-  `tests/fixtures/geb-path-b-vectors.json` (fixed labelled test keys and public
-  outputs only) and bound in `tests/vectors.rs`; round 2
-  (`geb-path-b-vectors-2.json`: commit hash and settle winner, exporter, signed
-  leaf, persona card, VRC v2) is bound in `tests/vectors2.rs`. Of those, the exporter
+- **No invented test vectors, and what the committed ones are.** Geb's own vector files are
+  NOT in this repository (Geb has not agreed to redistribution). `tests/vectors.rs`
+  (round 1) and `tests/vectors2.rs` (round 2: commit hash and settle winner, exporter, signed
+  leaf, persona card, VRC v2) read `tests/fixtures/geb-path-b-vectors.json` and
+  `geb-path-b-vectors-2.json`, which are **stand-ins**: the same JSON shape, but fresh throwaway
+  keys and nonces, every expected output computed by this crate
+  (`tests/gen_standin_vectors.rs`, which regenerates them and fails if they drift). **A stand-in
+  run proves self-consistency and fixture structure only, NOT independent agreement with
+  Geb.** The real interop check is the same tests run against Geb's real files: put them in
+  `tests/fixtures/private/` (git-ignored) or point `GEB_VECTORS_DIR` at their directory
+  (`GEB_VECTORS_REQUIRE_REAL=1` refuses the fallback); each run names the set it used
+  (`-- --nocapture`, or `vectors2::which_vectors_ran`). Never commit Geb's files or values
+  copied from them (no key, nonce, ciphertext or hash from them in tests, docs or comments).
+  Of Geb's vectors, the exporter
   is re-derived by a test-only RFC 9420 implementation (our code derives it only
   through OpenMLS) and the persona card by a test-only verifier (this crate has no
   card type). Other tests are round-trips
@@ -185,7 +194,7 @@ held by a census test and documented in `docs/bridges/geb.md`. Adapter state liv
 
 - **default (none)**: the Geb core and the adapter-neutral core build and test
   without `vta-sdk`, the generated Trust Task crates, fjall or `room-host`
-  (186 lib tests plus `tests/vectors.rs` 11 and `tests/vectors2.rs` 9, seconds; the other test
+  (186 lib tests plus `tests/vectors.rs` 11, `tests/vectors2.rs` 10 and `tests/gen_standin_vectors.rs` 1, seconds; the other test
   targets need a feature and run 0 tests). The pump needs none of them: it speaks the
   `room::RoomSide` and `store::BridgeStore` traits only.
 - **`vtc`**: `vtc::VtcRoom` (`RoomSide` over `VtaClient`, HTTPS delivery in
@@ -216,7 +225,7 @@ write "verified in CI" for anything.
 Run everything locally: the root crate needs the local-only `.cargo/config.toml` override
 (git-ignored; `[patch.crates-io]` for VTI crates not in the cargo cache, plus a `[patch]` for
 `room-host`). `cargo test --offline --workspace --features harness --no-fail-fast`
-in the root gives the sums 312 lib (85 core, 214 geb, 13 vtc), `cli` 10, `custody` 5, `geb_live` 9, `vectors` 11, `vectors2` 9. For
+in the root gives the sums 312 lib (85 core, 214 geb, 13 vtc), `cli` 10, `custody` 5, `geb_live` 9, `vectors` 11, `vectors2` 10, `gen_standin_vectors` 1. For
 the room-host tests, `cd harness && cargo test --offline`: `e2e` 3, `harness` 8. A `[patch]` on
 a git source still has to fetch it on a fresh resolve (no lock), so offline either point
 `room-host` at a path in `harness/Cargo.toml` temporarily (do not commit that) or keep a lock.

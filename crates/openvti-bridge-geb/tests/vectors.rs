@@ -1,16 +1,21 @@
-//! Geb's path B test vectors (`tests/fixtures/geb-path-b-vectors.json`),
-//! generated at Geb substrate commit release 0.5.14 (round 1, release 0.5.14).
-//! The crate is now pinned to `fdf804d` (0.5.15); these vectors were not
-//! regenerated and nothing in them is a 0.5.15 output.
+//! Geb's path B test vectors, round 1 (`geb-path-b-vectors.json`).
 //!
-//! Every value in the fixture was produced by calling Geb's own code with
-//! fixed, labelled test keys (alice: Ed25519 seed 01x32, X25519 secret 02x32;
-//! bob: 03x32 / 04x32). It holds test keys and public outputs only.
+//! Two sets can run (see `common/mod.rs`). Geb's own file, generated at Geb
+//! substrate commit release 0.5.14 (round 1, release 0.5.14; the crate is pinned to
+//! `fdf804d`, 0.5.15, and nothing in it is a 0.5.15 output), is not redistributed
+//! here: when it is present locally (`$GEB_VECTORS_DIR`, or
+//! `tests/fixtures/private/`) these tests run against it, and that run is the real
+//! interop check. Otherwise they run against the committed STAND-IN vectors, which
+//! this crate generated from fresh throwaway keys (`gen_standin_vectors.rs`): a stand-in
+//! run proves the crate agrees with itself and that the fixture structure is what these
+//! tests expect, and nothing about agreement with Geb.
 //!
-//! Where Geb draws randomness it cannot fix (sealed box, mailbox envelope,
-//! ratchet nonces) the vector gives a ciphertext to OPEN, and these checks
-//! open it. Nothing here is computed by this crate and then compared with
-//! itself except where a vector pins a byte-exact output.
+//! In Geb's file every value was produced by Geb's own code from fixed, labelled
+//! test keys and it holds test keys and public outputs only. Where Geb draws
+//! randomness it cannot fix (sealed box, mailbox envelope, ratchet nonces) the vector
+//! gives a ciphertext to OPEN, and these checks open it. Nothing here is computed by
+//! this crate and then compared with itself except where a vector pins a byte-exact
+//! output (and in a stand-in run, everything is).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use ed25519_dalek::SigningKey;
@@ -20,10 +25,10 @@ use openvti_bridge_geb::crypto::{
 use openvti_bridge_geb::wire::{LineBody, signing_doc};
 use serde_json::Value;
 
-const FIXTURE: &str = include_str!("fixtures/geb-path-b-vectors.json");
+mod common;
 
 fn all() -> Value {
-    serde_json::from_str(FIXTURE).expect("fixture is JSON")
+    serde_json::from_str(&common::load(common::V1)).expect("fixture is JSON")
 }
 
 fn vec_of(name: &str) -> Value {
