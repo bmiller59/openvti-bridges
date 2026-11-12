@@ -88,28 +88,22 @@ pub fn decode(did: &str) -> Result<DidPeer> {
         let value = chars.as_str();
         let dup = || Error::Wire(format!("repeated purpose code {code}"));
         match code {
-            'A' => {
-                if out.assertion.replace(dec_key(ED_PREFIX, value)?).is_some() {
-                    return Err(dup());
-                }
+            'A' if out.assertion.replace(dec_key(ED_PREFIX, value)?).is_some() => {
+                return Err(dup());
             }
-            'V' => {
-                if out
-                    .authentication
-                    .replace(dec_key(ED_PREFIX, value)?)
-                    .is_some()
-                {
-                    return Err(dup());
-                }
+            'V' if out
+                .authentication
+                .replace(dec_key(ED_PREFIX, value)?)
+                .is_some() =>
+            {
+                return Err(dup());
             }
-            'E' => {
-                if out
-                    .key_agreement
-                    .replace(dec_key(X_PREFIX, value)?)
-                    .is_some()
-                {
-                    return Err(dup());
-                }
+            'E' if out
+                .key_agreement
+                .replace(dec_key(X_PREFIX, value)?)
+                .is_some() =>
+            {
+                return Err(dup());
             }
             'S' => {
                 let raw = URL_SAFE_NO_PAD
