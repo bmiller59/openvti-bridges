@@ -16,17 +16,43 @@ all-features = true
 version = 2
 ignore = [
 
-  { id = "RUSTSEC-2026-0381", reason = """
-  webpki-roots 0.26.x: bundled roots trust distrusted emSign intermediates.
-  Patched only in >= 1.0.10; there is no fixed 0.26 release.
+  { id = "RUSTSEC-2026-0387", reason = """
+  crypto-bigint 0.5.5: constant-time issues in secret-dependent arithmetic;
+  fixed in >= 0.7.6. UNVERIFIED beyond the code trace below: no timing
+  measurement or independent review was done.
 
-  0.26.11 is a compatibility shim with no roots of its own: it re-exports
-  webpki-roots 1.x, which Cargo.lock pins at 1.0.10, the patched release. So
-  the roots any 0.26 user (tokio-tungstenite 0.30, under the messaging SDK,
-  the test mediator and vta-mobile-core) actually gets are the fixed ones; the
-  advisory matches on the shim's version number alone.
+  Path: openvti-bridge-geb (feature `mls`) -> openmls_rust_crypto 0.6 ->
+  hpke-rs-rust-crypto 0.7 / p256 0.13 / p384 0.13 / k256 0.13 / ecdsa 0.16
+  -> elliptic-curve 0.13 -> crypto-bigint 0.5.5 (also openmls_basic_credential
+  0.6 -> p256 / p384). Nothing else in this workspace reaches 0.5.5: our own
+  k256 0.14 and the VTI crates resolve to elliptic-curve 0.14 and
+  crypto-bigint 0.7.x (checked with `cargo tree -i crypto-bigint@0.5.5
+  --all-features`, normal and build edges).
 
-  Drop when tokio-tungstenite depends on webpki-roots 1.x directly.
+  We cannot upgrade it: the 0.13 RustCrypto curve stack is pinned by
+  openmls_rust_crypto 0.6 and hpke-rs-rust-crypto 0.7, and OpenMLS has no
+  other production crypto provider.
+
+  What the trace found, for the one ciphersuite the bridge uses (0x0001,
+  MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519, fixed by `SUITE` in
+  mls/identity.rs): the KEM is DhKem25519 (x25519-dalek in hpke-rs-rust-crypto)
+  and signatures are Ed25519 (ed25519-dalek in openmls_rust_crypto and
+  openmls_basic_credential), neither of which uses crypto-bigint. The
+  P-256 / P-384 / secp256k1 code in those crates is selected by ciphersuite or
+  signature scheme, and none of our code names those: the signer is built with
+  SUITE.signature_algorithm(), a Welcome whose ciphersuite is not 0x0001 is
+  rejected, and the bridge's own code uses no P-256 (its secp256k1 is k256 0.14,
+  which is on crypto-bigint 0.7.x). So p256 / p384 / k256 0.13 are linked but,
+  on the paths we found, not run with a secret scalar.
+
+  Not verified: that every path inside openmls 0.9 is suite-gated (a Welcome
+  is parsed with StagedWelcome::new_from_welcome before our 0x0001 check, and
+  the default leaf capabilities advertise the P-256 suite, which only declares
+  support); the `harness/` package's own lockfile; and anything about
+  dev-dependency or non-default feature graphs beyond `--all-features`.
+
+  Revisit when openmls_rust_crypto / hpke-rs-rust-crypto move to RustCrypto
+  curves on crypto-bigint >= 0.7.6, and drop this entry then.
   """ },
 
 
