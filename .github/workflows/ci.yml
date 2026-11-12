@@ -32,6 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The vtc crate's keyring backend builds libdbus-sys, which needs pkg-config and the D-Bus headers.
+      - name: System packages for the keyring backend
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
@@ -51,6 +54,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The vtc crate's keyring backend builds libdbus-sys, which needs pkg-config and the D-Bus headers.
+      - name: System packages for the keyring backend
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@1.95.0
       - run: cargo generate-lockfile
       - run: cargo test -p openvti-bridge-core
@@ -68,6 +74,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The vtc crate's keyring backend builds libdbus-sys, which needs pkg-config and the D-Bus headers.
+      - name: System packages for the keyring backend
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@1.95.0
       - run: cargo generate-lockfile
       - run: cargo test -p openvti-bridge-conformance
@@ -150,5 +159,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The vtc crate's keyring backend builds libdbus-sys, which needs pkg-config and the D-Bus headers.
+      - name: System packages for the keyring backend
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@1.95.0
       - run: cd harness && cargo test
