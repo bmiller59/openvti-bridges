@@ -1962,18 +1962,30 @@ mod tests {
         let (w, relay) = flaky_world();
         connect(&w).await;
         settle_acks(&w).await;
-        // Three sends whose posts all fail after their counters were spent.
-        for t in ["m0", "m1", "m2", "m3", "m4"] {
+        // Sends whose posts all fail after their counters were spent. The ids are
+        // hashes of random frames, so keep sending (at least five) until they are
+        // not in sorted order: that precondition is then guaranteed, not luck.
+        let mut texts: Vec<String> = Vec::new();
+        let order = loop {
             relay.fail.store(true, Ordering::SeqCst);
-            assert!(w.a.send(w.b.did(), &msg(t)).await.is_err());
-        }
-        assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), 5);
-        let order = w.a.pending_ids(w.b.did()).await;
+            let t = format!("m{}", texts.len());
+            assert!(w.a.send(w.b.did(), &msg(&t)).await.is_err());
+            texts.push(t);
+            let ids = w.a.pending_ids(w.b.did()).await;
+            let mut sorted = ids.clone();
+            sorted.sort();
+            if texts.len() >= 5 && sorted != ids {
+                break ids;
+            }
+            assert!(texts.len() < 64, "64 random ids all came out sorted");
+        };
+        let n = texts.len();
+        assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), n);
         let before = envelopes(&w).len();
         // Not yet due: a frame is reposted once it is 3 s old.
         assert_eq!(w.a.retransmit_due(w.b.did()).await.unwrap(), 0);
         w.now.fetch_add(REPOST_AFTER_SECS, Ordering::SeqCst);
-        assert_eq!(w.a.retransmit_due(w.b.did()).await.unwrap(), 5);
+        assert_eq!(w.a.retransmit_due(w.b.did()).await.unwrap(), n);
         let posted: Vec<String> = envelopes(&w)
             .into_iter()
             .skip(before)
@@ -1986,7 +1998,7 @@ mod tests {
         let mut hashes = order.clone();
         hashes.sort();
         assert_ne!(hashes, order, "the ids are not already in sorted order");
-        // The peer gets all five, in order, and the sender's pending drains.
+        // The peer gets all of them, in order, and the sender's pending drains.
         w.now.fetch_add(1, Ordering::SeqCst);
         let got: Vec<_> = take(&w.b, w.a.did())
             .await
@@ -1994,7 +2006,7 @@ mod tests {
             .iter()
             .map(text)
             .collect();
-        assert_eq!(got, ["m0", "m1", "m2", "m3", "m4"]);
+        assert_eq!(got, texts);
         w.now.fetch_add(1, Ordering::SeqCst);
         w.a.sync(w.b.did()).await.unwrap();
         assert_eq!(w.a.unacked(w.b.did()).await.unwrap(), 0);
