@@ -592,7 +592,10 @@ async fn session(
                         worked = true;
                     }
                     Message::Ping(p) => {
-                        if ws.send(Message::Pong(p)).await.is_err() { return Session::Lost(worked); }
+                        let ponged = ws.send(Message::Pong(p)).await;
+                        if ponged.is_err() {
+                            return Session::Lost(worked);
+                        }
                     }
                     Message::Close(_) => return Session::Lost(worked),
                     // Binary and the rest are not NIP-01.
